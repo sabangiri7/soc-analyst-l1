@@ -39,7 +39,7 @@ from siem_providers import (
 )
 import lookup_tables as lookup
 
-MAX_TOOL_TURNS = 6
+MAX_TOOL_TURNS = 8
 
 SYSTEM_PROMPT = """You are a conversational SOC assistant. You help an analyst \
 answer questions and take read/write actions on their SIEM dashboard and lookup \
