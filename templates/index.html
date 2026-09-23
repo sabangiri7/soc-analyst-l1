@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SOC Triage · SIEM Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --panel2: #1c2230; --border: #2d333b;
+    --text: #e6edf3; --muted: #8b949e; --accent: #2f81f7; --green: #3fb950;
+    --red: #f85149; --amber: #d29922; --radius: 10px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif; padding: 24px; }
+  header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
+  header h1 { font-size: 20px; }
+  .pill { background: var(--panel2); border: 1px solid var(--border); border-radius: 999px; padding: 3px 12px; font-size: 12px; color: var(--muted); }
+  .pill b { color: var(--text); font-weight: 600; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; margin-top: 16px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+  .card .top { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+  .card .title { font-size: 15px; font-weight: 600; }
+  .badge { font-size: 11px; border: 1px solid var(--accent); color: var(--accent); padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+  .badge.mock { border-color: var(--amber); color: var(--amber); }
+  .badge.env { border-color: var(--muted); color: var(--muted); }
+  .meta { color: var(--muted); font-size: 12px; }
+  .status { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); display: inline-block; }
+  .dot.ok { background: var(--green); }
+  .dot.err { background: var(--red); }
+  .btn { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; font-size: 12px; cursor: pointer; }
+  .btn:hover { border-color: var(--accent); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn.danger:hover { border-color: var(--red); color: var(--red); }
+  .btn:disabled { opacity: .55; cursor: wait; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .panel { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin-top: 8px; font-size: 12px; display: none; }
+  .panel.open { display: block; }
+  .panel h4 { font-size: 12px; color: var(--muted); margin-bottom: 8px; text-transform: uppercase; letter-spacing: .05em; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  .sev { font-weight: 600; }
+  .sev.critical { color: var(--red); } .sev.high { color: #ffa657; } .sev.medium { color: var(--amber); }
+  pre.detail { white-space: pre-wrap; word-break: break-word; color: var(--muted); margin: 4px 0; max-height: 220px; overflow: auto; }
+  /* add form */
+  #add-form { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; margin-top: 8px; }
+  #add-form .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+  #add-form .field { display: flex; flex-direction: column; gap: 4px; min-width: 180px; flex: 1; }
+  label { font-size: 11px; color: var(--muted); }
+  input, select { background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 7px 9px; font-size: 13px; }
+  input:focus, select:focus { outline: none; border-color: var(--accent); }
+  #dynamic-fields { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+  .toast { position: fixed; right: 16px; bottom: 16px; background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; font-size: 13px; max-width: 340px; box-shadow: 0 6px 24px #0008; z-index: 10; }
+  .toast.err { border-color: var(--red); }
+  .toast.ok { border-color: var(--green); }
+  .empty { color: var(--muted); font-style: italic; padding: 8px 0; }
+  .summary li { list-style: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🛡️ SOC Triage · Multi-SIEM Dashboard</h1>
+  <span class="pill" id="health"></span>
+  <span class="pill">connections <b id="conn-count">0</b></span>
+</header>
+
+<form id="add-form">
+  <div class="row">
+    <div class="field" style="min-width:140px;">
+      <label for="p-name">Provider name</label>
+      <input id="p-name" placeholder="e.g. Prod Splunk" required>
+    </div>
+    <div class="field" style="min-width:220px;">
+      <label for="p-platform">Platform</label>
+      <select id="p-platform"></select>
+      <small style="color:var(--muted); font-size:11px;" id="platform-desc"></small>
+    </div>
+    <div class="field" style="min-width:120px;">
+      <label>&nbsp;</label>
+      <button type="submit" class="btn primary" id="add-btn">+ Add provider</button>
+    </div>
+  </div>
+  <div id="dynamic-fields"></div>
+</form>
+
+<div class="grid" id="providers"></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+
+let PLATFORMS = {};     // platform -> {label, description, fields[]}
+let PROVIDERS = [];     // provider list
+const CONFIG_LABEL = {}; // cache platform field labels for summaries
+
+async function api(path, opts) {
+  const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts });
+  let body = null;
+  try { body = await res.json(); } catch (_) { /* non-json */ }
+  if (!res.ok) throw new Error((body && body.error) || res.statusText);
+  return body;
+}
+
+function toast(msg, ok = false) {
+  const t = document.createElement("div");
+  t.className = "toast " + (ok ? "ok" : "err");
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 5000);
+}
+
+/* ---------------- health / platforms ---------------- */
+async function loadHealth() {
+  try {
+    const h = await api("/api/health");
+    $("health").innerHTML = `LLM <b>${h.llm_provider}</b> · SIEM <b>${h.siem_provider}</b> · mock <b>${h.mock_mode}</b>`;
+  } catch (e) { $("health").textContent = "API unreachable: " + e.message; }
+}
+
+async function loadPlatforms() {
+  const { platforms } = await api("/api/platforms");
+  PLATFORMS = {};
+  const sel = $("p-platform");
+  sel.innerHTML = "";
+  for (const p of platforms) {
+    PLATFORMS[p.platform] = p;
+    const opt = document.createElement("option");
+    opt.value = p.platform;
+    opt.textContent = p.label;
+    sel.appendChild(opt);
+  }
+  renderDynamicFields();
+}
+
+function renderDynamicFields() {
+  const platform = $("p-platform").value;
+  const meta = PLATFORMS[platform];
+  $("platform-desc").textContent = meta ? meta.description : "";
+  const wrap = $("dynamic-fields");
+  wrap.innerHTML = "";
+  for (const f of (meta ? meta.fields : [])) {
+    CONFIG_LABEL[f.key] = f.label;
+    const div = document.createElement("div");
+    div.className = "field";
+    const label = document.createElement("label");
+    label.textContent = f.label + (f.required ? " *" : "");
+    const input = document.createElement(f.type === "boolean" ? "select" : "input");
+    input.name = f.key;
+    if (f.type === "boolean") {
+      for (const [v, t] of [["true", "true"], ["false", "false"]]) {
+        const o = document.createElement("option");
+        o.value = v; o.textContent = t; input.appendChild(o);
+      }
+      input.value = String(f.default !== undefined ? f.default : true);
+    } else {
+      if (f.secret) input.type = "password";
+      if (f.placeholder) input.placeholder = f.placeholder;
+      if (f.required) input.required = true;
+    }
+    div.appendChild(label); div.appendChild(input);
+    wrap.appendChild(div);
+  }
+}
+$("p-platform").addEventListener("change", renderDynamicFields);
+
+/* ---------------- providers ---------------- */
+async function loadProviders() {
+  const { providers } = await api("/api/providers");
+  PROVIDERS = providers;
+  $("conn-count").textContent = providers.length;
+  const grid = $("providers");
+  grid.innerHTML = "";
+  for (const p of providers) grid.appendChild(providerCard(p));
+}
+
+function providerCard(p) {
+  const card = document.createElement("div");
+  card.className = "card";
+  card.dataset.id = p.id;
+
+  const meta = PLATFORMS[p.platform] || {};
+  const sourceTag = p.source === "env" ? `<span class="badge env">.env</span>` : "";
+  const mockTag = p.platform === "mock" ? `<span class="badge mock">mock</span>` : "";
+
+  const summary = Object.entries(p.config || {})
+    .filter(([k, v]) => v && k !== "alerts_file")
+    .map(([k, v]) => `<li><b>${CONFIG_LABEL[k] || k}:</b> ${(meta.fields || []).find(f => f.key === k)?.secret ? "••••••••" : v}</li>`)
+    .join("");
+
+  card.innerHTML = `
+    <div class="top">
+      <div>
+        <div class="title">${esc(p.name)}</div>
+        <div class="meta">${meta.label || p.platform} ${sourceTag} ${mockTag}</div>
+      </div>
+      <span class="badge">${p.platform}</span>
+    </div>
+    <div class="status"><span class="dot" id="dot-${p.id}"></span><span id="status-${p.id}">not tested</span></div>
+    <ul class="summary">${summary || '<li class="empty">no extra config</li>'}</ul>
+    <div class="actions">
+      <button class="btn" onclick="testConn('${p.id}')">Test</button>
+      <button class="btn" onclick="fetchAlerts('${p.id}')">Alerts</button>
+      <button class="btn" onclick="runTriage('${p.id}')">Run triage</button>
+      ${p.source !== "env" ? `<button class="btn danger" onclick="removeConn('${p.id}')">Delete</button>` : ""}
+    </div>
+    <div class="panel" id="panel-${p.id}"></div>
+  `;
+  return card;
+}
+
+function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+
+function setStatus(id, ok, text) {
+  const dot = $("dot-" + id), st = $("status-" + id);
+  if (dot) dot.className = "dot " + (ok ? "ok" : "err");
+  if (st) st.textContent = text;
+}
+
+async function testConn(id) {
+  setStatus(id, false, "testing…");
+  try {
+    const r = await api(`/api/providers/${id}/test`, { method: "POST" });
+    setStatus(id, r.ok, (r.ok ? "✓ " : "✗ ") + `${r.latency_ms}ms · ${r.detail}`);
+    toast(r.ok ? `Test OK (${r.latency_ms}ms)` : `Test failed: ${r.detail}`, r.ok);
+  } catch (e) { setStatus(id, false, "test failed"); toast(e.message); }
+}
+
+function panel(id, html) {
+  const p = $("panel-" + id);
+  p.innerHTML = html;
+  p.classList.add("open");
+}
+
+async function fetchAlerts(id) {
+  panel(id, '<h4>Loading alerts…</h4>');
+  try {
+    const r = await api(`/api/providers/${id}/alerts?limit=50`);
+    if (!r.count) return panel(id, `<h4>Alerts</h4><div class="empty">No alerts returned.</div>`);
+    panel(id, `<h4>${esc(r.provider_name)} · ${r.count} alerts (showing ${Math.min(50, r.alerts.length)})</h4>` +
+      alertTable(r.alerts));
+  } catch (e) { panel(id, `<h4>Alerts</h4><pre class="detail">${esc(e.message)}</pre>`); }
+}
+
+function alertTable(alerts) {
+  const rows = alerts.map(a => `
+    <tr>
+      <td>${esc(a.alert_id || "-")}</td>
+      <td class="sev ${String(a.severity || "").toLowerCase()}">${esc(a.severity || "-")}</td>
+      <td>${esc(a.rule_name || "-")}</td>
+      <td>${esc(a.host || "-")}</td>
+      <td>${esc(a.user || "-")}</td>
+      <td>${esc(a.src_ip || "-")}</td>
+    </tr>`).join("");
+  return `<table><thead><tr><th>ID</th><th>Sev</th><th>Rule</th><th>Host</th><th>User</th><th>Src IP</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+async function runTriage(id) {
+  panel(id, '<h4>Triaging (this can take a while)…</h4>');
+  try {
+    const r = await api(`/api/providers/${id}/triage`, { method: "POST" });
+    if (r.triaged === 0) return panel(id, `<h4>Triage</h4><div class="empty">${esc(r.note || "No alerts.")}</div>`);
+    const rows = r.results.map(x => x.error
+      ? `<tr><td>${esc(x.alert_id)}</td><td colspan="5" style="color:var(--red)">${esc(x.error)}</td></tr>`
+      : `<tr>
+          <td>${esc(x.alert_id)}</td>
+          <td>${esc(x.verdict)}</td>
+          <td>${Number(x.confidence).toFixed(2)}</td>
+          <td>${esc(x.recommended_action)}</td>
+          <td>${x.needs_human_review ? "👤 human review" : "auto-closeable"}</td>
+          <td>${esc(x.rationale)}</td>
+        </tr>`).join("");
+    panel(id, `<h4>${esc(r.provider_name)} · triaged ${r.triaged} alert(s) → data/triage_log.jsonl</h4>` +
+      `<table><thead><tr><th>Alert ID</th><th>Verdict</th><th>Conf</th><th>Action</th><th>Routing</th><th>Rationale</th></tr></thead><tbody>${rows}</tbody></table>`);
+    toast(`Triaged ${r.triaged} alert(s) from ${r.provider_name}`, true);
+  } catch (e) { panel(id, `<h4>Triage</h4><pre class="detail">${esc(e.message)}</pre>`); toast(e.message); }
+}
+
+async function removeConn(id) {
+  const p = PROVIDERS.find(x => x.id === id);
+  if (!confirm(`Delete provider '${p ? p.name : id}'? This only removes the stored connection, not the SIEM.`)) return;
+  try {
+    await api(`/api/providers/${id}`, { method: "DELETE" });
+    toast("Provider deleted.", true);
+    loadProviders();
+  } catch (e) { toast(e.message); }
+}
+
+$("add-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const config = {};
+  for (const input of $("dynamic-fields").querySelectorAll("input, select")) {
+    if (input.value !== "") config[input.name] = input.value;
+  }
+  try {
+    await api("/api/providers", { method: "POST", body: JSON.stringify({
+      name: $("p-name").value, platform: $("p-platform").value, config,
+    }) });
+    $("p-name").value = "";
+    toast("Provider added.", true);
+    loadProviders();
+  } catch (e) { toast(e.message); }
+});
+
+/* ---------------- init ---------------- */
+(async () => {
+  try {
+    await Promise.all([loadHealth(), loadPlatforms()]);
+    await loadProviders();
+  } catch (e) { toast("Could not load dashboard: " + e.message); }
+})();
+</script>
+</body>
+</html>

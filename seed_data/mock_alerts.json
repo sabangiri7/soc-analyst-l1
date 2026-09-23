@@ -1,0 +1,46 @@
+[
+  {
+    "alert_id": "SPLK-10231",
+    "rule_name": "Brute Force - Multiple Auth Failures Then Success",
+    "severity": "high",
+    "description": "12 failed logins followed by 1 successful login for user jsmith@corp.local from IP 185.220.101.7",
+    "user": "jsmith",
+    "src_ip": "185.220.101.7",
+    "host": null,
+    "raw_fields": {
+      "failed_count": 12,
+      "success": true,
+      "mfa_satisfied": false,
+      "source_asn": "AS9009 (known VPN/proxy hosting provider)"
+    }
+  },
+  {
+    "alert_id": "SPLK-10245",
+    "rule_name": "EDR Malware Detection - Suspicious Process",
+    "severity": "critical",
+    "description": "CrowdStrike flagged powershell.exe spawned by WINWORD.EXE with base64-encoded command line on host WKS-FIN-0231",
+    "host": "WKS-FIN-0231",
+    "host_id": "mock-host-id-0231",
+    "detection_id": "mock-detection-9981",
+    "falcon_process_id": "mock-process-4471",
+    "raw_fields": {
+      "parent_process": "WINWORD.EXE",
+      "child_process": "powershell.exe",
+      "command_line_snippet": "-enc JAB...(truncated)",
+      "prevented": false
+    }
+  },
+  {
+    "alert_id": "SPLK-10250",
+    "rule_name": "Phishing - User Reported Suspicious Email",
+    "severity": "medium",
+    "description": "User reported an email claiming to be from IT support asking to verify credentials via a link",
+    "user": "agarcia",
+    "raw_fields": {
+      "sender": "it-support@corp-secure-login.net",
+      "spf": "fail",
+      "dkim": "fail",
+      "link_clicked": false
+    }
+  }
+]

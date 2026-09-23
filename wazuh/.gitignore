@@ -1,0 +1,4 @@
+# Generated PKI material (contains private keys) - keep out of version control
+config/wazuh_indexer_ssl_certs/
+*.pem
+*.key

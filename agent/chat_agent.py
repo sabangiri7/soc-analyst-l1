@@ -1,0 +1,499 @@
+"""
+Conversational SOC assistant agent.
+
+Same bounded tool-use loop as TriageAgent, but built for free-form
+conversation instead of a single verdict: the user asks a question
+("what's the status of alert SPLK-10231?", "show me jsmith's recent
+events", "add 185.220.101.7 to the watchlist", "close SPLK-10245 as a
+false positive", ...) and the agent calls read/write tools across:
+
+  - alert status / history          (get_alert_status, search_related_events)
+  - user / host enrichment          (get_user_details, search_related_events)
+  - R/W dashboard providers         (list/add/remove/test_provider)
+  - R/W alerts                      (get_alerts, update_alert)
+  - R/W lookup tables (watchlists /
+    threat intel / allowlists)      (list/read/write_lookup_table)
+  - web search (OSINT enrichment)   (web_search - optional, DuckDuckGo/SearXNG)
+
+The agent must finish by calling `answer_user` with a natural-language reply +
+any structured data it gathered. Every tool call and result is kept in the
+transcript, which the dashboard stores per-chat for the audit trail.
+"""
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from config import cfg
+from llm import get_provider
+from connectors.siem import SIEMConnector
+from siem_providers import (
+    connector_for,
+    get_provider as store_get_provider,
+    load_providers,
+    remove_provider as store_remove_provider,
+    add_provider as store_add_provider,
+)
+import lookup_tables as lookup
+
+MAX_TOOL_TURNS = 6
+
+SYSTEM_PROMPT = """You are a conversational SOC assistant. You help an analyst \
+answer questions and take read/write actions on their SIEM dashboard and lookup \
+tables - always grounded in evidence you actually retrieved. Never invent alert \
+statuses, user details, or table contents you haven't looked up with a tool.
+
+When the user asks for an action (close/annotate an alert, add/remove a lookup \
+entry, add/remove a dashboard provider), call the relevant write tool. For \
+writes, confirm the result came back from the underlying store before claiming \
+success. When you don't know something, say so and suggest a tool call instead \
+of guessing.
+
+Finish every answer by calling `answer_user` with your reply text and any \
+structured data you collected. You may call web_search for OSINT enrichment, \
+but treat its results as background information (the model may be imperfect); \
+always hedge web-sourced facts you cannot verify against the SIEM."""
+
+TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "get_alert_status",
+        "description": "Read the triage status/history of one alert by its alert_id (e.g. SPLK-10231) - verdict, confidence, action, rationale if it was already triaged.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"alert_id": {"type": "string"}},
+            "required": ["alert_id"],
+        },
+    },
+    {
+        "name": "get_alerts",
+        "description": "Pull recent new alerts from a SIEM provider. Use to list alerts or find one when the user gives a host/user/severity but no alert id.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "provider_id": {"type": "string", "description": "provider id (optional, defaults to the active provider)"},
+                "severity": {"type": "string", "description": "optional filter: low|medium|high|critical"},
+                "host": {"type": "string", "description": "optional filter by host"},
+            },
+        },
+    },
+    {
+        "name": "get_user_details",
+        "description": "Look up recent SIEM events for a user and optional host - how much activity, unusual sources, auth failures. Use for user/host enrichment.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "user": {"type": "string"},
+                "host": {"type": "string"},
+                "earliest": {"type": "string", "description": "time window, default -24h"},
+            },
+        },
+    },
+    {
+        "name": "search_related_events",
+        "description": "Find other events for a host/user in a time window - correlation lookup (e.g. did this IP hit other hosts?).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string"},
+                "user": {"type": "string"},
+                "earliest": {"type": "string", "description": "default -24h"},
+            },
+        },
+    },
+    # --------------------------------------------------- R/W dashboard --- #
+    {
+        "name": "list_providers",
+        "description": "List every registered SIEM provider connection (env-seeded + dashboard-added) with its platform and enabled state.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "add_provider",
+        "description": "Register a new SIEM provider connection. `platform` must be one of: splunk, qradar, elastic, sentinel, wazuh, mock. `config` holds connection fields from the platform's field list (see /api/platforms).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "platform": {"type": "string"},
+                "config": {"type": "object"},
+            },
+            "required": ["name", "platform"],
+        },
+    },
+    {
+        "name": "remove_provider",
+        "description": "Delete a dashboard-added SIEM provider connection by its provider id (env-seeded ones cannot be removed via chat).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"provider_id": {"type": "string"}},
+            "required": ["provider_id"],
+        },
+    },
+    {
+        "name": "test_provider",
+        "description": "Test a SIEM provider connection (reachability + auth) by provider id.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"provider_id": {"type": "string"}},
+            "required": ["provider_id"],
+        },
+    },
+    # ------------------------------------------------------ R/W alerts --- #
+    {
+        "name": "update_alert",
+        "description": "Write a verdict/status back to an alert: annotate it with a comment or close it. `action` is 'annotate' or 'close'. For close, `status` is the close reason (e.g. 'false positive', 'resolved', 'escalated') and `comment` is the analyst note. Writes to the SIEM via the connector's close path.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "alert_id": {"type": "string"},
+                "action": {"type": "string", "enum": ["annotate", "close"]},
+                "status": {"type": "string"},
+                "comment": {"type": "string"},
+            },
+            "required": ["alert_id", "action", "comment"],
+        },
+    },
+    # ------------------------------------------------ R/W lookup tables -- #
+    {
+        "name": "list_lookup_tables",
+        "description": "List all lookup tables (watchlists, threat intel, allowlists) with their entry counts.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "read_lookup_table",
+        "description": "Read the entries of a lookup table, optionally filtering by a search term.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "query": {"type": "string", "description": "optional substring filter across keys+values"},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "write_lookup_table",
+        "description": "Create or update a lookup table. `action` is 'upsert' (add/replace an entry, creating the table if needed) or 'clear' (empty a table). For upsert provide `key` and `value` (a small JSON value). `description` is set when creating a new table.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "action": {"type": "string", "enum": ["upsert", "clear"]},
+                "key": {"type": "string"},
+                "value": {"type": "object"},
+                "description": {"type": "string"},
+            },
+            "required": ["name", "action"],
+        },
+    },
+    # ------------------------------------------------------- web search -- #
+    {
+        "name": "web_search",
+        "description": "OSINT/web search for enrichment (e.g. an IP, hash, domain, or CVE). Uses DuckDuckGo or a configured SearXNG. Disabled or offline when no backend is available.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    },
+    # ------------------------------------------------------------ final --- #
+    {
+        "name": "answer_user",
+        "description": "Provide the final natural-language answer to the user, plus any structured data you gathered. Call this exactly once at the end.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "answer": {"type": "string"},
+                "data": {"type": "object", "description": "optional structured data (e.g. alerts, table rows, enrichment)"},
+            },
+            "required": ["answer"],
+        },
+    },
+]
+
+
+@dataclass
+class ChatResult:
+    reply: str
+    data: dict[str, Any] = field(default_factory=dict)
+    transcript: list[dict[str, Any]] = field(default_factory=list)
+
+
+class ChatAgent:
+    def __init__(self, siem: SIEMConnector | None = None, provider_id: str | None = None):
+        self.llm = get_provider()
+        self.siem = siem
+        self.provider_id = provider_id
+
+    # ------------------------------------------------------------------ #
+    def _execute_tool(self, name: str, tool_input: dict[str, Any]) -> Any:
+        if name == "get_alert_status":
+            return self._alert_status(tool_input)
+        if name == "get_alerts":
+            return self._get_alerts(tool_input)
+        if name == "get_user_details":
+            return self._get_user_details(tool_input)
+        if name == "search_related_events":
+            if self.siem is None:
+                return {"error": "No SIEM connection available in this chat."}
+            return self.siem.search_related_events(
+                host=tool_input.get("host"),
+                user=tool_input.get("user"),
+                earliest=tool_input.get("earliest", "-24h"),
+            )
+        if name in ("list_providers", "add_provider", "remove_provider", "test_provider"):
+            return self._providers(name, tool_input)
+        if name == "update_alert":
+            return self._update_alert(tool_input)
+        if name == "list_lookup_tables":
+            return lookup.list_lookup_tables()
+        if name == "read_lookup_table":
+            return lookup.read_lookup_table(tool_input.get("name", "")) or {}
+        if name == "write_lookup_table":
+            return self._write_lookup(tool_input)
+        if name == "web_search":
+            return web_search(tool_input.get("query", ""))
+        raise ValueError(f"unknown tool {name}")  # pragma: no cover
+
+    # ------------------------------------------------------------------ #
+    def _alert_status(self, tool_input: dict[str, Any]) -> Any:
+        alert_id = (tool_input.get("alert_id") or "").strip()
+        out: dict[str, Any] = {"alert_id": alert_id}
+        # 1) What the agent already decided (triage log, if present)
+        verdicts = []
+        log = Path(cfg.TRIAGE_LOG_PATH)
+        if log.exists():
+            for line in log.read_text().splitlines():
+                if not line.strip() or alert_id not in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                result = row.get("result") or {}
+                verdicts.append({
+                    "at": (row.get("ts") or ""),
+                    "verdict": result.get("verdict"),
+                    "confidence": result.get("confidence"),
+                    "recommended_action": result.get("recommended_action"),
+                    "rationale": (result.get("rationale") or "")[:400],
+                })
+        out["triage_verdicts"] = verdicts
+        # 2) Current alert doc shape from the SIEM, if we can find it
+        if self.siem is not None:
+            try:
+                for a in self.siem.get_new_alerts() or []:
+                    if a.get("alert_id") == alert_id:
+                        out["current"] = {k: v for k, v in a.items() if k != "raw_fields"}
+                        break
+            except Exception as e:  # noqa: BLE001 - SIEM down shouldn't block an answer
+                out["siem_error"] = str(e)
+        if not verdicts and "current" not in out:
+            out["note"] = "No triage verdict and no matching alert found in the current pull window."
+        return out
+
+    def _get_alerts(self, tool_input: dict[str, Any]) -> Any:
+        if self.siem is None:
+            return {"error": "No SIEM connection available in this chat."}
+        try:
+            alerts = self.siem.get_new_alerts() or []
+        except Exception as e:  # noqa: BLE001
+            return {"error": f"Failed to pull alerts: {e}"}
+        severity = tool_input.get("severity")
+        host = tool_input.get("host")
+        out = []
+        for a in alerts:
+            if severity and (a.get("severity") or "").lower() != str(severity).lower():
+                continue
+            if host and host not in (a.get("host") or ""):
+                continue
+            out.append({k: v for k, v in a.items() if k != "raw_fields"})
+        return {"count": len(out), "alerts": out[:25]}
+
+    def _get_user_details(self, tool_input: dict[str, Any]) -> Any:
+        if self.siem is None:
+            return {"error": "No SIEM connection available in this chat."}
+        try:
+            events = self.siem.search_related_events(
+                host=tool_input.get("host"),
+                user=tool_input.get("user"),
+                earliest=tool_input.get("earliest", "-24h"),
+            )
+        except Exception as e:  # noqa: BLE001
+            return {"error": f"Failed to search user events: {e}"}
+        return {"user": tool_input.get("user"), "host": tool_input.get("host"), "events": events or [], "event_count": len(events or [])}
+
+    def _providers(self, name: str, tool_input: dict[str, Any]) -> Any:
+        if name == "list_providers":
+            return [
+                {"id": p.get("id"), "name": p.get("name"), "platform": p.get("platform"), "source": p.get("source"), "enabled": p.get("enabled")}
+                for p in load_providers()
+            ]
+        if name == "add_provider":
+            config = tool_input.get("config") or {}
+            try:
+                provider = store_add_provider({
+                    "name": tool_input.get("name", ""),
+                    "platform": tool_input.get("platform", ""),
+                    "config": config,
+                })
+            except Exception as e:  # noqa: BLE001 - validation error -> plain message
+                return {"error": str(e)}
+            return {"added": True, "id": provider.get("id"), "platform": provider.get("platform")}
+        if name == "remove_provider":
+            ok = store_remove_provider(tool_input.get("provider_id", ""))
+            return {"removed": ok, "note": "Provider deleted." if ok else "Provider not found or it is env-seeded (cannot delete via chat)."}
+        # test_provider
+        provider = store_get_provider(tool_input.get("provider_id", ""))
+        if not provider:
+            return {"error": f"Provider '{tool_input.get('provider_id')}' not found."}
+        try:
+            conn = connector_for(provider)
+        except Exception as e:  # noqa: BLE001
+            return {"error": f"Could not build connector: {e}"}
+        return conn.test_connection()
+
+    def _update_alert(self, tool_input: dict[str, Any]) -> Any:
+        alert_id = tool_input.get("alert_id", "")
+        action = tool_input.get("action", "")
+        comment = tool_input.get("comment", "")
+        status = tool_input.get("status", "")
+        if self.siem is None:
+            return {"error": "No SIEM connection available in this chat - cannot write back."}
+        try:
+            if action == "close":
+                self.siem.close_notable(event_id=alert_id, status=status or "closed", comment=comment)
+                return {"updated": True, "action": "close", "alert_id": alert_id, "status": status or "closed"}
+            # annotate == a close_notable write with the existing/default status so
+            # connectors that only support one write path can still persist notes.
+            self.siem.close_notable(event_id=alert_id, status=status or "annotated", comment=f"ANNOTATION: {comment}")
+            return {"updated": True, "action": "annotate", "alert_id": alert_id}
+        except Exception as e:  # noqa: BLE001 - SIEM write failure shouldn't crash the chat
+            return {"error": f"Write failed: {e}", "action": action, "alert_id": alert_id}
+
+    def _write_lookup(self, tool_input: dict[str, Any]) -> Any:
+        name = (tool_input.get("name") or "").strip()
+        if not name:
+            return {"error": "Table name is required."}
+        action = tool_input.get("action", "")
+        if action == "clear":
+            try:
+                for key in list((lookup.read_lookup_table(name) or {}).get("entries") or {}):
+                    lookup.delete_entry(name, key)
+            except Exception as e:  # noqa: BLE001
+                return {"error": f"Clear failed: {e}"}
+            return {"updated": True, "action": "clear", "name": name}
+        # upsert
+        key = str(tool_input.get("key") or "").strip()
+        if not key:
+            return {"error": "`key` is required for upsert."}
+        try:
+            table = lookup.upsert_entry(name, key, tool_input.get("value") or {}, description=tool_input.get("description", ""))
+            return {"updated": True, "action": "upsert", "name": name, "key": key, "entry_count": len((table.get("entries") or {}))}
+        except Exception as e:  # noqa: BLE001
+            return {"error": f"Upsert failed: {e}"}
+
+    # ------------------------------------------------------------------ #
+    def chat(self, *, user_message: str, history: list[dict[str, Any]] | None = None) -> ChatResult:
+        messages: list[dict[str, Any]] = list(history or [])
+        messages.append({"role": "user", "content": user_message})
+        transcript: list[dict[str, Any]] = []
+
+        for _ in range(MAX_TOOL_TURNS):
+            resp = self.llm.chat(
+                system=SYSTEM_PROMPT,
+                messages=messages,
+                tools=TOOLS,
+                max_tokens=2000,
+            )
+            if not resp.tool_calls:
+                messages.append({"role": "assistant", "content": resp.content or ""})
+                continue
+            transcript.append({"assistant": resp.content or "", "tool_calls": [{"name": tc.name, "input": tc.input} for tc in resp.tool_calls]})
+            messages.append({
+                "role": "assistant",
+                "content": resp.content,
+                "tool_calls": [{"id": tc.id, "name": tc.name, "input": tc.input} for tc in resp.tool_calls],
+            })
+            tool_results = []
+            for tc in resp.tool_calls:
+                if tc.name == "answer_user":
+                    return ChatResult(
+                        reply=tc.input.get("answer", ""),
+                        data=tc.input.get("data") or {},
+                        transcript=transcript,
+                    )
+                try:
+                    result = self._execute_tool(tc.name, tc.input)
+                except Exception as e:  # noqa: BLE001 - never let a tool crash the loop
+                    result = {"error": str(e)}
+                tool_results.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result, default=str)})
+            messages.extend(tool_results)
+
+        return ChatResult(
+            reply="I wasn't able to finish a complete answer within the tool budget. Please rephrase or narrow the question.",
+            transcript=transcript,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Web search (OSINT) - graceful fallback chain, no hard dependency.
+def _ddg_instant(query: str) -> list[dict[str, Any]]:
+    import requests
+
+    url = "https://api.duckduckgo.com/"
+    params = {"q": query, "format": "json", "no_html": 1, "skip_disambig": 1}
+    try:
+        r = requests.get(url, params=params, timeout=8)
+        r.raise_for_status()
+    except Exception:  # noqa: BLE001 - offline / blocked -> fall through
+        return []
+    data = r.json()
+    out = []
+    if data.get("AbstractText"):
+        out.append({"title": "Instant answer", "snippet": data["AbstractText"], "url": data.get("AbstractURL", "")})
+    for t in data.get("RelatedTopics") or []:
+        if isinstance(t, dict) and t.get("Text"):
+            out.append({"title": t.get("Text", "")[:80], "snippet": t.get("Text", ""), "url": t.get("FirstURL", "")})
+        elif isinstance(t, dict) and t.get("Topics"):
+            for s in t["Topics"]:
+                if s.get("Text"):
+                    out.append({"title": s.get("Text", "")[:80], "snippet": s.get("Text", ""), "url": s.get("FirstURL", "")})
+    return out[:10]
+
+
+def _searxng(query: str) -> list[dict[str, Any]]:
+    import requests
+
+    base = cfg.SEARXNG_URL.rstrip("/")
+    if not base:
+        return []
+    try:
+        r = requests.get(
+            f"{base}/search",
+            params={"q": query, "format": "json"},
+            headers={"User-Agent": "soc-triage-agent/1.0"},
+            timeout=8,
+        )
+        r.raise_for_status()
+    except Exception:  # noqa: BLE001 - searxng down -> fall through
+        return []
+    results = r.json().get("results") or []
+    return [
+        {"title": (x.get("title") or "")[:120], "snippet": (x.get("content") or "")[:300], "url": x.get("url", "")}
+        for x in results[:8]
+    ]
+
+
+def web_search(query: str) -> dict[str, Any]:
+    """OSINT web search. DuckDuckGo instant-answer first; SearXNG when configured."""
+    if not cfg.WEB_SEARCH_ENABLED:
+        return {"enabled": False, "note": "Web search is disabled (WEB_SEARCH_ENABLED=false).", "results": []}
+    results = _ddg_instant(query)
+    backend = "duckduckgo"
+    if not results:
+        results = _searxng(query)
+        backend = "searxng"
+    return {"enabled": True, "backend": backend, "query": query, "count": len(results), "results": results}

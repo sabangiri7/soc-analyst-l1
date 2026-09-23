@@ -1,0 +1,31 @@
+# --- secrets: NEVER commit ---
+.env
+.env.*
+!.env.example
+!.env.example
+data/siem_providers.json
+data/agent_heartbeat.json
+data/agent_stop.txt
+data/*.jsonl
+data/*.json
+data/chroma/
+
+# --- python ---
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+venv*/
+*.egg-info/
+.pytest_cache/
+
+# --- data dir (runtime artifacts) ---
+data/*
+!data/.gitkeep
+
+# --- OS / editor / misc ---
+.DS_Store
+Thumbs.db
+*.swp
+*.log
+nohup.out

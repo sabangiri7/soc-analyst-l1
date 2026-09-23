@@ -1,0 +1,17 @@
+# Generates the internal PKI (root CA + per-service certs) into
+# ./config/wazuh_indexer_ssl_certs/ using the Wazuh indexer cert tool.
+#
+# Run BEFORE docker compose up (first time only):
+#   docker compose -f generate-indexer-certs.yml run --rm generator
+#
+# The generated directory contains private keys - it is git-ignored and must
+# be kept secret. The compose mounts these certs into manager/indexer/dashboard.
+services:
+  generator:
+    image: wazuh/wazuh-certs-generator:0.0.2
+    hostname: wazuh-certs-generator
+    container_name: wazuh-certs-generator
+    entrypoint: /entrypoint.sh
+    volumes:
+      - ./config/wazuh_indexer_ssl_certs/:/certificates/
+      - ./config/certs.yml:/config/certs.yml
