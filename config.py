@@ -45,6 +45,66 @@ class Config:
     # <PROVIDER>_MODEL.
     AGENT_MODEL = os.getenv("AGENT_MODEL", "claude-sonnet-4-6")
 
+    # --- Agent watcher plumbing (run.py / dashboard agent panel) ---
+    # Stop-file: dashboard writes it to ask the overnight watcher to stop.
+    AGENT_STOP_FILE = os.getenv("AGENT_STOP_FILE", "data/agent_stop.txt")
+    # Heartbeat: watcher updates it each poll so the dashboard can show
+    # "still alive / last cycle / triaged" without polling the process.
+    AGENT_HEARTBEAT_PATH = os.getenv("AGENT_HEARTBEAT_PATH", "data/agent_heartbeat.json")
+    # Seconds between poll cycles (--interval default in run.py).
+    AGENT_POLL_INTERVAL = float(os.getenv("AGENT_POLL_INTERVAL", "30"))
+
+    # --- LLM retry/backoff (openai_compat_provider._post) ---
+    # Free gateways (FreeLLMAPI, OpenRouter free tier, ...) throw 429/5xx under
+    # load; retries with exponential backoff + jitter keep one blip from killing
+    # a whole overnight batch. LLM_RETRY_BACKOFF_BASE caps per-step max wait.
+    LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "5"))
+    LLM_RETRY_BACKOFF_BASE = float(os.getenv("LLM_RETRY_BACKOFF_BASE", "1.5"))
+    LLM_RETRY_BACKOFF_MAX = float(os.getenv("LLM_RETRY_BACKOFF_MAX", "30"))
+
+    # --- Audit / triage logs ---
+    # Chat + triage transcripts land here as JSONL (same file the dashboard's
+    # "chat" and "triage" panels append to).
+    TRIAGE_LOG_PATH = os.getenv("TRIAGE_LOG_PATH", "data/triage_log.jsonl")
+
+    # Lookup tables - small named threat-intel stores for the chat agent and
+    # dashboard (see lookup_tables.py). Single atomic JSON file.
+    LOOKUP_TABLES_PATH = os.getenv("LOOKUP_TABLES_PATH", "data/lookup_tables.json")
+
+    # --- Web search (OSINT enrichment, no API key) ---
+    # OFF by default so triage never blocks on an external lookup. When on,
+    # the chat agent can enrich alerts via SearXNG (or DuckDuckGo fallback).
+    WEB_SEARCH_ENABLED = _bool("WEB_SEARCH_ENABLED", False)
+    SEARXNG_URL = os.getenv("SEARXNG_URL", "")
+
+    # ---------------------------------------------------------------------- #
+    # Overnight watcher (run.py) + chat agent paths + LLM retry behavior.
+    # These are the attributes the dashboard's chat / lookup-table / agent
+    # control panels wire up; they used to be referenced but never defined,
+    # which crashed run.py on the very first poll. All offline-safe.
+    AGENT_STOP_FILE = os.getenv("AGENT_STOP_FILE", "data/agent_stop.txt")
+    AGENT_HEARTBEAT_PATH = os.getenv("AGENT_HEARTBEAT_PATH", "data/agent_heartbeat.json")
+    AGENT_POLL_INTERVAL = float(os.getenv("AGENT_POLL_INTERVAL", "30"))
+    AGENT_EXIT_AFTER = int(os.getenv("AGENT_EXIT_AFTER", "0"))
+
+    # LLM retry/backoff - retried transient failures (429/5xx/network) with
+    # exponential backoff + jitter instead of killing a whole triage batch.
+    LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "5"))
+    LLM_RETRY_BACKOFF_BASE = float(os.getenv("LLM_RETRY_BACKOFF_BASE", "1.5"))
+    LLM_RETRY_BACKOFF_MAX = float(os.getenv("LLM_RETRY_BACKOFF_MAX", "30"))
+
+    # Audit / storage (JSONL + JSON stores under data/)
+    TRIAGE_LOG_PATH = os.getenv("TRIAGE_LOG_PATH", "data/triage_log.jsonl")
+    CHAT_LOG_PATH = os.getenv("CHAT_LOG_PATH", "data/chat_log.jsonl")
+    LOOKUP_TABLES_PATH = os.getenv("LOOKUP_TABLES_PATH", "data/lookup_tables.json")
+
+    # Web search / OSINT enrichment for the chat agent - no API key needed
+    # (DuckDuckGo instant answers + optional self-hosted SearXNG). Off keeps
+    # triage fully offline.
+    WEB_SEARCH_ENABLED = _bool("WEB_SEARCH_ENABLED", False)
+    SEARXNG_URL = os.getenv("SEARXNG_URL", "")
+
+
     # Splunk
     SPLUNK_HOST = os.getenv("SPLUNK_HOST", "")
     SPLUNK_TOKEN = os.getenv("SPLUNK_TOKEN", "")

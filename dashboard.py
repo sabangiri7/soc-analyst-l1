@@ -21,6 +21,11 @@ API (JSON): /api/platforms, /api/providers,
 """
 from __future__ import annotations
 import json
+import os
+import signal
+import subprocess
+import sys
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -30,6 +35,8 @@ from flask import Flask, jsonify, render_template, request
 import siem_providers as store
 from connectors.siem import PLATFORM_FIELDS
 from agent.triage_agent import TriageAgent
+from agent.chat_agent import ChatAgent
+import lookup_tables as lookup
 
 app = Flask(__name__)
 
@@ -179,6 +186,204 @@ def api_triage(provider_id: str):
         "triaged": len(results),
         "results": results,
     })
+
+
+# --------------------------------------------------------------------------- #
+# Chat agent route - conversational SOC assistant with R/W lookup tables.
+# --------------------------------------------------------------------------- #
+CHAT_LOG = Path("data/chat_log.jsonl")
+CHAT_LIMIT_DEFAULT = 50
+
+
+@app.post("/api/chat")
+def api_chat():
+    body = request.get_json(force=True, silent=True) or {}
+    message = (body.get("message") or "").strip()
+    provider_id = body.get("provider_id") or ""
+    history = body.get("history") or []
+    if not message:
+        return jsonify({"error": "message is required."}), 400
+
+    siem = None
+    if provider_id:
+        conn, err, _ = _connector_or_error(provider_id)
+        if err:
+            return err
+        siem = conn
+
+    try:
+        agent = ChatAgent(siem=siem, provider_id=provider_id or None)
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": f"Could not start the chat agent: {e}"}), 400
+
+    result = agent.chat(user_message=message, history=history or [])
+
+    CHAT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(CHAT_LOG, "a") as f:
+        f.write(json.dumps({
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "message": message,
+            "reply": result.reply,
+            "data": result.data,
+            "transcript_len": len(result.transcript),
+        }, default=str) + "\n")
+
+    return jsonify({
+        "reply": result.reply,
+        "data": result.data,
+        "transcript_len": len(result.transcript),
+    })
+
+
+@app.get("/api/chat/history")
+def api_chat_history():
+    limit = int(request.args.get("limit", CHAT_LIMIT_DEFAULT))
+    if not CHAT_LOG.exists():
+        return jsonify({"entries": [], "count": 0})
+    entries = []
+    for line in CHAT_LOG.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    entries = entries[-limit:]
+    return jsonify({"entries": entries, "count": len(entries)})
+
+
+# --------------------------------------------------------------------------- #
+# Lookup-tables CRUD routes.
+# --------------------------------------------------------------------------- #
+@app.get("/api/lookup-tables")
+def api_lookup_tables():
+    return jsonify({"tables": lookup.list_lookup_tables()})
+
+
+@app.post("/api/lookup-tables")
+def api_create_lookup_table():
+    body = request.get_json(force=True, silent=True) or {}
+    name = (body.get("name") or "").strip()
+    description = (body.get("description") or "").strip()
+    if not name:
+        return jsonify({"error": "name is required."}), 400
+    try:
+        table = lookup.create_lookup_table(name, description)
+    except KeyError as e:
+        return jsonify({"error": str(e)}), 409
+    return jsonify({"table": {"name": name, "entry_count": len((table.get("entries") or {})), "updated": table.get("updated")}}), 201
+
+
+@app.get("/api/lookup-tables/<name>")
+def api_read_lookup_table(name: str):
+    table = lookup.read_lookup_table(name)
+    if not table:
+        return jsonify({"error": f"Lookup table '{name}' not found."}), 404
+    return jsonify({"name": name, "table": table})
+
+
+@app.post("/api/lookup-tables/<name>/entries/<key>")
+def api_upsert_lookup_entry(name: str, key: str):
+    body = request.get_json(force=True, silent=True) or {}
+    value = body.get("value")
+    try:
+        table = lookup.upsert_lookup_entry(name, key, value)
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"name": name, "key": key, "entry_count": len((table.get("entries") or {})), "updated": table.get("updated")})
+
+
+@app.delete("/api/lookup-tables/<name>/entries/<key>")
+def api_delete_lookup_entry(name: str, key: str):
+    ok = lookup.delete_lookup_entry(name, key)
+    if not ok:
+        return jsonify({"error": f"Key '{key}' not found in table '{name}'."}), 404
+    return jsonify({"ok": True})
+
+
+@app.delete("/api/lookup-tables/<name>")
+def api_delete_lookup_table(name: str):
+    ok = lookup.delete_lookup_table(name)
+    if not ok:
+        return jsonify({"error": f"Lookup table '{name}' not found."}), 404
+    return jsonify({"ok": True})
+
+
+# --------------------------------------------------------------------------- #
+# Agent control routes - overnight watcher status / start / stop.
+# --------------------------------------------------------------------------- #
+AGENT_POLL_TOLERANCE = 120  # seconds: heartbeat fresher than this counts as "running"
+
+
+@app.get("/api/agent")
+def api_agent_status():
+    from config import cfg
+    hb_path = Path(cfg.AGENT_HEARTBEAT_PATH or "data/agent_heartbeat.json")
+    stop_path = Path(cfg.AGENT_STOP_FILE or "data/agent_stop.txt")
+    try:
+        hb = json.loads(hb_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        hb = {}
+    running = bool(hb.get("status") == "running")
+    now = time.time()
+    last_ts = hb.get("at")
+    last_age = None
+    if last_ts:
+        try:
+            import datetime
+            last_dt = datetime.datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+            last_age = (datetime.datetime.now(datetime.timezone.utc) - last_dt).total_seconds()
+        except Exception:
+            last_age = None
+    return jsonify({
+        "running": running and (last_age is None or last_age < AGENT_POLL_TOLERANCE),
+        "last_heartbeat": last_ts,
+        "last_heartbeat_age_s": last_age,
+        "pid": hb.get("pid"),
+        "stop_file_present": stop_path.exists(),
+        "cycle": hb.get("cycle"),
+        "triaged_this_cycle": hb.get("triaged_this_cycle"),
+        "alerts_seen": hb.get("alerts_seen"),
+        "status": hb.get("status"),
+        "reason": hb.get("reason"),
+    })
+
+
+@app.post("/api/agent/start")
+def api_agent_start():
+    from config import cfg
+    stop_path = Path(cfg.AGENT_STOP_FILE or "data/agent_stop.txt")
+    if stop_path.exists():
+        stop_path.unlink()
+
+    cmd = [sys.executable, str(Path(__file__).parent / "run.py")]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    # Write a temporary heartbeat so the dashboard can pick up the pid quickly.
+    hb_path = Path(cfg.AGENT_HEARTBEAT_PATH or "data/agent_heartbeat.json")
+    hb_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = hb_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"status": "starting", "pid": proc.pid, "at": time.strftime("%Y-%m-%dT%H:%M:%S")}, indent=2))
+    tmp.replace(hb_path)
+    return jsonify({"ok": True, "pid": proc.pid})
+
+
+@app.post("/api/agent/stop")
+def api_agent_stop():
+    from config import cfg
+    hb_path = Path(cfg.AGENT_HEARTBEAT_PATH or "data/agent_heartbeat.json")
+    stop_path = Path(cfg.AGENT_STOP_FILE or "data/agent_stop.txt")
+    try:
+        hb = json.loads(hb_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        hb = {}
+    pid = hb.get("pid")
+    if pid:
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass
+    stop_path.touch()
+    return jsonify({"ok": True})
 
 
 if __name__ == "__main__":

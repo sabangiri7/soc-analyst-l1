@@ -351,3 +351,11 @@ LLM_RETRY_BACKOFF_MAX=30     # cap on each backoff step (seconds)
   `data/triage_log.jsonl` vs. analyst corrections over time — this is what
   tells you when it's safe to raise `AUTO_CLOSE_CONFIDENCE_THRESHOLD` or
   flip `DRY_RUN_ACTIONS`.
+
+## Dashboard panels
+
+The Flask dashboard (`dashboard.py`, port 5001) now exposes three new panels beyond the SIEM provider cards:
+
+- **💬 SOC Chat Assistant** (`POST /api/chat`, `GET /api/chat/history`) — a conversational L1 analyst that can answer questions about alerts, look up user/host enrichment, manage lookup tables, and optionally connect to a SIEM for live alert context. Every exchange is appended to `data/chat_log.jsonl` for audit.
+- **📋 Lookup Tables** (`GET/POST /api/lookup-tables`, `GET/DELETE /api/lookup-tables/<name>`, `POST/DELETE /api/lookup-tables/<name>/entries/<key>`) — full CRUD for threat-intel / watchlist stores backed by `data/lookup_tables.json`. The chat agent calls these same primitives via its `write_lookup_table` tool.
+- **🤖 Overnight Watcher** (`GET/POST /api/agent`, `POST /api/agent/start|stop`) — controls `run.py`'s overnight triage loop. Start spawns `python run.py` in a detached session and writes an initial heartbeat; stop writes the stop-file kill switch (`data/agent_stop.txt`) and best-effort SIGTERMs the watcher PID. Status reports `running`/`stopped`, last heartbeat age, current cycle count, and whether the stop file is present. Poll every 2–5 s from the UI.

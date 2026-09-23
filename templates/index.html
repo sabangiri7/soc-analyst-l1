@@ -56,6 +56,17 @@
   .toast.ok { border-color: var(--green); }
   .empty { color: var(--muted); font-style: italic; padding: 8px 0; }
   .summary li { list-style: none; }
+  /* chat / lookup / agent panels */
+  .chat-wrap { display: flex; flex-direction: column; gap: 8px; max-height: 420px; overflow: auto; }
+  .chat-msg { padding: 8px 10px; border-radius: 6px; font-size: 12px; white-space: pre-wrap; }
+  .chat-msg.user { background: #1a2332; border: 1px solid var(--border); }
+  .chat-msg.agent { background: #1a2f23; border: 1px solid #234; }
+  .chat-input { display: flex; gap: 8px; }
+  .chat-input input { flex: 1; }
+  .lookup-row { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
+  .lookup-row input { flex: 1; min-width: 0; }
+  .agent-status { display: flex; align-items: center; gap: 10px; padding: 8px 0; }
+  .heartbeat-age { color: var(--muted); font-size: 11px; }
 </style>
 </head>
 <body>
@@ -85,6 +96,82 @@
 </form>
 
 <div class="grid" id="providers"></div>
+
+<!-- Chat panel -->
+<div class="card">
+  <div class="top">
+    <div class="title">💬 SOC Chat Assistant</div>
+    <div class="meta">R/W lookup tables · SIEM enrichment</div>
+  </div>
+  <div class="panel open" id="panel-chat">
+    <div class="chat-wrap" id="chat-wrap"></div>
+    <div style="margin-top:8px">
+      <label>Provider (optional — for SIEM-aware questions)</label>
+      <select id="chat-provider" style="width:100%">
+        <option value="">(none)</option>
+      </select>
+    </div>
+    <div class="chat-input" style="margin-top:6px">
+      <input id="chat-input" placeholder="e.g. 'what's the status of alert ...'" />
+      <button class="btn primary" onclick="sendChat()">Send</button>
+    </div>
+    <div class="actions" style="margin-top:6px">
+      <button class="btn" onclick="loadChatHistory()">History</button>
+      <button class="btn danger" onclick="clearChat()">Clear</button>
+    </div>
+  </div>
+</div>
+
+<!-- Lookup tables panel -->
+<div class="card">
+  <div class="top">
+    <div class="title">📋 Lookup Tables</div>
+    <div class="meta">CRUD · threat intel · watchlists</div>
+  </div>
+  <div class="panel" id="panel-lookup">
+    <div id="lookup-list"><div class="empty">No tables loaded.</div></div>
+    <div style="margin-top:10px; border-top:1px solid var(--border); padding-top:10px">
+      <h4>Create / Manage</h4>
+      <div class="lookup-row">
+        <input id="lookup-name" placeholder="Table name" style="flex:2" />
+        <input id="lookup-desc" placeholder="Description" style="flex:3" />
+        <button class="btn primary" onclick="createLookupTable()">Create</button>
+      </div>
+      <div class="lookup-row" id="lookup-entry-row" style="display:none">
+        <input id="lookup-key" placeholder="Key" style="flex:1" />
+        <input id="lookup-value" placeholder='{"value": "..."}' style="flex:2" />
+        <button class="btn" onclick="upsertLookupEntry()">Upsert</button>
+        <button class="btn danger" onclick="deleteLookupEntry()">Del</button>
+      </div>
+      <div class="actions" style="margin-top:6px">
+        <button class="btn" onclick="loadLookupTables()">Refresh</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Agent control panel -->
+<div class="card">
+  <div class="top">
+    <div class="title">🤖 Overnight Watcher</div>
+    <div class="meta">run.py · start / stop / heartbeat</div>
+  </div>
+  <div class="panel" id="panel-agent">
+    <div class="agent-status" id="agent-status-row">
+      <span class="dot" id="agent-dot"></span>
+      <span id="agent-state">Checking...</span>
+    </div>
+    <div class="meta" id="agent-meta"></div>
+    <div class="actions" style="margin-top:8px">
+      <button class="btn primary" id="agent-start-btn" onclick="agentStart()">Start</button>
+      <button class="btn danger" id="agent-stop-btn" onclick="agentStop()">Stop</button>
+      <button class="btn" onclick="agentRefresh()">Refresh status</button>
+    </div>
+    <div class="meta" style="margin-top:6px; font-size:11px">
+      💡 Stop-file kill switch: creates data/agent_stop.txt so the watcher exits cleanly on its next cycle.
+    </div>
+  </div>
+</div>
 
 <script>
 "use strict";
@@ -302,11 +389,242 @@ $("add-form").addEventListener("submit", async (ev) => {
   } catch (e) { toast(e.message); }
 });
 
+/* ---------------- chat ---------------- */
+let CHAT_HISTORY = [];
+
+async function sendChat() {
+  const input = $("chat-input");
+  const msg = input.value.trim();
+  if (!msg) return;
+  const providerId = $("chat-provider").value;
+  input.value = "";
+  CHAT_HISTORY.push({ role: "user", content: msg });
+  renderChatMessages();
+  const wrap = $("chat-wrap");
+  const loading = document.createElement("div");
+  loading.className = "chat-msg agent";
+  loading.textContent = "...";
+  wrap.appendChild(loading);
+  wrap.scrollTop = wrap.scrollHeight;
+  try {
+    const r = await api("/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ message: msg, provider_id: providerId, history: CHAT_HISTORY.slice(0, -1) }),
+    });
+    loading.remove();
+    CHAT_HISTORY.push({ role: "assistant", content: r.reply });
+    const replyEl = document.createElement("div");
+    replyEl.className = "chat-msg agent";
+    replyEl.textContent = r.reply;
+    wrap.appendChild(replyEl);
+    toast("Chat reply received", true);
+  } catch (e) {
+    loading.remove();
+    toast("Chat failed: " + e.message);
+  }
+  wrap.scrollTop = wrap.scrollHeight;
+}
+
+function renderChatMessages() {
+  const wrap = $("chat-wrap");
+  wrap.innerHTML = "";
+  for (const m of CHAT_HISTORY) {
+    const el = document.createElement("div");
+    el.className = "chat-msg " + (m.role === "user" ? "user" : "agent");
+    el.textContent = m.content;
+    wrap.appendChild(el);
+  }
+  wrap.scrollTop = wrap.scrollHeight;
+}
+
+async function loadChatHistory() {
+  try {
+    const r = await api("/api/chat/history?limit=20");
+    CHAT_HISTORY = [];
+    const wrap = $("chat-wrap");
+    wrap.innerHTML = "";
+    for (const entry of r.entries) {
+      const userEl = document.createElement("div");
+      userEl.className = "chat-msg user";
+      userEl.textContent = entry.message;
+      wrap.appendChild(userEl);
+      const agentEl = document.createElement("div");
+      agentEl.className = "chat-msg agent";
+      agentEl.textContent = entry.reply;
+      wrap.appendChild(agentEl);
+    }
+    toast(`Loaded ${r.count} chat entry(ies)`, true);
+  } catch (e) { toast("Failed to load chat history: " + e.message); }
+}
+
+function clearChat() {
+  CHAT_HISTORY = [];
+  $("chat-wrap").innerHTML = "";
+}
+
+$("chat-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    sendChat();
+  }
+});
+
+/* ---------------- lookup tables ---------------- */
+async function loadLookupTables() {
+  try {
+    const r = await api("/api/lookup-tables");
+    const list = $("lookup-list");
+    if (!r.tables.length) {
+      list.innerHTML = '<div class="empty">No lookup tables yet. Create one above.</div>';
+      return;
+    }
+    const rows = r.tables.map(t => `
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--border)">
+        <div>
+          <b>${esc(t.name)}</b>
+          <span class="meta" style="margin-left:8px">${t.entry_count} entries · updated ${t.updated || "?"}</span>
+        </div>
+        <div class="actions">
+          <button class="btn" onclick="showLookupEntries('${esc(t.name)}')">View</button>
+          <button class="btn danger" onclick="deleteLookupTable('${esc(t.name)}')">Delete</button>
+        </div>
+      </div>`).join("");
+    list.innerHTML = rows;
+  } catch (e) { toast("Failed to load lookup tables: " + e.message); }
+}
+
+async function showLookupEntries(name) {
+  try {
+    const r = await api(`/api/lookup-tables/${encodeURIComponent(name)}`);
+    const entries = r.table.entries || {};
+    const rows = Object.entries(entries).map(([k, v]) => `
+      <div style="padding:4px 0;border-bottom:1px solid var(--border);font-size:11px">
+        <b>${esc(k)}</b>: <code>${esc(JSON.stringify(v))}</code>
+      </div>`).join("");
+    $("lookup-list").innerHTML = `<div style="margin-bottom:6px"><b>${esc(name)}</b> <button class="btn" onclick="loadLookupTables()">← back</button></div>${rows || '<div class="empty">No entries.</div>'}`;
+    $("lookup-entry-row").style.display = "flex";
+    $("lookup-name").value = name;
+  } catch (e) { toast("Failed to load table entries: " + e.message); }
+}
+
+async function createLookupTable() {
+  const name = $("lookup-name").value.trim();
+  const desc = $("lookup-desc").value.trim();
+  if (!name) { toast("Name is required."); return; }
+  try {
+    await api("/api/lookup-tables", { method: "POST", body: JSON.stringify({ name, description: desc }) });
+    $("lookup-name").value = "";
+    $("lookup-desc").value = "";
+    toast(`Created table '${name}'`, true);
+    loadLookupTables();
+  } catch (e) { toast("Failed to create table: " + e.message); }
+}
+
+async function upsertLookupEntry() {
+  const name = $("lookup-name").value.trim();
+  const key = $("lookup-key").value.trim();
+  const valueStr = $("lookup-value").value.trim();
+  if (!name || !key) { toast("Name and key are required."); return; }
+  let value;
+  try { value = JSON.parse(valueStr); } catch { value = valueStr; }
+  try {
+    await api(`/api/lookup-tables/${encodeURIComponent(name)}/entries/${encodeURIComponent(key)}`, {
+      method: "POST",
+      body: JSON.stringify({ value }),
+    });
+    $("lookup-key").value = "";
+    $("lookup-value").value = "";
+    toast(`Upserted '${key}' in '${name}'`, true);
+    showLookupEntries(name);
+  } catch (e) { toast("Failed to upsert: " + e.message); }
+}
+
+async function deleteLookupEntry() {
+  const name = $("lookup-name").value.trim();
+  const key = $("lookup-key").value.trim();
+  if (!name || !key) { toast("Name and key are required."); return; }
+  try {
+    await api(`/api/lookup-tables/${encodeURIComponent(name)}/entries/${encodeURIComponent(key)}`, { method: "DELETE" });
+    toast(`Deleted '${key}' from '${name}'`, true);
+    showLookupEntries(name);
+  } catch (e) { toast("Failed to delete: " + e.message); }
+}
+
+async function deleteLookupTable(name) {
+  if (!confirm(`Delete lookup table '${name}'?`)) return;
+  try {
+    await api(`/api/lookup-tables/${encodeURIComponent(name)}`, { method: "DELETE" });
+    toast(`Deleted table '${name}'`, true);
+    loadLookupTables();
+  } catch (e) { toast("Failed to delete: " + e.message); }
+}
+
+/* ---------------- agent control ---------------- */
+let AGENT_POLL_TIMER = null;
+
+function agentRefresh() {
+  api("/api/agent").then(r => renderAgentStatus(r)).catch(e => {
+    $("agent-state").textContent = "Error: " + e.message;
+    $("agent-dot").className = "dot err";
+  });
+}
+
+function renderAgentStatus(r) {
+  const dot = $("agent-dot");
+  const state = $("agent-state");
+  const meta = $("agent-meta");
+  if (r.running) {
+    dot.className = "dot ok";
+    state.textContent = `Running (cycle ${r.cycle || "?"})`;
+    const age = r.last_heartbeat_age_s != null ? `${Math.round(r.last_heartbeat_age_s)}s ago` : "?";
+    meta.textContent = `Last heartbeat: ${r.last_heartbeat || "?"} · ${age} · PID ${r.pid || "?"}`;
+  } else {
+    dot.className = "dot err";
+    state.textContent = "Stopped";
+    meta.textContent = r.reason ? `Reason: ${r.reason}` : (r.stop_file_present ? "Stop file present" : "No heartbeat");
+  }
+  $("agent-start-btn").disabled = r.running;
+  $("agent-stop-btn").disabled = !r.running;
+}
+
+async function agentStart() {
+  try {
+    const r = await api("/api/agent/start", { method: "POST" });
+    toast(`Watcher started (PID ${r.pid})`, true);
+    agentRefresh();
+    startAgentPolling();
+  } catch (e) { toast("Failed to start: " + e.message); }
+}
+
+async function agentStop() {
+  if (!confirm("Stop the overnight watcher?")) return;
+  try {
+    await api("/api/agent/stop", { method: "POST" });
+    toast("Watcher stop requested", true);
+    agentRefresh();
+  } catch (e) { toast("Failed to stop: " + e.message); }
+}
+
+function startAgentPolling() {
+  if (AGENT_POLL_TIMER) clearInterval(AGENT_POLL_TIMER);
+  AGENT_POLL_TIMER = setInterval(agentRefresh, 3000);
+}
+
 /* ---------------- init ---------------- */
 (async () => {
   try {
-    await Promise.all([loadHealth(), loadPlatforms()]);
+    await Promise.all([loadHealth(), loadPlatforms(), loadLookupTables()]);
     await loadProviders();
+    // Populate chat provider dropdown
+    const provSel = $("chat-provider");
+    for (const p of PROVIDERS) {
+      const opt = document.createElement("option");
+      opt.value = p.id;
+      opt.textContent = `${p.name} (${p.platform})`;
+      provSel.appendChild(opt);
+    }
+    agentRefresh();
+    startAgentPolling();
   } catch (e) { toast("Could not load dashboard: " + e.message); }
 })();
 </script>

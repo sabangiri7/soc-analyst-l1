@@ -381,7 +381,7 @@ class ChatAgent:
         if action == "clear":
             try:
                 for key in list((lookup.read_lookup_table(name) or {}).get("entries") or {}):
-                    lookup.delete_entry(name, key)
+                    lookup.delete_lookup_entry(name, key)
             except Exception as e:  # noqa: BLE001
                 return {"error": f"Clear failed: {e}"}
             return {"updated": True, "action": "clear", "name": name}
@@ -390,7 +390,7 @@ class ChatAgent:
         if not key:
             return {"error": "`key` is required for upsert."}
         try:
-            table = lookup.upsert_entry(name, key, tool_input.get("value") or {}, description=tool_input.get("description", ""))
+            table = lookup.upsert_lookup_entry(name, key, tool_input.get("value") or {}, path=None)
             return {"updated": True, "action": "upsert", "name": name, "key": key, "entry_count": len((table.get("entries") or {}))}
         except Exception as e:  # noqa: BLE001
             return {"error": f"Upsert failed: {e}"}
