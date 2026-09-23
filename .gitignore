@@ -2,7 +2,6 @@
 .env
 .env.*
 !.env.example
-!.env.example
 data/siem_providers.json
 data/agent_heartbeat.json
 data/agent_stop.txt
@@ -29,3 +28,7 @@ Thumbs.db
 *.swp
 *.log
 nohup.out
+
+# --- local DBs ---
+*.db
+*.sqlite3
