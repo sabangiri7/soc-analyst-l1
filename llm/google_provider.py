@@ -108,11 +108,14 @@ class GoogleProvider(LLMProvider):
         for i, p in enumerate(parts):
             fc = p.get("functionCall")
             if fc:
+                args = fc.get("args") or {}
+                if not isinstance(args, dict):
+                    args = {}
                 calls.append(
                     ToolCall(
                         id=f"{fc['name']}{_ID_SEP}call_{i}",
                         name=fc["name"],
-                        input=fc.get("args") or {},
+                        input=args,
                     )
                 )
         return LLMResponse(content=text, tool_calls=calls)

@@ -41,6 +41,15 @@ import lookup_tables as lookup
 
 MAX_TOOL_TURNS = cfg.LLM_MAX_TOOL_TURNS
 
+
+def _tool_input(tc: Any) -> dict[str, Any]:
+    """LLM tool arguments must be a JSON *object*. A truncated/malformed
+    arguments payload can arrive as a bool/list/str/None; normalize so the
+    loop never crashes with "'bool' object has no attribute 'get'"."""
+    raw = getattr(tc, "input", None)
+    return raw if isinstance(raw, dict) else {}
+
+
 SYSTEM_PROMPT = """You are a conversational SOC assistant. You help an analyst \
 answer questions and take read/write actions on their SIEM dashboard and lookup \
 tables - always grounded in evidence you actually retrieved. Never invent alert \
@@ -418,22 +427,23 @@ class ChatAgent:
                     return ChatResult(reply=resp.content, transcript=transcript)
                 messages.append({"role": "assistant", "content": resp.content or ""})
                 continue
-            transcript.append({"assistant": resp.content or "", "tool_calls": [{"name": tc.name, "input": tc.input} for tc in resp.tool_calls]})
+            transcript.append({"assistant": resp.content or "", "tool_calls": [{"name": tc.name, "input": _tool_input(tc)} for tc in resp.tool_calls]})
             messages.append({
                 "role": "assistant",
                 "content": resp.content,
-                "tool_calls": [{"id": tc.id, "name": tc.name, "input": tc.input} for tc in resp.tool_calls],
+                "tool_calls": [{"id": tc.id, "name": tc.name, "input": _tool_input(tc)} for tc in resp.tool_calls],
             })
             tool_results = []
             for tc in resp.tool_calls:
+                tool_input = _tool_input(tc)
                 if tc.name == "answer_user":
                     return ChatResult(
-                        reply=tc.input.get("answer", ""),
-                        data=tc.input.get("data") or {},
+                        reply=tool_input.get("answer", ""),
+                        data=tool_input.get("data") or {},
                         transcript=transcript,
                     )
                 try:
-                    result = self._execute_tool(tc.name, tc.input)
+                    result = self._execute_tool(tc.name, tool_input)
                 except Exception as e:  # noqa: BLE001 - never let a tool crash the loop
                     result = {"error": str(e)}
                 tool_results.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result, default=str)})

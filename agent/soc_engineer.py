@@ -36,6 +36,19 @@ from tools.registry import build_tools_meta, execute as run_tool
 
 MAX_TOOL_TURNS = getattr(cfg, "ENGINE_MAX_TOOL_TURNS", 10)
 
+
+def _tool_input(tc: Any) -> dict[str, Any]:
+    """Normalize an LLM tool call's arguments to a dict.
+
+    Providers are supposed to hand us a JSON *object*, but a truncated or
+    malformed arguments payload (e.g. a bare `true`/`null` when max_tokens cuts
+    the model's JSON mid-argument) can arrive as a bool/list/str/None. Any
+    non-dict value is dropped to ``{}`` so the loop never crashes with
+    "'bool' object has no attribute 'get'" on `tc.input.get(...)`."""
+    raw = getattr(tc, "input", None)
+    return raw if isinstance(raw, dict) else {}
+
+
 SYSTEM_PROMPT = f"""You are an AI SOC Engineer for Wazuh. You investigate security
 activity, build and validate detection rules, create dashboards, and analyze
 detection gaps - always grounded in evidence you actually retrieved with tools.
@@ -161,7 +174,7 @@ class SOCEngineer:
                     system=SYSTEM_PROMPT,
                     messages=messages,
                     tools=self.tools,
-                    max_tokens=2000,
+                    max_tokens=4096,
                 )
             except Exception as e:  # noqa: BLE001 - provider outage shouldn't crash the console
                 return EngineerResult(
@@ -174,31 +187,32 @@ class SOCEngineer:
 
             transcript.append({
                 "assistant": resp.content or "",
-                "tool_calls": [{"name": tc.name, "input": tc.input} for tc in resp.tool_calls],
+                "tool_calls": [{"name": tc.name, "input": _tool_input(tc)} for tc in resp.tool_calls],
             })
             messages.append({
                 "role": "assistant",
                 "content": resp.content,
-                "tool_calls": [{"id": tc.id, "name": tc.name, "input": tc.input} for tc in resp.tool_calls],
+                "tool_calls": [{"id": tc.id, "name": tc.name, "input": _tool_input(tc)} for tc in resp.tool_calls],
             })
 
             tool_messages = []
             done: EngineerResult | None = None
             for tc in resp.tool_calls:
+                tool_input = _tool_input(tc)
                 if tc.name in _TERMINAL_TOOLS:
                     done = EngineerResult(
-                        reply=tc.input.get("answer", ""),
-                        data=tc.input.get("data") or {},
+                        reply=tool_input.get("answer", ""),
+                        data=tool_input.get("data") or {},
                         transcript=transcript,
                         proposals=proposals,
                         messages=messages + [{"role": "tool", "tool_call_id": tc.id,
                                               "content": json.dumps(
-                                                  {"terminal": True, "answer": tc.input.get("answer")},
+                                                  {"terminal": True, "answer": tool_input.get("answer")},
                                                   default=str)}],
                     )
                     break
                 try:
-                    result, proposal = self._execute_tool(tc.name, tc.input)
+                    result, proposal = self._execute_tool(tc.name, tool_input)
                 except Exception as e:  # noqa: BLE001 - never let a tool crash the loop
                     result, proposal = {"status": "error", "error": str(e)}, None
                 if proposal is not None:

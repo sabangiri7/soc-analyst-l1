@@ -28,6 +28,14 @@ if cfg.MOCK_MODE:
 else:
     from connectors.crowdstrike_connector import CrowdStrikeConnector
 
+
+def _tool_input(tc: Any) -> dict[str, Any]:
+    """LLM tool arguments must be a JSON *object*. A truncated/malformed
+    arguments payload can arrive as a bool/list/str/None; normalize so a
+    malformed submit_verdict can't crash the whole triage run."""
+    raw = getattr(tc, "input", None)
+    return raw if isinstance(raw, dict) else {}
+
 MAX_TOOL_TURNS = 8
 
 SYSTEM_PROMPT = """You are an L1 SOC triage analyst agent. You investigate one \
@@ -232,7 +240,7 @@ class TriageAgent:
                 "role": "assistant",
                 "content": resp.content,
                 "tool_calls": [
-                    {"id": tc.id, "name": tc.name, "input": tc.input} for tc in resp.tool_calls
+                    {"id": tc.id, "name": tc.name, "input": _tool_input(tc)} for tc in resp.tool_calls
                 ],
             })
 
@@ -243,20 +251,41 @@ class TriageAgent:
 
             tool_results: list[dict[str, Any]] = []
             for call in resp.tool_calls:
-                transcript.append({"tool": call.name, "input": call.input})
+                call_input = _tool_input(call)
+                transcript.append({"tool": call.name, "input": call_input})
                 if call.name == "submit_verdict":
-                    v = call.input
+                    v = call_input
                     transcript.append({"final_verdict": v})
+                    try:
+                        verdict = v["verdict"]
+                        confidence = float(v["confidence"])
+                        action = v["recommended_action"]
+                        rationale = v["rationale"]
+                        evidence = v["evidence_used"]
+                    except (KeyError, TypeError, ValueError) as e:
+                        # Truncated/malformed verdict - never crash the run;
+                        # tell the model and let it retry within the budget.
+                        transcript.append({"tool_result": {"error": "malformed verdict", "detail": str(e)}})
+                        tool_results.append({
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "content": json.dumps(
+                                {"error": "Malformed submit_verdict arguments - expected an object with "
+                                          "verdict, confidence, recommended_action, rationale, evidence_used. "
+                                          "Please retry.", "detail": str(e)},
+                                default=str),
+                        })
+                        continue
                     return TriageResult(
-                        verdict=v["verdict"],
-                        confidence=float(v["confidence"]),
-                        recommended_action=v["recommended_action"],
-                        rationale=v["rationale"],
-                        evidence_used=v["evidence_used"],
+                        verdict=verdict,
+                        confidence=confidence,
+                        recommended_action=action,
+                        rationale=rationale,
+                        evidence_used=evidence,
                         transcript=transcript,
                     )
                 try:
-                    result = self._execute_tool(call.name, call.input)
+                    result = self._execute_tool(call.name, call_input)
                 except Exception as e:  # connector unreachable, bad id, etc.
                     result = {"error": str(e)}
                 transcript.append({"tool_result": result})

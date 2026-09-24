@@ -27,6 +27,21 @@ from llm.base import LLMError, LLMRateLimitedError, LLMProvider, LLMResponse, To
 _RETRYABLE_5XX = (500, 502, 503, 504)
 
 
+def _coerce_tool_input(arguments: str | None) -> dict[str, Any]:
+    """Tool arguments must be a JSON *object*.
+
+    Gateways sometimes return truncated or malformed arguments - most often a
+    bare scalar like ``true``/``null`` when max_tokens cuts the model's JSON
+    mid-argument. Any non-object value is dropped to ``{}`` so consumers never
+    see a bool/list/str where a dict is expected (previously a bool input made
+    the agent crash with "'bool' object has no attribute 'get'")."""
+    try:
+        parsed = json.loads(arguments or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def to_openai_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Canonical tool shape -> OpenAI 'function' tools."""
     return [
@@ -256,11 +271,8 @@ class OpenAICompatProvider(LLMProvider):
 
         calls = []
         for tc in msg.get("tool_calls") or []:
-            try:
-                arguments = json.loads(tc["function"]["arguments"] or "{}")
-            except json.JSONDecodeError:
-                arguments = {}
-            calls.append(ToolCall(id=tc["id"], name=tc["function"]["name"], input=arguments))
+            calls.append(ToolCall(id=tc["id"], name=tc["function"]["name"],
+                                  input=_coerce_tool_input(tc["function"]["arguments"])))
         return LLMResponse(
             content=msg.get("content") or "",
             tool_calls=calls,
