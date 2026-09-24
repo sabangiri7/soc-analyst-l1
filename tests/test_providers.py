@@ -210,5 +210,50 @@ class TestMockProviderEndToEnd(unittest.TestCase):
         self.assertLess(r.confidence, 0.9)  # below auto-close threshold -> human review
 
 
+class TestToolInputCoercion(unittest.TestCase):
+    """Truncated/malformed tool arguments from the gateway must be normalized
+    to {} instead of surfacing as a bare bool/list/str and crashing the agent
+    with "'bool' object has no attribute 'get'"."""
+
+    def _parse(self, arguments: str) -> dict:
+        prov = OpenAICompatProvider.__new__(OpenAICompatProvider)
+
+        class _Resp:
+            def json(self):
+                return {
+                    "choices": [{"message": {
+                        "content": "",
+                        "tool_calls": [
+                            {"id": "t1", "type": "function",
+                             "function": {"name": "answer_user", "arguments": arguments}},
+                        ],
+                    }}],
+                }
+
+        return prov._parse_response(_Resp()).tool_calls[0].input
+
+    def test_valid_object_passthrough(self):
+        self.assertEqual(self._parse('{"answer": "hi"}'), {"answer": "hi"})
+
+    def test_bare_bool_normalized_to_empty_dict(self):
+        # max_tokens truncation can leave the gateway returning `true`/`false`
+        # as the whole arguments payload - the exact live crash this guards.
+        self.assertEqual(self._parse("true"), {})
+        self.assertEqual(self._parse("false"), {})
+
+    def test_null_array_and_scalar_normalized(self):
+        self.assertEqual(self._parse("null"), {})
+        self.assertEqual(self._parse("[1, 2]"), {})
+        self.assertEqual(self._parse('"oops"'), {})
+
+    def test_invalid_json_normalized(self):
+        self.assertEqual(self._parse('{"answer": '), {})  # truncated mid-object
+        self.assertEqual(self._parse("nope"), {})
+
+    def test_empty_arguments_normalized(self):
+        self.assertEqual(self._parse(""), {})
+        self.assertEqual(self._parse(None), {})
+
+
 if __name__ == "__main__":
     unittest.main()

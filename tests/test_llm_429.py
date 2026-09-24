@@ -316,6 +316,68 @@ class TestSingleChatBudgeting(unittest.TestCase):
         self.assertIn("tool budget", res.reply)
 
 
+class TestEngineerMalformedToolInput(unittest.TestCase):
+    """A truncated/malformed tool-arguments payload (a bare bool etc.) must
+    never crash the engineer or analyst loops - it is normalized to {} and
+    the request degrades gracefully instead of surfacing "'bool' object has
+    no attribute 'get'" from the /api/engineer/chat endpoint."""
+
+    def _engineer(self, fake_llm):
+        from agent.soc_engineer import SOCEngineer
+        eng = SOCEngineer()
+        eng.llm = fake_llm
+        return eng
+
+    def test_answer_user_with_bool_input_does_not_crash(self):
+        class FakeLLM:
+            def chat(self, **kw):
+                return LLMResponse(
+                    content="",
+                    tool_calls=[ToolCall(id="t1", name="answer_user", input=True)],
+                )
+        res = self._engineer(FakeLLM()).chat(user_message="hi")
+        self.assertEqual(res.reply, "")
+        # The bool was normalized to {} in the transcript, not stored raw.
+        self.assertEqual(res.transcript[0]["tool_calls"][0]["input"], {})
+
+    def test_bool_input_on_tool_is_normalized_and_loop_continues(self):
+        class FakeLLM:
+            def __init__(self):
+                self.calls = 0
+
+            def chat(self, **kw):
+                self.calls += 1
+                if self.calls == 1:
+                    return LLMResponse(content="", tool_calls=[
+                        ToolCall(id="t1", name="design_detection_dashboard", input=False)])
+                return LLMResponse(content="", tool_calls=[
+                    ToolCall(id="t2", name="answer_user", input={"answer": "done"})])
+
+        with mock.patch("agent.soc_engineer.run_tool",
+                        return_value={"status": "ok", "result": {}}) as run:
+            res = self._engineer(FakeLLM()).chat(user_message="hi")
+        # The registry saw {} (not the raw bool); its own param validation
+        # would report the missing-parameter error back to the model.
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[1], "design_detection_dashboard")
+        self.assertEqual(run.call_args.args[2], {})
+        self.assertEqual(res.reply, "done")
+
+    def test_chat_agent_answer_user_with_bool_input_does_not_crash(self):
+        from agent.chat_agent import ChatAgent
+
+        class FakeLLM:
+            def chat(self, **kw):
+                return LLMResponse(
+                    content="",
+                    tool_calls=[ToolCall(id="t1", name="answer_user", input=False)],
+                )
+        agent = ChatAgent(siem=None, provider_id=None)
+        agent.llm = FakeLLM()
+        res = agent.chat(user_message="hi")
+        self.assertEqual(res.reply, "")
+
+
 class TestTracingNoSecrets(unittest.TestCase):
     def test_trace_lines_carry_fields_but_never_keys_or_prompts(self):
         secret_key = "sk-secret-that-must-never-appear-9f8e"
