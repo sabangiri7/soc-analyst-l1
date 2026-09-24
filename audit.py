@@ -1,0 +1,93 @@
+"""
+Audit logging for the AI SOC engineer.
+
+Every tool invocation - read, proposed, or executed - is appended to
+data/audit_log.jsonl (AUDIT_LOG_PATH) with the fields the spec requires:
+
+    timestamp, user, agent, requested action (tool), params, result,
+    permission level, approval status, execution status, error.
+
+This is append-only and never gated on the tool having succeeded: failures
+are logged with their error so triage of the *agent* is possible. Writers
+never rotate this file - log_rotation.py handles that for the other JSONL
+logs; add AUDIT_LOG_PATH to the rotation list if it grows.
+"""
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+from typing import Any
+
+from config import cfg
+
+DEFAULT_AUDIT_PATH = "data/audit_log.jsonl"
+
+
+def audit_log(
+    *,
+    tool: str,
+    params: dict[str, Any],
+    result: Any = None,
+    permission: str = "read",
+    approval_status: str = "not_required",
+    execution_status: str = "success",
+    user: str | None = None,
+    agent: str = "soc_engineer",
+    error: str | None = None,
+    action: str | None = None,
+    path: str | Path | None = None,
+) -> None:
+    """Append one audit record. Never raises - auditing must not crash the
+    operation being audited."""
+    record = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "user": user or getattr(cfg, "ENGINE_USER", "analyst"),
+        "agent": agent,
+        "action": action or tool,
+        "tool": tool,
+        "params": _safe(params),
+        "result": _safe(result),
+        "permission": permission,
+        "approval_status": approval_status,
+        "execution_status": execution_status,
+        "error": error,
+    }
+    try:
+        p = Path(path or getattr(cfg, "AUDIT_LOG_PATH", DEFAULT_AUDIT_PATH))
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+    except Exception:  # noqa: BLE001 - audit must never break the caller
+        pass
+
+
+def _safe(obj: Any) -> Any:
+    """Serialize anything into a JSON-safe, size-capped form (large API
+    responses truncated; secrets are redacted by the tool before this)."""
+    try:
+        text = json.dumps(obj, default=str)
+    except TypeError:
+        return {"unserializable": str(obj)[:200]}
+    if len(text) > 4000:
+        text = text[:4000] + '…(truncated)'
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return {"repr": text}
+
+
+def read_audit_log(path: str | Path | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    """Newest-first audit records, for the dashboard's read-only Audit panel."""
+    p = Path(path or getattr(cfg, "AUDIT_LOG_PATH", DEFAULT_AUDIT_PATH))
+    if not p.exists():
+        return []
+    rows = []
+    for line in p.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows[-limit:][::-1]

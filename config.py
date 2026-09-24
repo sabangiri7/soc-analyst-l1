@@ -158,6 +158,45 @@ class Config:
     WAZUH_VERIFY_SSL = _bool("WAZUH_VERIFY_SSL", False)  # self-signed by default
     WAZUH_CA_CERT = os.getenv("WAZUH_CA_CERT", "")
 
+    # --- Wazuh manager REST API (rules / decoders / logtest / agents) ---
+    # This is a *different* surface from the indexer above: the manager API
+    # (default port 55000, user wazuh-wui in the bundled docker stack) is what
+    # serves rules, decoders, agents, manager/cluster status and logtest. The
+    # AI SOC engineer's write tools (create/update/delete rule, decoder, ...)
+    # go through here, always behind an approval gate.
+    WAZUH_API_URL = os.getenv("WAZUH_API_URL", "https://localhost:55000")
+    WAZUH_API_USERNAME = os.getenv("WAZUH_API_USERNAME", "wazuh-wui")
+    WAZUH_API_PASSWORD = os.getenv("WAZUH_API_PASSWORD", "")
+    WAZUH_API_VERIFY_SSL = _bool("WAZUH_API_VERIFY_SSL", False)
+    WAZUH_API_CA_CERT = os.getenv("WAZUH_API_CA_CERT", "")
+
+    # --- Wazuh dashboard / OpenSearch Dashboards (saved-objects API) ---
+    # Used by the dashboard engineer to create/verify dashboards and
+    # visualizations (best-effort: errors surface cleanly if unreachable).
+    WAZUH_DASHBOARD_URL = os.getenv("WAZUH_DASHBOARD_URL", "https://localhost:443")
+    WAZUH_DASHBOARD_USERNAME = os.getenv("WAZUH_DASHBOARD_USERNAME", "admin")
+    WAZUH_DASHBOARD_PASSWORD = os.getenv("WAZUH_DASHBOARD_PASSWORD", "")
+    WAZUH_DASHBOARD_VERIFY_SSL = _bool("WAZUH_DASHBOARD_VERIFY_SSL", False)
+
+    # --- AI SOC engineer: tool layer limits & gates ---
+    # Who the audit log and approval center attribute actions to (a free-text
+    # analyst name, same convention as ANALYST_NAME in feedback_cli.py).
+    ENGINE_USER = os.getenv("ENGINE_USER", "analyst")
+    # Audit trail for every tool invocation (timestamp, tool, params, result,
+    # permission level, approval status, error).
+    AUDIT_LOG_PATH = os.getenv("AUDIT_LOG_PATH", "data/audit_log.jsonl")
+    # Approval center store (pending/proposed actions awaiting human review).
+    APPROVALS_PATH = os.getenv("APPROVALS_PATH", "data/approvals.json")
+    # Hard caps so a single tool call can never pull unbounded data.
+    TOOL_QUERY_SIZE_LIMIT = int(os.getenv("TOOL_QUERY_SIZE_LIMIT", "200"))
+    TOOL_RESULT_SIZE_LIMIT = int(os.getenv("TOOL_RESULT_SIZE_LIMIT", "50"))
+    TOOL_QUERY_TIMEOUT = float(os.getenv("TOOL_QUERY_TIMEOUT", "20"))
+    # Rule validation: how many automatic logtest-driven correction attempts a
+    # generated rule gets before it is handed back as "failed" for human debug.
+    LOGTEST_MAX_ATTEMPTS = int(os.getenv("LOGTEST_MAX_ATTEMPTS", "3"))
+    # Pending proposals older than this are expired and cannot be approved.
+    APPROVAL_EXPIRY_SECONDS = int(os.getenv("APPROVAL_EXPIRY_SECONDS", "86400"))
+
     # Mock SIEM (SIEM_PROVIDER=mock) - optional override for the canned alerts
     MOCK_SIEM_ALERTS_FILE = os.getenv("MOCK_SIEM_ALERTS_FILE", "")
 

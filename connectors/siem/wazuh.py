@@ -96,6 +96,33 @@ class WazuhConnector(SIEMConnector):
         r.raise_for_status()
         return r.json().get("hits", {}).get("hits", [])
 
+    def search(self, index: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Raw OpenSearch search against the indexer - public entrypoint used
+        by the AI SOC engineer tool layer (tools/indexer.py). Returns the full
+        response JSON (hits, aggregations, ...), not just the hit list."""
+        r = requests.post(
+            f"{self.host}/{index}/_search",
+            auth=self.auth,
+            json=body,
+            verify=self.verify,
+            timeout=cfg.TOOL_QUERY_TIMEOUT if hasattr(cfg, "TOOL_QUERY_TIMEOUT") else 20,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def post_field_caps_search(self, body: dict[str, Any], index: str = "*") -> dict[str, Any]:
+        """POST /{index}/_field_caps - schema/type mapping for field discovery
+        (used by the AI SOC engineer's dashboard + gap analysis)."""
+        r = requests.post(
+            f"{self.host}/{index}/_field_caps",
+            auth=self.auth,
+            json=body,
+            verify=self.verify,
+            timeout=20,
+        )
+        r.raise_for_status()
+        return r.json()
+
     # ------------------------------------------------------------------ #
     def get_new_alerts(self) -> list[dict[str, Any]]:
         hits = self._search(self.index, {
