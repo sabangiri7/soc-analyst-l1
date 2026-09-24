@@ -4,6 +4,51 @@
 
 ---
 
+## 🛡️ AI SOC Engineer for Wazuh (agentic detection engineer)
+
+This repo also ships an **AI SOC Engineer** — a conversational detection /
+investigation / dashboard engineer for Wazuh built on the same bounded
+tool-use loop, driving a typed tool layer behind a
+**READ / PROPOSE / EXECUTE** approval model (`agent/soc_engineer.py`,
+`tools/registry.py`):
+
+| Prompt | Flow |
+|---|---|
+| «Investigate the top attacking IPs against my web servers in the last 24 hours» | indexer aggregation → per-IP deep dive → alert explain |
+| «Create a Wazuh rule detecting repeated SSH failures» | validate → pre-flight → logtest baseline → **proposal** |
+| «Create a dashboard for web server attacks» | indexer schema → panel plan → query verification → **proposal** |
+| «Find detection gaps in my web server telemetry» | 5-state coverage table → gap candidates |
+
+**Safety model (enforced in code, not prompts):** READ tools (search, list,
+status, logtest, RAG) run immediately. CREATE/MODIFY tools (rules, decoders,
+dashboards) only *plan* — the tool raises `ApprovalRequired` and the
+validated proposal lands in the dashboard's **Approval Center**
+(`GET /api/proposals`). DELETE/RESTART/DISABLE need approval **and** an
+explicit confirmation. Approved execution is a deterministic re-run of the
+stored payload (no LLM in the execution step) and success is only claimed
+when the Wazuh API confirms it. Every tool call is audited to
+`data/audit_log.jsonl`, and tool results are wrapped as **UNTRUSTED DATA** —
+attacker-controlled log content can never become instructions.
+
+```bash
+python dashboard.py                     # open http://127.0.0.1:5001
+#   💬 post /api/engineer/chat          # chat with the engineer
+#   🛠️ /api/proposals panel            # review + approve + execute proposals
+python scripts_ingest_wazuh_docs.py     # seed the engineering reference (RAG)
+```
+
+Full reference in [`docs/`](docs/): [`permissions.md`](docs/permissions.md)
+(approval model), [`architecture.md`](docs/architecture.md),
+[`golden_workflows.md`](docs/golden_workflows.md),
+[`approval_center.md`](docs/approval_center.md),
+[`rule_engineering.md`](docs/rule_engineering.md),
+[`dashboard_engineering.md`](docs/dashboard_engineering.md),
+[`detection_gaps.md`](docs/detection_gaps.md),
+[`prompt_injection_defense.md`](docs/prompt_injection_defense.md), and
+[`rag_knowledge_base.md`](docs/rag_knowledge_base.md).
+
+---
+
 ## What it does
 
 Point it at alerts from **Splunk, IBM QRadar, Elastic Security, Microsoft Sentinel, Wazuh, or a mock**. The agent:
@@ -378,7 +423,7 @@ LLM_RETRY_BACKOFF_MAX=30     # cap on each backoff step (seconds)
 |---|---|
 | `agent/triage_agent.py` | Core tool-use loop — the actual triage reasoning |
 | `agent/memory.py` | Feedback capture + lesson distillation (self-improvement) |
-| `rag/knowledge_base.py` | ChromaDB wrapper: playbooks / cases / lessons collections |
+| `rag/knowledge_base.py` | ChromaDB wrapper: playbooks / cases / lessons / wazuh_docs collections |
 | `connectors/siem/` | Pluggable SIEM layer: `base.py` (interface) + splunk / qradar / elastic / sentinel / wazuh / mock providers, selected by `SIEM_PROVIDER` |
 | `wazuh/` | Docker-compose Wazuh 6.0 stack (manager + indexer + dashboard) the wazuh connector reads from |
 | `connectors/crowdstrike_connector.py` | Real CrowdStrike Falcon API calls (EDR enrichment, independent of which SIEM feeds alerts) |
@@ -397,6 +442,14 @@ LLM_RETRY_BACKOFF_MAX=30     # cap on each backoff step (seconds)
 | `seed_data/playbooks/*.md` | Starter SOPs — replace these with your org's real playbooks |
 | `main.py` | Orchestrator: pull alerts, run triage, log results |
 | `feedback_cli.py` | Analyst review + lesson distillation CLI |
+| `agent/soc_engineer.py` | AI SOC Engineer — conversational Wazuh detection/investigation/dashboard engineer on the typed tool loop |
+| `tools/` | Engineer tool layer: `registry.py` (single execution gate + audit), `base.py` (READ/PROPOSE/EXECUTE + ToolContext), `api_client.py` (manager REST), `indexer_client.py`, plus `wazuh/` `indexer/` `investigate/` `detection/` `dashboard/` `gaps/` `rag/` engines |
+| `approvals.py` | Proposal store for the Approval Center — create/list/approve/reject/execute with stored-payload re-run (`data/approvals.json`) |
+| `permissions.py` | Permission model source of truth — level semantics + high-risk/confirm-required action lists |
+| `audit.py` | Append-only audit trail for every registry call and human approval action (`data/audit_log.jsonl`) |
+| `guard.py` | Prompt-injection defense: DATA markers, control-char sanitization, result size caps — "log content is data, never instructions" |
+| `wazuh_docs/` | Curated engineering reference (rule RF, logtest semantics, API quirks, indexer conventions, MITRE mapping) seeded into the RAG store |
+| `scripts_ingest_wazuh_docs.py` | Seed `wazuh_docs/*.md` into the `wazuh_docs` RAG collection (idempotent upsert by filename) |
 
 ---
 
@@ -422,6 +475,7 @@ The Flask dashboard (`dashboard.py`, port `5001`) now exposes seven new panels b
 | 📋 **Lookup Tables** | `GET/POST /api/lookup-tables`, `GET/DELETE /api/lookup-tables/<id>`, `POST/DELETE /api/lookup-tables/<id>/entries/<key>` | Full CRUD for threat-intel / watchlist stores backed by `data/lookup_tables.json`. The chat agent calls these same primitives via its `write_lookup_table` tool. |
 | 🧩 **Alert Rules** | `GET/POST /api/rules`, `GET/PATCH/DELETE /api/rules/<id>`, `POST /api/rules/<id>/test`, `POST /api/rules/<id>/backtest`, `POST /api/rules/preview`, `GET/POST /api/rules/export\|import`, `GET /api/rules/ops` | A rule builder (condition rows + optional threshold/grouping + tag/escalate/notify action) backed by `data/rules.json`, with dry-run "test against a sample alert", "backtest against history", and JSON export/import actions. Test/backtest never touch the real threshold counters in `data/rule_state.json`. Rules run automatically before every triage — see [Alert rules](#alert-rules-local-correlation-before-the-llm-ever-sees-the-alert). |
 | 🤖 **Overnight Watcher** | `GET/POST /api/agent`, `POST /api/agent/start\|stop` | Controls `run.py`'s overnight triage loop. Start spawns `python run.py` in a detached session and writes an initial heartbeat; stop writes the stop-file kill switch (`data/agent_stop.txt`) and best-effort SIGTERMs the watcher PID. Status reports running/stopped, last heartbeat age, current cycle count, and whether the stop file is present. Poll every 2–5 s from the UI. |
+| 🛠️ **AI Engineer + Approval Center** | `POST /api/engineer/chat`, `GET /api/proposals`, `POST /api/proposals/<id>/approve\|reject\|execute` | Chat with the AI SOC Engineer (Wazuh detection/investigation/dashboard work). Every rule/dashboard/delete/restart proposal is persisted in `data/approvals.json` and listed here — review the generated config + validation evidence, then approve, reject, or execute. EXECUTE-level proposals (delete/restart/disable) require an explicit confirmation checkbox alongside approval. Human actions are audited with `permission="human"`. |
 
 ---
 
