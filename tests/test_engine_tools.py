@@ -9,6 +9,7 @@ audit.audit_log are patched wherever the registry is exercised).
 Run: cd soc-agent && MOCK_MODE=true python3 -m unittest tests.test_engine_tools -v
 """
 from __future__ import annotations
+import json
 import os
 import unittest
 from unittest import mock
@@ -373,6 +374,130 @@ class TestDashboardEngine(unittest.TestCase):
         with self.assertRaises(ToolError) as cm:
             DesignDetectionDashboard().run(ctx, title="t", focus="web", reason="r")
         self.assertIn("Cannot read indexer schema", str(cm.exception))
+
+    # -- pattern discovery: never bind alert panels to a non-alert index family --
+
+    def test_find_index_pattern_prefers_alerts_over_statistics(self):
+        # Regression: the API can list wazuh-statistics-* first; it must never
+        # win over the alerts pattern (bounds a dashboard that renders empty).
+        from tools.dashboard import engine
+        resp = {"saved_objects": [
+            {"id": "wazuh-statistics-*", "attributes": {"title": "wazuh-statistics-*"}},
+            {"id": "abcd-1234", "attributes": {"title": "wazuh-alerts-*"}},
+        ]}
+        with mock.patch("tools.dashboard.engine.dashboards_request", return_value=resp):
+            self.assertEqual(engine._find_index_pattern(), "abcd-1234")
+        # id may also be the pattern id itself, without a title match.
+        resp = {"saved_objects": [
+            {"id": "wazuh-statistics-*", "attributes": {"title": "wazuh-statistics-*"}},
+            {"id": "wazuh-alerts-*", "attributes": {"title": "Wazuh alerts"}},
+        ]}
+        with mock.patch("tools.dashboard.engine.dashboards_request", return_value=resp):
+            self.assertEqual(engine._find_index_pattern(), "wazuh-alerts-*")
+
+    def test_find_index_pattern_rejects_non_alert_families(self):
+        from tools.dashboard import engine
+        resp = {"saved_objects": [
+            {"id": "wazuh-statistics-*", "attributes": {"title": "wazuh-statistics-*"}},
+            {"id": "wazuh-archives-*", "attributes": {"title": "wazuh-archives-*"}},
+            {"id": "wazuh-monitoring-*", "attributes": {"title": "wazuh-monitoring-*"}},
+        ]}
+        with mock.patch("tools.dashboard.engine.dashboards_request", return_value=resp):
+            self.assertIsNone(engine._find_index_pattern())
+        # caller falls back to the conventional alerts id.
+        with mock.patch("tools.dashboard.engine._find_index_pattern", return_value=None) as m:
+            from tools.dashboard.engine import DesignDetectionDashboard
+            ctx = self._ctx_with_schema()
+            with self.assertRaises(ApprovalRequired) as cm:
+                DesignDetectionDashboard().run(ctx, title="t", focus="web", reason="r")
+            self.assertEqual(cm.exception.proposed_action["generated_config"]["index_pattern"],
+                             "wazuh-alerts-*")
+
+    def test_find_index_pattern_unreachable_returns_none(self):
+        from tools.dashboard import engine
+        with mock.patch("tools.dashboard.engine.dashboards_request",
+                        side_effect=RuntimeError("dashboards down")):
+            self.assertIsNone(engine._find_index_pattern())
+
+    # -- proposal is a complete, resolvable, OSD-openable saved-object bundle --
+
+    def test_proposal_bundle_is_complete_and_resolvable(self):
+        from tools.dashboard.engine import DesignDetectionDashboard
+        ctx = self._ctx_with_schema()
+        with mock.patch("tools.dashboard.engine._find_index_pattern", return_value="idx-abc"):
+            with self.assertRaises(ApprovalRequired) as cm:
+                DesignDetectionDashboard().run(ctx, title="Web Server Attacks", focus="web",
+                                               description="web attack dashboard",
+                                               time_range="-7d", reason="golden dashboard")
+        cfg = cm.exception.proposed_action["generated_config"]
+        self.assertEqual(cfg["index_pattern"], "idx-abc")
+        self.assertEqual(cfg["title"], "Web Server Attacks")
+        bundle = cfg["saved_objects"]
+        self.assertEqual([o["type"] for o in bundle].count("visualization"), 7)
+        self.assertEqual([o["type"] for o in bundle].count("dashboard"), 1)
+        # panelsJSON ids must resolve exactly against the bundle's visualization ids.
+        dash = next(o for o in bundle if o["type"] == "dashboard")
+        panel_ids = {p["id"] for p in json.loads(dash["attributes"]["panelsJSON"])}
+        vis_ids = {o["id"] for o in bundle if o["type"] == "visualization"}
+        self.assertEqual(panel_ids, vis_ids)
+        self.assertEqual(dash["id"], "dashboard-web-server-attacks")
+        # every visualization is a full saved object: visState + searchSourceJSON
+        # (index + 7d window + web filter) + index-pattern reference.
+        term_web_seen = False
+        for vis in (o for o in bundle if o["type"] == "visualization"):
+            attrs = vis["attributes"]
+            self.assertIn("visState", attrs)
+            ss = json.loads(attrs["kibanaSavedObjectMeta"]["searchSourceJSON"])
+            self.assertEqual(ss["index"], "idx-abc")
+            filters = {list(f["term"])[0]: f["term"] for f in ss["filter"] if "term" in f}
+            if filters.get("rule.groups") == {"rule.groups": "web"}:
+                term_web_seen = True
+            self.assertTrue(any("range" in f and "timestamp" in f["range"] for f in ss["filter"]),
+                            f"{vis['id']} missing 7d range filter")
+            self.assertEqual(vis["references"][0]["id"], "idx-abc")
+        self.assertTrue(term_web_seen, "no visualization carries the rule.groups: web filter")
+
+    # -- execution creates OSD-openable saved objects (searchSourceJSON attached) --
+
+    def test_executed_saved_objects_include_search_source(self):
+        from tools.dashboard.engine import DesignDetectionDashboard
+        indexer = mock.MagicMock()
+        indexer.field_caps.return_value = {"data.srcip": "keyword", "agent.name": "keyword",
+                                           "rule.groups": "keyword", "rule.level": "long"}
+        indexer.search.return_value = {"hits": {"total": {"value": 42}}, "took": 3}
+        ctx = make_ctx(indexer=indexer, approval={"action": "design_detection_dashboard"})
+        calls: list[tuple[str, dict]] = []
+
+        def fake_request(method: str, path: str, body: dict | None = None, **kw) -> dict:
+            calls.append((path, body))
+            if path.endswith("/visualization"):
+                return {"saved_object": {"id": f"sv-{len(calls)}", "type": "visualization"}}
+            return {"saved_object": {"id": "dash-1", "type": "dashboard"}}
+
+        with mock.patch("tools.dashboard.engine._find_index_pattern", return_value="idx-abc"), \
+             mock.patch("tools.dashboard.engine.dashboards_request", side_effect=fake_request):
+            out = DesignDetectionDashboard().run(ctx, title="Web Server Attacks", focus="web",
+                                                 description="d", time_range="-7d", reason="r")
+        self.assertEqual(out["status"], "executed")
+        self.assertEqual(out["dashboard_id"], "dash-1")
+        vis_bodies = [b for path, b in calls if path.endswith("/visualization")]
+        self.assertEqual(len(vis_bodies), 7)
+        web_seen = False
+        for body in vis_bodies:
+            attrs = body["attributes"]
+            ss = json.loads(attrs["kibanaSavedObjectMeta"]["searchSourceJSON"])
+            self.assertEqual(ss["index"], "idx-abc")
+            self.assertTrue(any("range" in f for f in ss["filter"]))
+            if any("term" in f and f["term"].get("rule.groups") == "web" for f in ss["filter"]):
+                web_seen = True
+            self.assertEqual(body["references"][0]["id"], "idx-abc")
+        self.assertTrue(web_seen)
+        dash_path, dash_body = [c for c in calls if c[0].endswith("/dashboard")][0]
+        self.assertIn("kibanaSavedObjectMeta", dash_body["attributes"])
+        refs = dash_body["references"]
+        self.assertTrue(refs and all(r["type"] == "visualization" for r in refs))
+        panel_ids = {p["id"] for p in json.loads(dash_body["attributes"]["panelsJSON"])}
+        self.assertEqual(panel_ids, {r["id"] for r in refs})
 
 
 class TestGapsEngine(unittest.TestCase):

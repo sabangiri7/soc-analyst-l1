@@ -20,6 +20,7 @@ object. Dashboard creation is PROPOSE; deletion is EXECUTE.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from tools.base import BaseWazuhTool, Permission, ToolContext, ToolError
@@ -28,13 +29,22 @@ from tools.indexer.queries import search_body, to_range_expr, verify_opensearch_
 
 _INDEX = "wazuh-alerts-*"
 _PANEL_LIMIT = 8
+# Index families that contain no alert documents: none of the panel fields
+# (rule.*, data.srcip, agent.name, timestamp) exist there, so a dashboard
+# bound to them renders empty or errors. Never selected for alert panels.
+_NON_ALERT_PATTERN_HINTS = ("statistics", "archives", "monitoring", "sample-data")
 
 
 # --------------------------------------------------------------------------- #
 def _find_index_pattern() -> str | None:
-    """Discover the Wazuh alert index pattern id from the dashboards server.
-    Returns None when unreachable - the caller falls back to the conventional
-    'wazuh-alerts-*' id, which the Wazuh stack's default config uses."""
+    """Discover the Wazuh *alerts* index pattern id from the dashboards server.
+
+    Only an alerts-capable pattern is acceptable for alert panels: statistics /
+    archives / monitoring indices carry none of the alert fields the panels use.
+    Those families are rejected even when the API lists them first (which is how
+    a proposal could previously end up bound to 'wazuh-statistics-*'). Returns
+    None when unreachable or no alerts pattern is found - the caller falls back
+    to the conventional 'wazuh-alerts-*' id."""
     try:
         resp = dashboards_request(
             "GET", "/api/saved_objects/_find",
@@ -43,14 +53,25 @@ def _find_index_pattern() -> str | None:
     except Exception:  # noqa: BLE001 - best-effort discovery
         return None
     items = resp.get("saved_objects") or resp.get("objects") or []
-    best = None
+
+    def text(item: dict[str, Any]) -> str:
+        attrs = item.get("attributes") or {}
+        return f"{item.get('id') or ''} {attrs.get('title') or ''}".lower()
+
+    # 1) a pattern that is clearly the alerts pattern (id and/or title).
     for item in items:
-        title = ((item.get("attributes") or {}).get("title") or "").lower()
-        if "wazuh" in title or "alerts" in title:
+        t = text(item)
+        if "alerts" in t or "wazuh-alerts" in t:
             return item.get("id")
-        if best is None:
-            best = item.get("id")
-    return best or ("wazuh-alerts-*" if any("wazuh" in str(i) for i in items) else best)
+    # 2) best-effort: any wazuh-ish pattern, never a non-alert family.
+    fallback: str | None = None
+    for item in items:
+        t = text(item)
+        if any(h in t for h in _NON_ALERT_PATTERN_HINTS):
+            continue
+        if "wazuh" in t or "filebeat" in t or "index-pattern" in t:
+            fallback = fallback or item.get("id")
+    return fallback
 
 
 # --------------------------------------------------------------------------- #
@@ -192,12 +213,37 @@ def _vis_state(title: str, vis_type: str, aggs: list[dict[str, Any]]) -> str:
     return json.dumps(state)
 
 
-def _search_source(index_pattern: str, aggs: list[dict[str, Any]]) -> str:
-    """searchSourceJSON for the saved object - ties the visualization (and so the
-    panel) to the wazuh alert index pattern."""
+def _osd_filters(query: dict[str, Any] | None, index: str) -> list[dict[str, Any]]:
+    """Turn the panel's verified query clauses into OSD filter objects.
+
+    OSD searchSourceJSON expects full Filter objects (with meta.index so the
+    filter resolves against the pattern) - bare DSL clauses are not reliably
+    applied. Term/range clauses coming from _panel_plan are mapped; anything
+    else is ignored."""
+    out: list[dict[str, Any]] = []
+    if query:
+        for clause in (query.get("bool") or {}).get("filter") or []:
+            if "term" in clause:
+                field = next(iter(clause["term"]))
+                out.append({"meta": {"index": index, "type": "term", "key": field,
+                                     "value": clause["term"][field], "negate": False,
+                                     "disabled": False}, **clause})
+            elif "range" in clause:
+                field = next(iter(clause["range"]))
+                out.append({"meta": {"index": index, "type": "range", "key": field,
+                                     "negate": False, "disabled": False}, **clause})
+    return out
+
+
+def _search_source(index_pattern: str, aggs: list[dict[str, Any]],
+                   query: dict[str, Any] | None = None) -> str:
+    """searchSourceJSON for the saved object - ties the visualization (and so
+    the panel) to the wazuh alert index pattern and carries the focus filter
+    (e.g. rule.groups: web) + verification window so the panel renders scoped
+    instead of showing every alert in the cluster."""
     return json.dumps({
         "query": {"query": "", "language": "kuery"},
-        "filter": [],
+        "filter": _osd_filters(query, index_pattern),
         "index": index_pattern,
         "aggs": json.loads(json.dumps(aggs)),
     })
@@ -263,12 +309,47 @@ class DesignDetectionDashboard(BaseWazuhTool):
                 "title": panel["title"],
                 "vis_type": panel["vis_type"],
                 "vis_state": vis_state,
-                "search_source": _search_source(index_pattern, panel["aggs"]),
+                "search_source": _search_source(index_pattern, panel["aggs"], panel["query"]),
             })
             grid.append({"id": f"vis-{panel['slug']}", "x": x % 2 * 24, "y": (x // 2) * 15,
                          "w": 24, "h": 15, "type": "visualization"})
             x += 1
         panels_json = json.dumps(grid)
+
+        # 4b) the importable saved-object bundle: the proposal is a complete,
+        # valid, resolvable artifact - not just metadata. panelsJSON ids match
+        # the visualization object ids exactly, and every visualization carries
+        # its searchSourceJSON (index + focus filter + window) + the index-
+        # pattern reference, so the objects open and render in OSD.
+        vis_ref = [{"id": index_pattern, "name": "kibanaSavedObjectMeta.searchSourceJSON.index",
+                    "type": "index-pattern"}] if index_pattern else []
+        saved_objects: list[dict[str, Any]] = []
+        for v in visualizations:
+            saved_objects.append({
+                "id": f"vis-{v['slug']}", "type": "visualization", "version": 1,
+                "attributes": {
+                    "title": v["title"],
+                    "description": "Generated by the AI SOC engineer (verified against wazuh-alerts-*)",
+                    "visState": v["vis_state"],
+                    "version": 1,
+                    "kibanaSavedObjectMeta": {"searchSourceJSON": v["search_source"]},
+                },
+                "references": list(vis_ref),
+            })
+        dashboard_id = "dashboard-" + re.sub(r"[^a-z0-9]+", "-", p["title"].lower()).strip("-")
+        saved_objects.append({
+            "id": dashboard_id, "type": "dashboard", "version": 1,
+            "attributes": {
+                "title": p["title"],
+                "description": p.get("description") or f"Wazuh {focus} alert dashboard over {index_pattern}",
+                "hits": 0, "version": 1, "timeRestore": False,
+                "panelsJSON": panels_json,
+                "kibanaSavedObjectMeta": {"searchSourceJSON": json.dumps(
+                    {"query": {"query": "", "language": "kuery"}, "filter": []})},
+            },
+            "references": [{"name": f"panel_vis-{v['slug']}", "type": "visualization",
+                            "id": f"vis-{v['slug']}"} for v in visualizations],
+        })
 
         proposed = {
             # Re-running this same workflow with an approved context executes
@@ -288,6 +369,9 @@ class DesignDetectionDashboard(BaseWazuhTool):
             "visualizations": [{"slug": v["slug"], "title": v["title"], "vis_type": v["vis_type"]}
                                for v in visualizations],
             "panelsJSON": panels_json,
+            # the importable, self-contained saved-object bundle (ids are the
+            # vis-<slug> placeholders; execution remaps them to server ids).
+            "saved_objects": saved_objects,
         }
         validated = not degraded
         proposed["validation"] = {
@@ -315,6 +399,7 @@ class DesignDetectionDashboard(BaseWazuhTool):
                             "visState": v["vis_state"],
                             "description": "Generated by the AI SOC engineer (approved)",
                             "version": 1,
+                            "kibanaSavedObjectMeta": {"searchSourceJSON": v["search_source"]},
                         },
                         "references": [{"id": index_pattern,
                                         "name": "kibanaSavedObjectMeta.searchSourceJSON.index",
@@ -351,8 +436,13 @@ class DesignDetectionDashboard(BaseWazuhTool):
                         "panelsJSON": json.dumps(real_panels),
                         "timeRestore": False,
                         "version": 1,
+                        "kibanaSavedObjectMeta": {"searchSourceJSON": json.dumps(
+                            {"query": {"query": "", "language": "kuery"}, "filter": []})},
                     },
-                    "references": [],
+                    # panel references mirror the dashboard references in the
+                    # proposed bundle so the panel ids resolve on import/export.
+                    "references": [{"id": panel["id"], "name": f"panel_{panel['id']}",
+                                    "type": "visualization"} for panel in real_panels],
                 },
             )
         except ToolError as e:
