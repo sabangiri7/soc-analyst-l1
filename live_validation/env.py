@@ -9,6 +9,7 @@ with that stored payload - no LLM, no display blob, no re-derivation.
 from __future__ import annotations
 
 import json
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -159,6 +160,66 @@ class LiveEnv:
             raise RuntimeError(f"delete_by_query {index} -> {r.status_code}: "
                                f"{r.text[:200]}")
         return r.json()
+
+    # ------------------------------------------------------------------ #
+    # dev-stack setup/cleanup (docker-exec; NOT application tools). These
+    # exist because the stock single-node stack only listens on 1514/tcp
+    # (secure) - the streamed syslog workflow needs a UDP 514 syslog input.
+    # ------------------------------------------------------------------ #
+    def docker_exec(self, cmd: list[str], *, container: str | None = None) -> str:
+        container = container or getattr(cfg, "WAZUH_MANAGER_CONTAINER", "single-node_wazuh.manager_1")
+        proc = subprocess.run(["docker", "exec", container] + cmd,
+                              capture_output=True, text=True, timeout=60)
+        proc.check_returncode()
+        return proc.stdout
+
+    _SYSLOG_REMOTE_BLOCK = (
+        "\n  <remote>\n    <connection>syslog</connection>\n"
+        "    <port>514</port>\n    <protocol>udp</protocol>\n  </remote>\n"
+    )
+
+    def has_syslog_514(self, container: str | None = None) -> bool:
+        try:
+            cfg_text = self.docker_exec(["cat", "/var/ossec/etc/ossec.conf"], container=container)
+        except Exception:  # noqa: BLE001 - docker not available in hermetic tests
+            return False
+        return ("<connection>syslog</connection>" in cfg_text
+                and "<port>514</port>" in cfg_text)
+
+    def ensure_syslog_514(self, container: str | None = None) -> tuple[bool, str]:
+        """Idempotently add the UDP 514 syslog <remote> block to ossec.conf.
+        Returns (changed, detail). No restart here - callers restart via the
+        approved EXECUTE path. Reverted by remove_syslog_514()."""
+        if self.has_syslog_514(container):
+            return False, "syslog 514 listener already configured"
+        block = self._SYSLOG_REMOTE_BLOCK
+        base = "python3 -c"
+        script = (
+            "import pathlib; p = pathlib.Path('/var/ossec/etc/ossec.conf'); t = p.read_text();"
+            "marker = '</ossec_config>';"
+            "assert t.count(marker) == 1 and 'syslog' not in t, 'unexpected ossec.conf shape';"
+            f"p.write_text(t.replace(marker, '{block}' + marker))"
+        )
+        self.docker_exec([base, script], container=container)
+        if not self.has_syslog_514(container):
+            raise RuntimeError("ossec.conf edit did not take effect")
+        return True, "added UDP 514 syslog <remote> block to ossec.conf"
+
+    def remove_syslog_514(self, container: str | None = None) -> tuple[bool, str]:
+        """Idempotently remove the UDP 514 syslog <remote> block (cleanup)."""
+        if not self.has_syslog_514(container):
+            return False, "no syslog 514 block present"
+        script = (
+            "import pathlib, re; p = pathlib.Path('/var/ossec/etc/ossec.conf');"
+            "t = p.read_text();"
+            "t2 = re.sub(r'\\s*<remote>\\s*<connection>syslog</connection>\\s*"
+            "<port>514</port>\\s*<protocol>udp</protocol>\\s*</remote>', '', t);"
+            "assert t2 != t, 'syslog block regex failed'; p.write_text(t2)"
+        )
+        self.docker_exec(["python3", "-c", script], container=container)
+        if self.has_syslog_514(container):
+            raise RuntimeError("ossec.conf removal did not take effect")
+        return True, "removed UDP 514 syslog <remote> block from ossec.conf"
 
     # ------------------------------------------------------------------ #
     # preflight - the CLI refuses to run scenarios before this passes

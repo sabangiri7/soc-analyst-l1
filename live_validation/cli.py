@@ -18,8 +18,13 @@ SCENARIO_ORDER = [
     "env_baseline",
     "detection_ssh_rule",
     "streamed_ssh_alert",
+    "investigation_ip",
+    "investigation_web",
+    "investigation_existing_alert",
     "security_tool_args",
     "security_query_safety",
+    "security_approval_bypass",
+    "security_prompt_injection",
 ]
 
 
@@ -47,6 +52,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="scenario options as key=value,key2=value2 (e.g. test_ip=203.0.113.77)")
     p.add_argument("--approvals-path", default=None, help="approval store path (dev/testing)")
     p.add_argument("--audit-path", default=None, help="audit log path (dev/testing)")
+    p.add_argument("--syslog-listener-setup", action="store_true",
+                   help="dev-stack setup: add UDP 514 syslog <remote> to ossec.conf "
+                        "(needed for streamed_ssh_alert) and restart the manager")
+    p.add_argument("--syslog-listener-remove", action="store_true",
+                   help="dev-stack cleanup: remove the UDP 514 syslog <remote> block "
+                        "from ossec.conf and restart the manager")
     return p
 
 
@@ -102,6 +113,27 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  - {p}")
         return 1
     print("preflight OK (manager API, manager status, indexer, dashboards)")
+
+    # dev-stack listener setup (UDP 514 syslog) - docker-exec admin ops
+    if args.syslog_listener_setup:
+        changed, detail = env.ensure_syslog_514()
+        print(f"\n[syslog-listener] {detail}")
+        env.docker_exec(["/var/ossec/bin/wazuh-control", "restart"])
+        print("[syslog-listener] manager restarted (docker wazuh-control); waiting for readiness...")
+        if not env.wait_for_manager(timeout_s=300) or not env.wait_for_logtest(timeout_s=300):
+            print("[syslog-listener] FAILED: manager not ready after listener setup")
+            return 1
+        print("[syslog-listener] ready; UDP 514 syslog input active")
+
+    if args.syslog_listener_remove:
+        changed, detail = env.remove_syslog_514()
+        print(f"\n[syslog-listener] {detail}")
+        env.docker_exec(["/var/ossec/bin/wazuh-control", "restart"])
+        print("[syslog-listener] manager restarted; waiting for readiness...")
+        if not env.wait_for_manager(timeout_s=300) or not env.wait_for_logtest(timeout_s=300):
+            print("[syslog-listener] FAILED: manager not ready after listener removal")
+            return 1
+        print("[syslog-listener] ready; UDP 514 syslog input removed")
 
     # choose scenarios
     if args.scenario == "all":

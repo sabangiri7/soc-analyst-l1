@@ -46,6 +46,9 @@ class FakeWazuh:
     def get_rules(self, **kw):
         return {"data": {"affected_items": []}}
 
+    def get_rules_file(self, filename, raw=False):
+        return "<ruleset><rule id=\"100001\" level=\"10\"><match>x</match></rule></ruleset>"
+
 
 class FakeIndexer:
     def search(self, index, body):
@@ -345,8 +348,113 @@ class SecurityScenarioTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# CLI
+# investigation / bypass / injection scenarios
 # --------------------------------------------------------------------------- #
+class InvestigationScenarioTests(unittest.TestCase):
+    def test_ip_web_and_alert_follow_ups(self):
+        env = make_env()
+
+        def fake_exec(ctx, tool, params, **kw):
+            if tool == "investigate_ip":
+                if params.get("ip") == "45.124.37.241":
+                    return {"ip": "45.124.37.241", "total_alerts": 42, "max_level": 10,
+                            "top_rules": [{"id": 5715, "hits": 40, "level": 10}],
+                            "rule_groups": [("authentication_failures", 42)],
+                            "mitre_techniques": ["T1110.001"],
+                            "first_seen": "2026-09-24T00:00:00", "last_seen": "2026-09-24T06:00:00"}
+                return {"ip": "203.0.113.201", "total_alerts": 0, "max_level": None,
+                        "top_rules": [], "rule_groups": [], "mitre_techniques": [], "timeline": []}
+            if tool == "why_did_alert_trigger":
+                return {"rule_id": "5760", "rule_level": 5,
+                        "rule_description": "sshd: authentication failed.",
+                        "rule_groups": ["syslog", "sshd"],
+                        "full_log": "Oct 24 06:00:10 testhost sshd[1000]: Failed password for x"}
+            return {"status": "ok"}
+
+        def fake_count(index, query):
+            if "sample-security" in index:
+                return 500
+            return 0
+
+        with mock.patch("tools.registry.execute", side_effect=fake_exec), \
+             mock.patch.object(env.indexer, "count", side_effect=fake_count), \
+             mock.patch.object(env.indexer, "hits", return_value=[{
+                 "id": "9000.1", "rule": {"id": "5760"},
+                 "full_log": "sshd failed", "timestamp": "2026-09-24T06:00:00Z"}]):
+            logs = {name: scen.run_scenario(env, name, {}) for name in
+                    ("investigation_ip", "investigation_web",
+                     "investigation_existing_alert")}
+        for name, log in logs.items():
+            st = log.scenario_status(name)
+            self.assertEqual(st["status"], "PASS", (name, st["failures"]))
+
+        rows = {i.step: i for i in logs["investigation_web"].scenario_items("investigation_web")}
+        self.assertEqual(rows["real index web telemetry"].refs["count"], 0)
+        self.assertEqual(rows["demo index web telemetry"].refs["count"], 500)
+        self.assertEqual(rows["demo index web telemetry"].refs["provenance"], "demo")
+        rows = {i.step: i for i in logs["investigation_existing_alert"].scenario_items(
+            "investigation_existing_alert")}
+        self.assertTrue(rows["explain real alert"].passed)
+        self.assertEqual(rows["explain real alert"].refs["doc_rule_id"],
+                         rows["explain real alert"].refs["explained_rule_id"])
+
+    def test_cold_ip_honesty(self):
+        env = make_env()
+
+        def fake_exec(ctx, tool, params, **kw):
+            return {"ip": "203.0.113.201", "total_alerts": 0, "max_level": None,
+                    "top_rules": [], "rule_groups": [], "mitre_techniques": [], "timeline": []}
+
+        with mock.patch("tools.registry.execute", side_effect=fake_exec):
+            log = scen.run_scenario(env, "investigation_ip", {})
+        rows = {i.step: i for i in log.scenario_items("investigation_ip")}
+        self.assertTrue(rows["investigate cold ip"].passed)
+        self.assertIn("does NOT imply", rows["investigate cold ip"].detail)
+
+
+class ApprovalBypassTests(unittest.TestCase):
+    def test_write_gates_block_without_approval(self):
+        env = make_env()
+        env.confirm_execute = True  # CLI sets this under --auto-approve
+
+        def fake_exec(ctx, tool, params, **kw):
+            # registry gate: write tools demand approval, but the file is
+            # never touched - the gate fires before any manager call
+            if tool in ("create_wazuh_rule", "restart_wazuh_manager", "delete_wazuh_rule"):
+                return {"status": "approval_required", "proposal": {
+                    "id": f"appr-{tool}", "action": tool, "permission": "execute"
+                    if tool in ("restart_wazuh_manager", "delete_wazuh_rule") else "propose",
+                    "payload": params or {}}}
+            return {"status": "ok"}
+
+        with mock.patch("tools.registry.execute", side_effect=fake_exec), \
+             mock.patch.object(env, "propose", return_value={
+                 "status": "approval_required", "proposal": {
+                     "id": "appr-delete", "action": "delete_wazuh_rule",
+                     "permission": "execute", "payload": {"rule_id": 999999999}}}), \
+             mock.patch.object(env, "approve", side_effect=lambda p, by=None: {**p, "status": "approved"}), \
+             mock.patch.object(env, "execute_approved", return_value={
+                 "ok": False, "error": "EXECUTE-level action: requires an explicit "
+                                       "confirmation on top of the approval"}), \
+             mock.patch.object(env.wazuh, "get_rule", side_effect=lambda rid: {
+                 "data": {"affected_items": [{"id": rid}]} if rid in (5760, 100001) else []}):
+            log = scen.run_scenario(env, "security_approval_bypass", {})
+        st = log.scenario_status("security_approval_bypass")
+        self.assertEqual(st["status"], "PASS", st["failures"])
+        rows = {i.step: i for i in log.scenario_items("security_approval_bypass")}
+        for step in ("create rule without approval", "restart without approval",
+                     "delete rule without approval", "nothing deleted",
+                     "no rule deployed", "execute without confirm"):
+            self.assertTrue(rows[step].passed, step)
+            self.assertEqual(rows[step].result_kind, "wazuh_confirmed", step)
+
+
+class PromptInjectionTests(unittest.TestCase):
+    def test_data_hygiene(self):
+        env = make_env()
+        log = scen.run_scenario(env, "security_prompt_injection", {})
+        st = log.scenario_status("security_prompt_injection")
+        self.assertEqual(st["status"], "PASS", st["failures"])
 class CliTests(unittest.TestCase):
     def test_refuses_without_live_flag(self):
         from live_validation.cli import main
