@@ -39,7 +39,7 @@ from siem_providers import (
 )
 import lookup_tables as lookup
 
-MAX_TOOL_TURNS = 8
+MAX_TOOL_TURNS = cfg.LLM_MAX_TOOL_TURNS
 
 SYSTEM_PROMPT = """You are a conversational SOC assistant. You help an analyst \
 answer questions and take read/write actions on their SIEM dashboard and lookup \
@@ -409,6 +409,13 @@ class ChatAgent:
                 max_tokens=2000,
             )
             if not resp.tool_calls:
+                if resp.content and resp.content.strip():
+                    # The model answered in plain text - that IS the reply.
+                    # Returning immediately keeps a chat to a single LLM call
+                    # instead of burning the whole tool budget re-asking the
+                    # same question (which multiplied upstream requests and
+                    # blew through free-tier rate limits).
+                    return ChatResult(reply=resp.content, transcript=transcript)
                 messages.append({"role": "assistant", "content": resp.content or ""})
                 continue
             transcript.append({"assistant": resp.content or "", "tool_calls": [{"name": tc.name, "input": tc.input} for tc in resp.tool_calls]})

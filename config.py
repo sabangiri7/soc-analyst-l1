@@ -59,10 +59,31 @@ class Config:
     # --- LLM retry/backoff (openai_compat_provider._post) ---
     # Free gateways (FreeLLMAPI, OpenRouter free tier, ...) throw 429/5xx under
     # load; retries with exponential backoff + jitter keep one blip from killing
-    # a whole overnight batch. LLM_RETRY_BACKOFF_BASE caps per-step max wait.
+    # a whole overnight batch. LLM_RETRY_BACKOFF_MAX caps the per-step wait
+    # (and is honored even when the gateway sends a huge Retry-After header).
     LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "5"))
     LLM_RETRY_BACKOFF_BASE = float(os.getenv("LLM_RETRY_BACKOFF_BASE", "1.5"))
     LLM_RETRY_BACKOFF_MAX = float(os.getenv("LLM_RETRY_BACKOFF_MAX", "30"))
+    # 429s are rate-limit signals: retrying them hard only keeps the key inside
+    # the rate-limit window. Far fewer retries than 5xx, and Retry-After (when
+    # the gateway sends one) is honored before the bounded exponential fallback.
+    LLM_429_MAX_RETRIES = int(os.getenv("LLM_429_MAX_RETRIES", "2"))
+    # One structured log line per LLM attempt (request_id/attempt/model/status/
+    # latency/usage/retry_after). API keys and prompt contents are never logged.
+    LLM_TRACE_REQUESTS = _bool("LLM_TRACE_REQUESTS", True)
+
+    # FreeLLMAPI - after a rate-limit failure, make ONE extra attempt with an
+    # explicit alternate model (a different provider family than the last one
+    # that routed successfully), using the gateway's own /v1/models list.
+    # Bounded to a single fallback request *on failure* - the happy path is
+    # untouched, so this does not increase request volume under normal use.
+    FREELLMAPI_FALLBACK_ENABLED = _bool("FREELLMAPI_FALLBACK_ENABLED", True)
+    FREELLMAPI_FALLBACK_MODELS_TTL = int(os.getenv("FREELLMAPI_FALLBACK_MODELS_TTL", "300"))
+
+    # Chat agent tool-loop budget: max LLM calls per /api/chat message. The
+    # loop returns as soon as the model answers without a tool call, so this is
+    # a hard ceiling (anti run-away), not the typical call count.
+    LLM_MAX_TOOL_TURNS = int(os.getenv("LLM_MAX_TOOL_TURNS", "8"))
 
     # --- Audit / storage (JSONL + JSON stores under data/) ---
     # Triage verdicts - main.py / run.py / dashboard.py's on-demand triage

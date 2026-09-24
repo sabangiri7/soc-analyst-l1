@@ -36,6 +36,7 @@ import siem_providers as store
 from connectors.siem import PLATFORM_FIELDS
 from agent.triage_agent import TriageAgent, needs_human_review
 from agent.chat_agent import ChatAgent
+from llm.base import LLMRateLimitedError
 import lookup_tables as lookup
 import rules
 import notify
@@ -283,7 +284,18 @@ def api_chat():
     except Exception as e:  # noqa: BLE001
         return jsonify({"error": f"Could not start the chat agent: {e}"}), 400
 
-    result = agent.chat(user_message=message, history=history or [])
+    try:
+        result = agent.chat(user_message=message, history=history or [])
+    except LLMRateLimitedError as e:
+        # Upstream LLM gateway is rate limited. Answer 429 to the browser
+        # (with the gateway's Retry-After when known) instead of a Flask 500
+        # traceback - and never retry the message here, that would just keep
+        # the key inside the rate-limit window.
+        return jsonify({
+            "error": "The LLM gateway is rate limited; please wait a moment and try again.",
+            "retry_after": e.retry_after,
+            "request_id": e.request_id,
+        }), 429
 
     CHAT_LOG.parent.mkdir(parents=True, exist_ok=True)
     with open(CHAT_LOG, "a") as f:

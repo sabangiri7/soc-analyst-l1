@@ -20,9 +20,52 @@ its own wire format and back.
 """
 from __future__ import annotations
 
+import json
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
+
+from config import cfg
+
+# Structured per-attempt LLM tracing. One JSON line per attempt emitted by the
+# OpenAI-compatible transport. Never includes API keys or prompt contents.
+_llm_logger = logging.getLogger("soc.llm")
+
+
+def trace_llm(**fields: Any) -> None:
+    """Emit one structured JSON line for an LLM transport event.
+
+    Only known-safe fields are ever passed in - never the API key and never
+    prompt/system/message contents (that is enforced by the call sites, and
+    the transport never receives those objects with their secrets).
+    """
+    if not cfg.LLM_TRACE_REQUESTS:
+        return
+    event = fields.pop("event", "llm.request")
+    try:
+        _llm_logger.info(json.dumps({"event": event, **fields}))
+    except Exception:  # noqa: BLE001 - logging must never break a request
+        _llm_logger.info("event=%s", event)
+
+
+class LLMError(Exception):
+    """Base for provider/transport errors surfaced to callers."""
+
+
+class LLMRateLimitedError(LLMError):
+    """The upstream gateway kept returning 429 after bounded retries.
+
+    Carries enough detail for the HTTP layer to answer client-side 429s
+    (including a Retry-After value when the gateway supplied one).
+    """
+
+    def __init__(self, message: str, *, status: int = 429, retry_after: float | None = None,
+                 request_id: str | None = None):
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
+        self.request_id = request_id
 
 
 @dataclass
@@ -38,6 +81,8 @@ class LLMResponse:
 
     content: str = ""  # free text; empty when the model only made tool calls
     tool_calls: list[ToolCall] = field(default_factory=list)
+    usage: dict[str, Any] = field(default_factory=dict)  # prompt/completion/total tokens
+    request_id: str = ""  # trace id of the underlying transport call
 
     @property
     def text(self) -> str:
