@@ -542,19 +542,30 @@
           </div>
           <span class="pill">run.py</span>
         </div>
-        <div class="agent-status">
-          <span class="dot" id="agent-dot"></span>
-          <span id="agent-state" style="font-weight:600;">Checking…</span>
+        <div class="agent-counts" style="display:flex; gap:18px; margin:10px 0 12px; font-size:12.5px; flex-wrap:wrap;">
+          <span><b id="agent-deployed">0</b> deployed</span>
+          <span style="color:#3ecf8e;"><b id="agent-running">0</b> running</span>
+          <span><b id="agent-stopped">0</b> stopped</span>
         </div>
-        <div class="meta" id="agent-meta" style="margin-top:6px; font-family:var(--mono); font-size:11.5px;"></div>
-        <div class="actions" style="margin-top:14px;">
-          <button class="btn primary" id="agent-start-btn" onclick="agentStart()">Start watcher</button>
-          <button class="btn danger" id="agent-stop-btn" onclick="agentStop()" disabled>Stop</button>
-          <button class="btn" onclick="agentRefresh()">Refresh status</button>
+        <div class="agent-deploy" style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+          <select id="agent-provider" style="flex:1; min-width:200px;" title="Deploy a watcher pinned to a SIEM provider, or Default for the env-seeded connection"></select>
+          <button class="btn primary" onclick="agentsDeploy()">Deploy watcher</button>
+          <button class="btn" onclick="agentsRefresh()">Refresh</button>
         </div>
-        <p class="meta" style="margin-top:14px; font-size:11.5px; max-width:46ch;">
-          Stop-file kill switch: a stop request writes data/agent_stop.txt so the watcher
-          exits cleanly at the end of its current cycle. Heartbeats are written each poll.
+        <div id="agents-list" style="margin-top:14px;"></div>
+        <div id="agent-log-card" hidden style="margin-top:14px;">
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:6px;">
+            <div class="meta" style="font-family:var(--mono); font-size:11.5px;">Watcher logs <span id="agent-log-title"></span></div>
+            <div style="display:flex; gap:6px;">
+              <button class="btn" onclick="agentLogRefresh()">Refresh</button>
+              <button class="btn" onclick="agentLogClose()">Close</button>
+            </div>
+          </div>
+          <pre id="agent-log" class="detail" style="max-height:280px; overflow:auto; margin:0; font-size:11px; line-height:1.5; white-space:pre-wrap; word-break:break-word;"></pre>
+        </div>
+        <p class="meta" style="margin-top:14px; font-size:11.5px; max-width:52ch;">
+          Stop = SIGTERM + a stop-file (clean exit at end of cycle). Kill = immediate SIGKILL, no cleanup.
+          Captured output for every watcher is viewable via Logs.
         </p>
       </div>
     </div>
@@ -1702,55 +1713,139 @@ async function importRulesFromFile(file) {
   $("rule-import-file").value = "";
 }
 
-/* ---------------- agent control ---------------- */
+/* ---------------- agent control (multi-agent watchers) ---------------- */
 let AGENT_POLL_TIMER = null;
+let AGENT_LOG_TIMER = null;
+let ACTIVE_LOG_AGENT = null;
 
-function agentRefresh() {
-  api("/api/agent").then(r => renderAgentStatus(r)).catch(e => {
-    $("agent-state").textContent = "Error: " + e.message;
-    $("agent-dot").className = "dot err";
-  });
-}
+function agentRefresh() { agentsRefresh(); }  // legacy name kept for view hooks
 
-function renderAgentStatus(r) {
-  const dot = $("agent-dot");
-  const state = $("agent-state");
-  const meta = $("agent-meta");
-  if (r.running) {
-    dot.className = "dot ok";
-    state.textContent = `Running · cycle ${r.cycle || "?"}`;
-    const age = r.last_heartbeat_age_s != null ? `${Math.round(r.last_heartbeat_age_s)}s ago` : "?";
-    meta.textContent = `heartbeat ${r.last_heartbeat || "?"} · ${age} · pid ${r.pid || "?"}`;
-  } else {
-    dot.className = "dot err";
-    state.textContent = "Stopped";
-    meta.textContent = r.reason ? `Reason: ${r.reason}` : (r.stop_file_present ? "Stop file present" : "No heartbeat");
+async function agentsRefresh() {
+  try {
+    const r = await api("/api/agents");
+    renderAgentCounts(r.counts);
+    renderAgentsList(r.agents);
+    populateAgentProviders();
+  } catch (e) {
+    $("agents-list").innerHTML = `<div class="empty">⚠️ ${esc(e.message)}</div>`;
   }
-  $("agent-start-btn").disabled = r.running;
-  $("agent-stop-btn").disabled = !r.running;
 }
 
-async function agentStart() {
+function renderAgentCounts(c) {
+  $("agent-deployed").textContent = c.deployed ?? 0;
+  $("agent-running").textContent = c.running ?? 0;
+  $("agent-stopped").textContent = c.stopped ?? 0;
+}
+
+function renderAgentsList(agents) {
+  const box = $("agents-list");
+  if (!agents || !agents.length) {
+    box.innerHTML = `<div class="empty">No watchers deployed yet. Pick a SIEM (or Default) and hit "Deploy watcher".</div>`;
+    return;
+  }
+  box.innerHTML = "";
+  for (const a of agents) box.appendChild(agentRow(a));
+}
+
+function agentRow(a) {
+  const row = document.createElement("div");
+  row.className = "agent-row";
+  row.style.cssText = "border:1px solid var(--border); border-radius:8px; padding:10px 12px; margin-bottom:10px;";
+  const stateLabel = a.running ? (a.status === "starting" ? "starting…" : `running · cycle ${a.cycle ?? "?"}`) : (a.status || "stopped");
+  const age = a.last_heartbeat_age_s != null ? ` (${Math.round(a.last_heartbeat_age_s)}s ago)` : "";
+  row.innerHTML = `
+    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+      <span class="dot ${a.running ? "ok" : "err"}"></span>
+      <span style="font-weight:600; font-family:var(--mono);">${esc(a.agent_id)}</span>
+      <span class="pill">${esc(stateLabel)}</span>
+      ${a.pid ? `<span class="meta" style="font-family:var(--mono);">pid ${a.pid}</span>` : ""}
+      <span style="margin-left:auto; display:flex; gap:6px;">
+        <button class="btn" onclick="agentLogs('${esc(a.agent_id)}')">Logs</button>
+        <button class="btn" onclick="agentsStop('${esc(a.agent_id)}')">Stop</button>
+        <button class="btn danger" onclick="agentsKill('${esc(a.agent_id)}')">Kill</button>
+      </span>
+    </div>
+    <div class="meta" style="margin-top:6px; font-family:var(--mono); font-size:11px;">
+      heartbeat ${a.last_heartbeat || "never"}${age} · triaged ${a.triaged_this_cycle ?? "?"} · alerts seen ${a.alerts_seen ?? "?"}
+      ${a.stop_file_present ? " · <b>stop-file present</b>" : ""}
+      ${a.reason ? ` · ${esc(a.reason)}` : ""}
+    </div>`;
+  return row;
+}
+
+function populateAgentProviders() {
+  const sel = $("agent-provider");
+  if (!sel) return;
+  const cur = sel.value;
+  const opts = (typeof PROVIDERS !== "undefined" && PROVIDERS) ? PROVIDERS : [];
+  sel.innerHTML = `<option value="">Default (env-seeded SIEM)</option>` +
+    opts.map(p => `<option value="${esc(p.id)}">${esc(p.name || p.platform)} · ${esc(p.id)}</option>`).join("");
+  if (cur) sel.value = cur;
+}
+
+async function agentsDeploy() {
+  const prov = $("agent-provider").value;
+  const agent_id = prov || "default";
   try {
-    const r = await api("/api/agent/start", { method: "POST" });
-    toast(`Watcher started (PID ${r.pid})`, true);
-    agentRefresh();
+    const r = await api("/api/agents/start", {
+      method: "POST",
+      body: JSON.stringify({ agent_id, provider_id: prov || undefined }),
+    });
+    toast(`Watcher "${r.agent_id}" deployed (PID ${r.pid})`, true);
+    agentsRefresh();
     startAgentPolling();
-  } catch (e) { toast("Failed to start: " + e.message); }
+  } catch (e) { toast("Failed to deploy: " + e.message); }
 }
 
-async function agentStop() {
-  if (!confirm("Stop the overnight watcher?")) return;
+async function agentsStop(id) {
+  if (!confirm(`Stop watcher "${id}"?`)) return;
   try {
-    await api("/api/agent/stop", { method: "POST" });
-    toast("Watcher stop requested", true);
-    agentRefresh();
+    await api(`/api/agents/${encodeURIComponent(id)}/stop`, { method: "POST" });
+    toast(`Stop requested for "${id}"`, true);
+    agentsRefresh();
   } catch (e) { toast("Failed to stop: " + e.message); }
+}
+
+async function agentsKill(id) {
+  if (!confirm(`KILL watcher "${id}"? Immediate SIGKILL, no cleanup.`)) return;
+  try {
+    await api(`/api/agents/${encodeURIComponent(id)}/kill`, { method: "POST" });
+    toast(`Killed "${id}"`, true);
+    agentsRefresh();
+  } catch (e) { toast("Failed to kill: " + e.message); }
+}
+
+async function agentLogs(id) {
+  ACTIVE_LOG_AGENT = id;
+  $("agent-log-card").hidden = false;
+  $("agent-log-title").textContent = `· ${id}`;
+  await agentLogRefresh();
+  if (AGENT_LOG_TIMER) clearInterval(AGENT_LOG_TIMER);
+  AGENT_LOG_TIMER = setInterval(agentLogRefresh, 3000);
+}
+
+async function agentLogRefresh() {
+  if (!ACTIVE_LOG_AGENT) return;
+  try {
+    const r = await api(`/api/agents/${encodeURIComponent(ACTIVE_LOG_AGENT)}/logs?lines=400`);
+    const pre = $("agent-log");
+    pre.textContent = r.lines && r.lines.length ? r.lines.join("\n") : "(no output yet — watcher output appears here once running)";
+    pre.scrollTop = pre.scrollHeight;
+  } catch (e) { $("agent-log").textContent = "Error: " + e.message; }
+}
+
+function agentLogClose() {
+  ACTIVE_LOG_AGENT = null;
+  $("agent-log-card").hidden = true;
+  if (AGENT_LOG_TIMER) { clearInterval(AGENT_LOG_TIMER); AGENT_LOG_TIMER = null; }
 }
 
 function startAgentPolling() {
   if (AGENT_POLL_TIMER) clearInterval(AGENT_POLL_TIMER);
-  AGENT_POLL_TIMER = setInterval(agentRefresh, 3000);
+  AGENT_POLL_TIMER = setInterval(() => {
+    agentsRefresh();
+    if (ACTIVE_LOG_AGENT) agentLogRefresh();
+  }, 3000);
 }
 
 /* ================= AI SOC Engineer + Approval Center (PHASE 12) ================= */

@@ -51,6 +51,12 @@ class Config:
     # Heartbeat: watcher updates it each poll so the dashboard can show
     # "still alive / last cycle / triaged" without polling the process.
     AGENT_HEARTBEAT_PATH = os.getenv("AGENT_HEARTBEAT_PATH", "data/agent_heartbeat.json")
+    # Captured stdout/stderr of the default overnight watcher (dashboard-managed).
+    AGENT_LOG_FILE = os.getenv("AGENT_LOG_FILE", "data/agent_run.log")
+    # Per-agent state dir for *named* watchers: data/agents/<agent_id>/
+    # (heartbeat.json + stop.txt + run.log). The default agent ("default")
+    # keeps the legacy AGENT_* paths above.
+    AGENT_DIR = os.getenv("AGENT_DIR", "data/agents")
     # Seconds between poll cycles (--interval default in run.py).
     AGENT_POLL_INTERVAL = float(os.getenv("AGENT_POLL_INTERVAL", "30"))
     # Stop cleanly after N poll cycles (0 = run forever) - --exit-after default.

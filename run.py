@@ -21,6 +21,8 @@ Run modes
     python run.py --exit-after 50 # run ~50 alert cycles then exit cleanly
     python run.py --interval 60   # sleep 60s between polls
     python run.py --siem <id>     # SIEM provider id from the dashboard store
+    python run.py --agent-id <id> # named watcher (dashboard spawns these -
+                                  # state/logs live under data/agents/<id>/)
     python run.py --provider mock # force the mock LLM (offline dev/CI)
 
 Clean shutdown is honoured three ways - all exit 0 so the dashboard/CI sees a
@@ -30,11 +32,16 @@ clean stop:
   3. A stop-file (default data/agent_stop.txt), created by the dashboard's
      "Stop overnight run" button - checked once per cycle, so you can stop it
      remotely without needing the terminal.
+
+The watcher writes its heartbeat *every* poll cycle (even when there are no
+alerts) plus an initial "starting" heartbeat on boot, so the dashboard always
+knows it is alive and can signal it - an idle SIEM must not look "stopped".
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import sys
 import time
@@ -45,43 +52,40 @@ from config import cfg
 from llm import get_provider
 from agent.triage_agent import TriageAgent, needs_human_review
 from siem_providers import connector_for, load_providers, resolve_connector
+import agent_control as ac
 import rules
 import notify
+
+
+AGENT_ID = "default"
+_CYCLES_DONE = 0
 
 
 # --------------------------------------------------------------------------- #
 # Stop-file + heartbeat plumbing (shared with the dashboard "agent control").
 # --------------------------------------------------------------------------- #
 def stop_file_path() -> Path:
-    return Path(cfg.AGENT_STOP_FILE or "data/agent_stop.txt")
+    return ac.stop_file_path(AGENT_ID)
 
 
 def heartbeat_path() -> Path:
-    return Path(cfg.AGENT_HEARTBEAT_PATH or "data/agent_heartbeat.json")
+    return ac.heartbeat_path(AGENT_ID)
 
 
 def write_heartbeat(state: dict[str, Any]) -> None:
-    hb = heartbeat_path()
-    hb.parent.mkdir(parents=True, exist_ok=True)
-    tmp = hb.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2, default=str))
-    tmp.replace(hb)
+    # The watcher always knows its own pid - guarantee it is in every heartbeat
+    # so the dashboard can signal the process even if it spawned this watcher
+    # without writing one itself.
+    state.setdefault("pid", os.getpid())
+    ac.write_heartbeat(AGENT_ID, state)
 
 
 def read_heartbeat() -> dict[str, Any]:
-    p = heartbeat_path()
-    try:
-        return json.loads(p.read_text())
-    except (OSError, json.JSONDecodeError):
-        return {"status": "unknown"}
+    return ac.read_heartbeat(AGENT_ID)
 
 
-def mark_stopped() -> None:
-    write_heartbeat({"status": "stopped", "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                     "reason": "stop requested", "cycles": _CYCLES_DONE})
-
-
-_CYCLES_DONE = 0
+def mark_stopped(reason: str = "stop requested") -> None:
+    ac.mark_stopped(AGENT_ID, reason, cycles=_CYCLES_DONE)
 
 
 # --------------------------------------------------------------------------- #
@@ -102,6 +106,15 @@ def _run_cycle(siem, *, cycle: int, exit_after: int) -> bool:
     if not alerts:
         if cycle == 1:
             print("  [run] No alerts in the first poll - watching...")
+        # Heartbeat EVERY cycle, even with nothing to triage - this is how the
+        # dashboard knows the watcher is alive and enables its Stop button.
+        write_heartbeat({
+            "status": "running",
+            "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "cycle": cycle,
+            "triaged_this_cycle": 0,
+            "alerts_seen": 0,
+        })
         return False
 
     agent = TriageAgent(siem=siem)
@@ -183,8 +196,20 @@ def run_watch(*, siem, interval: float, exit_after: int) -> int:
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
 
+    # Initial heartbeat so the dashboard sees a live pid immediately, even
+    # before the first poll cycle finishes.
+    write_heartbeat({
+        "status": "starting",
+        "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "cycle": 0,
+        "alerts_seen": 0,
+        "triaged_this_cycle": 0,
+        "reason": "started",
+    })
+
     print("=" * 66)
-    print(f" SOC overnight watcher · siem={siem.name if siem is not None else 'none'}")
+    print(f" SOC overnight watcher · agent={AGENT_ID or 'default'} "
+          f"siem={siem.name if siem is not None else 'none'}")
     print(f" LLM={cfg.LLM_PROVIDER} · retries={cfg.LLM_MAX_RETRIES} "
           f"(backoff {cfg.LLM_RETRY_BACKOFF_BASE}s)")
     print(f" interval={interval}s · exit_after={exit_after or 'forever'}")
@@ -219,11 +244,18 @@ def main() -> int:  # pragma: no cover - thin argparse wrapper
                              "resolve_connector(None) -> env-seeded Wazuh/mock).")
     parser.add_argument("--provider", default=None,
                         help="LLM provider override: anthropic|openai|google|mock|freellmapi")
+    parser.add_argument("--agent-id", default="default",
+                        help="watcher id (dashboard spawns named watchers; state and "
+                             "logs live under data/agents/<id>/ - 'default' keeps the "
+                             "legacy data/agent_* paths)")
     parser.add_argument("--interval", type=float, default=cfg.AGENT_POLL_INTERVAL,
                         help="seconds between polls (default: AGENT_POLL_INTERVAL)")
     parser.add_argument("--exit-after", type=int, default=0,
                         help="stop cleanly after N poll cycles (0 = run forever)")
     args = parser.parse_args()
+
+    global AGENT_ID
+    AGENT_ID = ac.sanitize_id(args.agent_id)
 
     if args.provider:
         get_provider(args.provider)  # validate/instantiate early so a bad key fails fast

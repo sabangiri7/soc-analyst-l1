@@ -33,6 +33,7 @@ from typing import Any
 from flask import Flask, jsonify, render_template, request
 
 import siem_providers as store
+import agent_control as ac
 from connectors.siem import PLATFORM_FIELDS
 from agent.triage_agent import TriageAgent, needs_human_review
 from agent.chat_agent import ChatAgent
@@ -506,80 +507,132 @@ def api_import_rules():
 
 
 # --------------------------------------------------------------------------- #
-# Agent control routes - overnight watcher status / start / stop.
+# Agent control - overnight watchers: status, spawn, stop, KILL, logs.
 # --------------------------------------------------------------------------- #
-AGENT_POLL_TOLERANCE = 120  # seconds: heartbeat fresher than this counts as "running"
+def _spawn_agent(agent_id: str, provider_id: str | None = None) -> int:
+    """Start a run.py watcher for `agent_id`, capturing its output to run.log."""
+    agent_id = ac.sanitize_id(agent_id)
+    stop = ac.stop_file_path(agent_id)
+    stop.parent.mkdir(parents=True, exist_ok=True)
+    stop.unlink(missing_ok=True)
+
+    log_path = ac.log_file_path(agent_id)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_fh = open(log_path, "ab")
+    cmd = [sys.executable, str(Path(__file__).parent / "run.py"), "--agent-id", agent_id]
+    if provider_id:
+        cmd += ["--siem", provider_id]
+    try:
+        proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+    finally:
+        log_fh.close()
+    # "starting" heartbeat with a visible pid until the watcher's first write.
+    ac.write_heartbeat(agent_id, {
+        "status": "starting",
+        "pid": proc.pid,
+        "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "reason": "started",
+    })
+    return proc.pid
+
+
+def _signal_agent(agent_id: str, sig: int) -> bool:
+    """Signal a watcher's pid (heartbeat) AND drop its stop-file.
+
+    The stop-file alone makes the watcher exit at the end of the current
+    cycle; the signal makes that immediate. Both together mean Stop/Kill work
+    even if the recorded pid is stale or the heartbeat was overwritten.
+    """
+    agent_id = ac.sanitize_id(agent_id)
+    hb = ac.read_heartbeat(agent_id)
+    pid = hb.get("pid")
+    hit = False
+    if pid:
+        try:
+            os.kill(int(pid), sig)
+            hit = True
+        except (ProcessLookupError, OSError):
+            pass
+    ac.stop_file_path(agent_id).touch(exist_ok=True)
+    return hit
 
 
 @app.get("/api/agent")
 def api_agent_status():
-    from config import cfg
-    hb_path = Path(cfg.AGENT_HEARTBEAT_PATH or "data/agent_heartbeat.json")
-    stop_path = Path(cfg.AGENT_STOP_FILE or "data/agent_stop.txt")
-    try:
-        hb = json.loads(hb_path.read_text())
-    except (OSError, json.JSONDecodeError):
-        hb = {}
-    running = bool(hb.get("status") == "running")
-    now = time.time()
-    last_ts = hb.get("at")
-    last_age = None
-    if last_ts:
-        try:
-            import datetime
-            last_dt = datetime.datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
-            last_age = (datetime.datetime.now(datetime.timezone.utc) - last_dt).total_seconds()
-        except Exception:
-            last_age = None
-    return jsonify({
-        "running": running and (last_age is None or last_age < AGENT_POLL_TOLERANCE),
-        "last_heartbeat": last_ts,
-        "last_heartbeat_age_s": last_age,
-        "pid": hb.get("pid"),
-        "stop_file_present": stop_path.exists(),
-        "cycle": hb.get("cycle"),
-        "triaged_this_cycle": hb.get("triaged_this_cycle"),
-        "alerts_seen": hb.get("alerts_seen"),
-        "status": hb.get("status"),
-        "reason": hb.get("reason"),
-    })
+    """Legacy single-agent status (default watcher)."""
+    return jsonify(ac.status("default"))
 
 
 @app.post("/api/agent/start")
 def api_agent_start():
-    from config import cfg
-    stop_path = Path(cfg.AGENT_STOP_FILE or "data/agent_stop.txt")
-    if stop_path.exists():
-        stop_path.unlink()
-
-    cmd = [sys.executable, str(Path(__file__).parent / "run.py")]
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    # Write a temporary heartbeat so the dashboard can pick up the pid quickly.
-    hb_path = Path(cfg.AGENT_HEARTBEAT_PATH or "data/agent_heartbeat.json")
-    hb_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = hb_path.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"status": "starting", "pid": proc.pid, "at": time.strftime("%Y-%m-%dT%H:%M:%S")}, indent=2))
-    tmp.replace(hb_path)
-    return jsonify({"ok": True, "pid": proc.pid})
+    """Legacy single-agent start (default watcher)."""
+    body = request.get_json(force=True, silent=True) or {}
+    provider_id = (body.get("provider_id") or "").strip() or None
+    pid = _spawn_agent("default", provider_id)
+    return jsonify({"ok": True, "pid": pid})
 
 
 @app.post("/api/agent/stop")
 def api_agent_stop():
-    from config import cfg
-    hb_path = Path(cfg.AGENT_HEARTBEAT_PATH or "data/agent_heartbeat.json")
-    stop_path = Path(cfg.AGENT_STOP_FILE or "data/agent_stop.txt")
+    """Legacy single-agent stop (default watcher)."""
+    hit = _signal_agent("default", signal.SIGTERM)
+    return jsonify({"ok": True, "killed": hit})
+
+
+@app.get("/api/agents")
+def api_agents():
+    """All deployed watchers + deployed/running/stopped counts."""
+    agents = ac.list_agents()
+    return jsonify({"agents": agents, "counts": ac.counts(agents)})
+
+
+@app.post("/api/agents/start")
+def api_agents_start():
+    """Deploy a named watcher, optionally pinned to a SIEM provider.
+
+    agent_id defaults to the provider id (natural name for a per-provider
+    watcher) or 'default'. Refuses to double-start a watcher that is alive.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    provider_id = (body.get("provider_id") or "").strip() or None
+    agent_id = ac.sanitize_id(body.get("agent_id")) if (body.get("agent_id") or "").strip() else (
+        provider_id or "default"
+    )
+    if ac.status(agent_id)["running"]:
+        return jsonify({"error": f"Watcher '{agent_id}' is already running."}), 409
+    pid = _spawn_agent(agent_id, provider_id)
+    return jsonify({"ok": True, "agent_id": agent_id, "pid": pid})
+
+
+@app.post("/api/agents/<agent_id>/stop")
+def api_agents_stop(agent_id: str):
+    """Graceful stop: SIGTERM + stop-file (watcher exits cleanly end-of-cycle)."""
+    hit = _signal_agent(agent_id, signal.SIGTERM)
+    return jsonify({"ok": True, "agent_id": ac.sanitize_id(agent_id), "killed": hit})
+
+
+@app.post("/api/agents/<agent_id>/kill")
+def api_agents_kill(agent_id: str):
+    """Kill switch: SIGKILL immediately, no cleanup. Leaves a stopped heartbeat."""
+    aid = ac.sanitize_id(agent_id)
+    hit = _signal_agent(aid, signal.SIGKILL)
+    ac.mark_stopped(aid, "killed (SIGKILL)")
+    return jsonify({"ok": True, "agent_id": aid, "killed": hit})
+
+
+@app.get("/api/agents/<agent_id>/logs")
+def api_agents_logs(agent_id: str):
+    """Tail of a watcher's captured output (the last N lines of run.log)."""
+    aid = ac.sanitize_id(agent_id)
+    lines_arg = request.args.get("lines", "200")
     try:
-        hb = json.loads(hb_path.read_text())
-    except (OSError, json.JSONDecodeError):
-        hb = {}
-    pid = hb.get("pid")
-    if pid:
-        try:
-            os.kill(int(pid), signal.SIGTERM)
-        except (ProcessLookupError, OSError):
-            pass
-    stop_path.touch()
-    return jsonify({"ok": True})
+        n = int(lines_arg)
+    except ValueError:
+        n = 200
+    log_path = ac.log_file_path(aid)
+    lines = ac.tail_lines(log_path, n) if log_path.exists() else []
+    return jsonify({"agent": ac.status(aid), "lines": lines, "total": len(lines)})
 
 
 # --------------------------------------------------------------------------- #
