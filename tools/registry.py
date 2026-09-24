@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import approvals
 import audit
 import guard
 from config import cfg
@@ -40,7 +41,9 @@ def _collect_tool_classes() -> list[type[BaseWazuhTool]]:
     from tools.indexer import TOOLS as INDEXER_TOOLS
     from tools.wazuh import TOOLS as WAZUH_TOOLS
     from tools.dashboard import TOOLS as DASHBOARD_TOOLS
-    return [*INDEXER_TOOLS, *WAZUH_TOOLS, *DASHBOARD_TOOLS]
+    from tools.investigate import TOOLS as INVESTIGATE_TOOLS
+    from tools.propose import ProposeAction
+    return [*INDEXER_TOOLS, *WAZUH_TOOLS, *DASHBOARD_TOOLS, *INVESTIGATE_TOOLS, ProposeAction]
 
 
 ALL_TOOL_CLASSES: list[type[BaseWazuhTool]] = _collect_tool_classes()
@@ -72,6 +75,22 @@ def _permission_level(tool: BaseWazuhTool) -> Permission:
     return tool.permission
 
 
+def _store_proposal(proposed: dict[str, Any], ctx: ToolContext,
+                    tool: BaseWazuhTool, clean: dict[str, Any]) -> dict[str, Any]:
+    """Persist a tool's proposed action into the Approval Center so it gets an
+    id humans can approve, and thread the id back through audit + the agent."""
+    return approvals.create_proposal(
+        action=proposed.get("action", tool.name),
+        reason=proposed.get("reason", ""),
+        payload=proposed.get("payload", {}),
+        permission=proposed.get("permission", tool.permission.value),
+        generated_config=proposed.get("generated_config"),
+        validation=proposed.get("validation"),
+        user=ctx.user,
+        agent=ctx.agent,
+    )
+
+
 def execute(
     ctx: ToolContext,
     tool_name: str,
@@ -101,13 +120,13 @@ def execute(
             # as denied and report.
             raise PermissionDenied(f"{tool_name} is a write tool but executed without an approved proposal.")
         except ApprovalRequired as e:
-            proposal = e.proposed_action
+            proposal = _store_proposal(e.proposed_action, ctx, tool, clean)
             audit.audit_log(
                 tool=tool_name, params=tool.redact(clean),
                 permission=level.value, approval_status="proposed",
                 execution_status="awaiting_approval",
                 action=proposal.get("action", tool_name),
-                result={"proposal_id_hint": proposal.get("id")},
+                result={"proposal_id": proposal.get("id")},
             )
             return {"status": "approval_required", "proposal": proposal}
         except PermissionDenied:
@@ -117,10 +136,11 @@ def execute(
     try:
         result = tool.run(ctx, **clean)
     except ApprovalRequired as e:
-        proposal = e.proposed_action
+        proposal = _store_proposal(e.proposed_action, ctx, tool, clean)
         audit.audit_log(tool=tool_name, params=tool.redact(clean), permission=level.value,
                         approval_status="proposed", execution_status="awaiting_approval",
-                        action=proposal.get("action", tool_name))
+                        action=proposal.get("action", tool_name),
+                        result={"proposal_id": proposal.get("id")})
         return {"status": "approval_required", "proposal": proposal}
     except (ToolError, PermissionDenied) as e:
         audit.audit_log(tool=tool_name, params=tool.redact(clean), permission=level.value,

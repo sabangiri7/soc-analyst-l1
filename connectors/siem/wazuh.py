@@ -112,11 +112,17 @@ class WazuhConnector(SIEMConnector):
 
     def post_field_caps_search(self, body: dict[str, Any], index: str = "*") -> dict[str, Any]:
         """POST /{index}/_field_caps - schema/type mapping for field discovery
-        (used by the AI SOC engineer's dashboard + gap analysis)."""
+        (used by the AI SOC engineer's dashboard + gap analysis).
+
+        Wazuh's indexer is Elasticsearch 7.10.x-compatible: `_field_caps`
+        expects `fields` as a *query parameter*, not in the request body.
+        `body` may carry `index_filter` for scoping."""
+        fields = ",".join(body.get("fields") or ["*"])
+        req_body = {"index_filter": body.get("index_filter")} if body.get("index_filter") else {}
         r = requests.post(
-            f"{self.host}/{index}/_field_caps",
+            f"{self.host}/{index}/_field_caps?fields={fields}",
             auth=self.auth,
-            json=body,
+            json=req_body,
             verify=self.verify,
             timeout=20,
         )

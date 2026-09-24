@@ -196,6 +196,9 @@ class Config:
     LOGTEST_MAX_ATTEMPTS = int(os.getenv("LOGTEST_MAX_ATTEMPTS", "3"))
     # Pending proposals older than this are expired and cannot be approved.
     APPROVAL_EXPIRY_SECONDS = int(os.getenv("APPROVAL_EXPIRY_SECONDS", "86400"))
+    # Tool-use budget per engineer conversation (investigations can need more
+    # turns than the triage agent's default).
+    ENGINE_MAX_TOOL_TURNS = int(os.getenv("ENGINE_MAX_TOOL_TURNS", "10"))
 
     # Mock SIEM (SIEM_PROVIDER=mock) - optional override for the canned alerts
     MOCK_SIEM_ALERTS_FILE = os.getenv("MOCK_SIEM_ALERTS_FILE", "")
