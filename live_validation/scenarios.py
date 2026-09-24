@@ -54,12 +54,17 @@ def _manager_json(env: LiveEnv, path: str, params: dict[str, Any] | None = None)
         "GET", path, params or {})
 
 
-def gen_ssh_rule_xml(rid: int, marker: str) -> str:
+def gen_ssh_rule_xml(rid: int, marker: str, frequency: int = 8,
+                     timeframe: int = 300) -> str:
     """Deterministic frequency rule for repeated SSH failures (phase-verified
     pattern: frequency/timeframe are rule attributes with an if_matched_sid
-    parent - never child elements, never if_sid)."""
+    parent - never child elements, never if_sid).
+
+    frequency must match the number of positive samples a verify run can feed
+    (tools cap positive samples at 8; the Nth sample in one logtest session
+    fires the rule, the first N-1 fire the parent)."""
     return (
-        f'<rule id="{rid}" level="10" frequency="10" timeframe="300">\n'
+        f'<rule id="{rid}" level="10" frequency="{frequency}" timeframe="{timeframe}">\n'
         f"  <if_matched_sid>5760</if_matched_sid>\n"
         f"  <match>{marker}</match>\n"
         f"  <description>PHASE14 test: repeated SSH authentication failures ({marker})</description>\n"
@@ -160,7 +165,6 @@ def _scenario_detection_ssh(env: LiveEnv, log: EvidenceLog, opts: dict) -> None:
     s = "detection_ssh_rule"
     ts = time.strftime("%H%M%S")
     marker = f"phase14_{ts}"
-    user = f"p14user{ts[-4:]}"
     test_ip = opts.get("test_ip", "203.0.113.77")
     rid = 100000 + (int(time.time() * 1000) % 800000)
 
@@ -194,8 +198,10 @@ def _scenario_detection_ssh(env: LiveEnv, log: EvidenceLog, opts: dict) -> None:
                     else f"rule id {rid} valid (frequency/timeframe are attrs, if_matched_sid parent)",
              refs={"rule_id": rid, "errors": validation["errors"]})
 
-    positives = [ssh_failure_line(f"06:0{i}:1{i}", user, test_ip, 2200 + i) for i in range(10)]
-    negatives = [ssh_success_line("06:05:00", user, test_ip, 22)]
+    # the rule's <match> marker MUST appear in the samples or it can never fire
+    positives = [ssh_failure_line(f"06:00:{10 + i:02d}", f"{marker}u{i}", test_ip, 2200 + i)
+                 for i in range(8)]
+    negatives = [ssh_success_line("06:05:00", f"{marker}ux", test_ip, 22)]
 
     # 4) propose through the real gate (baseline logtest runs inside the tool)
     try:
@@ -282,20 +288,25 @@ def _scenario_detection_ssh(env: LiveEnv, log: EvidenceLog, opts: dict) -> None:
                      refs={"restart_required": True})
             if not restarted:
                 return
+            # analysisd's logtest engine lags the API's daemon status after a
+            # restart - wait for it before any logtest-backed verification
+            lt_ready = env.wait_for_logtest(timeout_s=180)
+            log.step(s, "logtest ready after restart", "wazuh.logtest", "wazuh_confirmed",
+                     lt_ready, detail="analysisd logtest accepts events" if lt_ready
+                            else "logtest never became ready within 180s",
+                     refs={"logtest_ready": lt_ready})
+            if not lt_ready:
+                return
         except Exception as e:  # noqa: BLE001
             log.step(s, "manager restart", "restart_wazuh_manager", "error", False,
                      detail=str(e)[:200])
             return
-        # 7) rule loaded after restart
-        try:
-            again = env.wazuh.get_rule(rid)
-            loaded = bool((again.get("data") or {}).get("affected_items"))
-            log.step(s, "rule loaded after restart", "manager_api.get_rule", "wazuh_confirmed",
-                     loaded, detail=f"rule {rid} retrievable post-restart = {loaded}",
-                     refs={"rule_loaded_after_restart": loaded})
-        except Exception as e:  # noqa: BLE001
-            log.step(s, "rule loaded after restart", "manager_api.get_rule", "error", False,
-                     detail=str(e)[:200])
+        # 7) rule loaded after restart (retried over transient not-ready errors)
+        loaded, last_err = env.wait_for_rule(rid, timeout_s=300)
+        log.step(s, "rule loaded after restart", "manager_api.get_rule", "wazuh_confirmed",
+                 loaded, detail=("rule {} retrievable post-restart".format(rid) if loaded
+                                 else f"rule {rid} not served within 180s ({last_err})"),
+                 refs={"rule_loaded_after_restart": loaded})
         # 8) verify deployment: logtest positives fire, negatives stay silent
         try:
             ctx = env.tool_ctx()
@@ -305,8 +316,7 @@ def _scenario_detection_ssh(env: LiveEnv, log: EvidenceLog, opts: dict) -> None:
                              "negative_samples": negatives, "log_format": "syslog"},
                             silent=True)
             vres_dict = vres if isinstance(vres, dict) else {"result": vres}
-            ok_v = bool(vres_dict.get("passed")) or bool(
-                (vres_dict.get("result") or {}).get("passed"))
+            ok_v = bool(vres_dict.get("verified"))
             detail = str(vres_dict)[:400]
             log.step(s, "verify rule deployment", "verify_rule_deployment", "wazuh_confirmed",
                      ok_v, detail=detail, refs={"rule_id": rid})
@@ -441,3 +451,144 @@ def _scenario_security_query_safety(env: LiveEnv, log: EvidenceLog, opts: dict) 
 
 register("security_query_safety", "query safety: special chars, injection markers, bounded results",
          _scenario_security_query_safety)
+
+
+# --------------------------------------------------------------------------- #
+# 5. Controlled streamed event through the manager pipeline (UDP 514 syslog)
+# --------------------------------------------------------------------------- #
+def _feed_syslog_udp(lines: list[str], *, host: str = "127.0.0.1",
+                     port: int = 514) -> int:
+    """Send RFC3164-style syslog datagrams to the manager's UDP 514 input.
+    Returns the number of datagrams sent."""
+    import socket
+    sent = 0
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        for ln in lines:
+            s.sendto(ln.encode("utf-8", "replace"), (host, port))
+            sent += 1
+    finally:
+        s.close()
+    return sent
+
+
+def _scenario_streamed_ssh_alert(env: LiveEnv, log: EvidenceLog, opts: dict) -> None:
+    s = "streamed_ssh_alert"
+    feed = opts.get("feed", _feed_syslog_udp)
+    test_ip = opts.get("test_ip", "203.0.113.60")
+    marker = f"phase14strm{time.strftime('%H%M%S')}"
+    stamp = time.strftime("%b %d ")
+    lines = [
+        f"<133>{stamp}{time.strftime('06:%M:%S')} testhost sshd[{1000 + i}]: "
+        f"Failed password for {marker}{i} from {test_ip} port 22 ssh2"
+        for i in range(12)
+    ]
+
+    # 0) baseline: no alerts for this marker yet
+    try:
+        pre = env.indexer.count("wazuh-alerts-*", {"match": {"full_log": marker}})
+        log.step(s, "baseline: marker absent", "indexer.count", "wazuh_confirmed",
+                 pre == 0, detail=f"alerts with marker {marker}: {pre}",
+                 refs={"pre_count": pre})
+    except Exception as e:  # noqa: BLE001
+        log.step(s, "baseline: marker absent", "indexer.count", "error", False,
+                 detail=str(e)[:160])
+
+    # 1) feed the synthetic events
+    try:
+        sent = feed(lines, port=int(opts.get("udp_port", 514)),
+                    host=opts.get("udp_host", "127.0.0.1"))
+        ok = sent == len(lines)
+        log.step(s, "feed syslog events", "udp.514", "mock" if ok else "error", ok,
+                 detail=f"sent {sent}/{len(lines)} datagrams to UDP 514 "
+                        f"(srcip {test_ip}, marker {marker})",
+                 refs={"sent": sent, "ip": test_ip})
+    except Exception as e:  # noqa: BLE001
+        log.step(s, "feed syslog events", "udp.514", "error", False, detail=str(e)[:160])
+        return
+    if not ok:
+        return
+
+    # 2) wait for the alert to land in the indexer (analysisd -> indexer pipeline)
+    found: dict[str, Any] | None = None
+    deadline = time.time() + 180
+    while time.time() < deadline and found is None:
+        try:
+            hits = env.indexer.hits("wazuh-alerts-*", {
+                "size": 5,
+                "sort": [{"timestamp": {"order": "desc"}}],
+                "query": {"bool": {"must": [
+                    {"match": {"full_log": marker}},
+                    {"term": {"data.srcip": test_ip}},
+                ]}},
+            })
+            for h in hits:
+                if marker in str(h.get("full_log") or "") and (h.get("data") or {}).get("srcip") == test_ip:
+                    found = h
+                    break
+        except Exception:  # noqa: BLE001 - indexer may be mid-write
+            pass
+        if found is None:
+            time.sleep(5)
+    if found is None:
+        log.step(s, "alert observed in indexer", "indexer.hits", "error", False,
+                 detail=f"no alert for {test_ip}/{marker} within 180s - "
+                        "no alert observed DOES NOT mean no detection capability")
+        return
+    alert_id = found.get("id") or (found.get("_id") or "")
+    rule = found.get("rule") or {}
+    log.step(s, "alert observed in indexer", "indexer.hits", "wazuh_confirmed", True,
+             detail=f"alert id {alert_id} rule {rule.get('id')} "
+                    f"({rule.get('description')}) level {rule.get('level')}",
+             refs={"alert_id": alert_id, "rule_id": rule.get("id"),
+                   "rule_level": rule.get("level")})
+
+    # 3) explain the alert from the REAL document fields
+    try:
+        ctx = env.tool_ctx()
+        from tools.registry import execute as run_tool
+        expl = run_tool(ctx, "why_did_alert_trigger", {"alert_id": alert_id}, silent=True)
+        ex = expl if isinstance(expl, dict) else {}
+        fl = str(ex.get("full_log") or "")
+        ok_ex = bool(ex.get("rule_id")) and marker in fl
+        log.step(s, "why did alert trigger", "why_did_alert_trigger", "wazuh_confirmed",
+                 ok_ex,
+                 detail=(f"rule {ex.get('rule_id')} level {ex.get('rule_level')}: "
+                         f"{ex.get('rule_description')} | groups {ex.get('rule_groups')} "
+                         f"| full_log marker present={marker in fl} "
+                         f"| mitre {list((ex.get('mitre') or {}).get('id', []) or [])}")
+                        if ok_ex else f"explanation incomplete: {str(expl)[:300]}",
+                 refs={"rule_id": ex.get("rule_id"), "groups": (ex.get("rule_groups") or [])})
+    except Exception as e:  # noqa: BLE001
+        log.step(s, "why did alert trigger", "why_did_alert_trigger", "error", False,
+                 detail=str(e)[:200])
+
+    # 4) the alert is gone only after cleanup - verify the real index path too
+    try:
+        total = env.indexer.count("wazuh-alerts-*", {"match": {"full_log": marker}})
+        log.step(s, "alert counts by marker", "indexer.count", "wazuh_confirmed",
+                 total >= 1, detail=f"{total} alerts carry the marker {marker}",
+                 refs={"marker_hits": total})
+    except Exception as e:  # noqa: BLE001
+        log.step(s, "alert counts by marker", "indexer.count", "error", False,
+                 detail=str(e)[:160])
+
+    # 5) cleanup: delete_by_query on the unique marker (dev-environment op)
+    try:
+        res = env.delete_by_query("wazuh-alerts-*", {"match": {"full_log": marker}})
+        deleted = (res.get("deleted") if isinstance(res, dict) else None) or 0
+        post = env.indexer.count("wazuh-alerts-*", {"match": {"full_log": marker}})
+        ok_del = post == 0
+        log.step(s, "cleanup: delete_by_query marker", "indexer.delete_by_query",
+                 "wazuh_confirmed", ok_del,
+                 detail=f"deleted {deleted}; remaining with marker: {post}",
+                 refs={"deleted": deleted, "remaining": post})
+    except Exception as e:  # noqa: BLE001
+        log.step(s, "cleanup: delete_by_query marker", "indexer.delete_by_query",
+                 "error", False, detail=str(e)[:200])
+
+
+register("streamed_ssh_alert",
+         "fresh controlled SSH-failure events streamed through UDP 514 -> alert -> "
+         "why_did_alert_trigger -> delete_by_query cleanup",
+         _scenario_streamed_ssh_alert)

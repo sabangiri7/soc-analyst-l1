@@ -123,7 +123,7 @@ class LiveEnv:
         if self._kb is None:
             from rag.knowledge_base import KnowledgeBase
             self._kb = KnowledgeBase()
-        return list(self._kb.search(query, top_k=top_k, collection=collection))
+        return list(self._kb.query(collection, query, n_results=top_k))
 
     def approvals_count(self, status: str | None = None) -> int:
         import approvals
@@ -141,6 +141,24 @@ class LiveEnv:
             return []
         rows = [json.loads(line) for line in p.open() if line.strip()]
         return rows if limit is None else rows[-limit:]
+
+    # ------------------------------------------------------------------ #
+    def delete_by_query(self, index: str = "wazuh-alerts-*",
+                        query: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Dev-environment cleanup op: POST /{index}/_delete_by_query.
+
+        Deliberately NOT an application tool - the IndexerClient is read-only
+        and destructive indexer writes belong only to the validation harness
+        (unique-marker cleanup of synthetic data)."""
+        conn = self.indexer.connector
+        url = f"{conn.host.rstrip('/')}/{index}/_delete_by_query?refresh=true"
+        r = requests.post(url, auth=conn.auth, verify=conn.verify,
+                          json={"query": query or {"match_all": {}}},
+                          timeout=getattr(cfg, "TOOL_QUERY_TIMEOUT", 15))
+        if r.status_code >= 400:
+            raise RuntimeError(f"delete_by_query {index} -> {r.status_code}: "
+                               f"{r.text[:200]}")
+        return r.json()
 
     # ------------------------------------------------------------------ #
     # preflight - the CLI refuses to run scenarios before this passes
@@ -199,3 +217,39 @@ class LiveEnv:
                 pass
             time.sleep(poll_s)
         return False
+
+    def wait_for_logtest(self, timeout_s: float = 300.0, poll_s: float = 5.0,
+                         probe_log: str | None = None) -> bool:
+        """Block until wazuh-analysisd's logtest engine accepts events. After a
+        manager restart the API reports daemons 'running' before logtest can
+        evaluate - probe until the 'daemons not ready' error goes away."""
+        probe_log = probe_log or ("Oct 24 06:00:00 testhost sshd[1000]: Accepted password "
+                                  "for phase14-probe from 203.0.113.200 port 22 ssh2")
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            try:
+                row = self.wazuh.run_logtest(probe_log, "syslog") or {}
+                blob = str(row).lower()
+                if ("not running or not yet available" not in blob
+                        and "not ready yet" not in blob):
+                    return True
+            except Exception:  # noqa: BLE001 - still warming up
+                pass
+            time.sleep(poll_s)
+        return False
+
+    def wait_for_rule(self, rule_id: int, timeout_s: float = 300.0,
+                      poll_s: float = 10.0) -> tuple[bool, str]:
+        """Retry until the manager serves the rule (transient 'daemons not
+        ready' errors must not fail verification). Returns (found, last_error)."""
+        deadline = time.time() + timeout_s
+        last_err = ""
+        while time.time() < deadline:
+            try:
+                again = self.wazuh.get_rule(rule_id) or {}
+                if bool((again.get("data") or {}).get("affected_items")):
+                    return True, ""
+            except Exception as e:  # noqa: BLE001 - transient during restart
+                last_err = str(e)[:200]
+            time.sleep(poll_s)
+        return False, last_err

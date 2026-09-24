@@ -17,6 +17,7 @@ from config import cfg
 SCENARIO_ORDER = [
     "env_baseline",
     "detection_ssh_rule",
+    "streamed_ssh_alert",
     "security_tool_args",
     "security_query_safety",
 ]

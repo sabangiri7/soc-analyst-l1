@@ -51,13 +51,20 @@ class FakeIndexer:
     def search(self, index, body):
         return {"hits": {"total": {"value": 716}}}
 
+    def count(self, index, query=None):
+        return 0
+
+    def hits(self, index, body):
+        return []
+
 
 class FakeKB:
     def counts(self):
         return {"playbooks": 0, "cases": 0, "lessons": 0, "wazuh_docs": 5}
 
-    def search(self, query, top_k=3, collection="wazuh_docs"):
-        return [{"id": "d1", "title": "frequency rules", "score": 0.9}]
+    def query(self, collection, text, n_results=4, where=None):
+        return [{"id": "d1", "text": "frequency rules", "metadata": {},
+                 "distance": 0.9}]
 
 
 def make_env(**kw) -> LiveEnv:
@@ -246,9 +253,13 @@ class DetectionScenarioTests(unittest.TestCase):
              mock.patch.object(env, "approve", side_effect=lambda p, by=None: p), \
              mock.patch.object(env, "execute_approved", side_effect=lambda p: next(results)), \
              mock.patch.object(env, "wait_for_manager", return_value=True), \
+             mock.patch.object(env, "wait_for_logtest", return_value=True), \
+             mock.patch.object(env, "wait_for_rule", return_value=(True, "")), \
              mock.patch.object(env.wazuh, "get_rule", side_effect=get_rule), \
              mock.patch("tools.registry.execute", return_value={
-                 "status": "ok", "result": {"passed": True}}) as reg:
+                 "rule_id": 100905, "frequency_rule": True,
+                 "positive_pass": "10/10", "negative_pass": "1/1",
+                 "verified": True}) as reg:
             log = scen.run_scenario(env, "detection_ssh_rule", {})
         st = log.scenario_status("detection_ssh_rule")
         self.assertEqual(st["status"], "PASS", st["failures"])
@@ -259,6 +270,50 @@ class DetectionScenarioTests(unittest.TestCase):
         self.assertTrue(rows["verify rule deployment"].passed)
         # verify_rule_deployment went through the real registry gate
         self.assertEqual(reg.call_args[0][1], "verify_rule_deployment")
+
+
+class StreamedAlertScenarioTests(unittest.TestCase):
+    def test_streamed_alert_full_chain(self):
+        env = make_env()
+        fed: dict[str, str] = {}
+
+        def fake_feed(lines, **kw):
+            fed["first"] = lines[0] if lines else ""
+            return len(lines)
+
+        # baseline(0) -> after-alert(3) -> after-cleanup(0)
+        counts = iter([0, 3, 0])
+
+        def fake_count(index, query):
+            try:
+                return next(counts)
+            except StopIteration:
+                return 0
+
+        def fake_hits(index, body):
+            fl = fed.get("first", "no marker yet")
+            return [{"id": "9001.1", "rule": {"id": "5715", "level": 10,
+                                              "description": "SSHD brute force"},
+                     "full_log": fl, "data": {"srcip": "203.0.113.60"},
+                     "_id": "abc123"}]
+
+        with mock.patch.object(env.indexer, "count", side_effect=fake_count), \
+             mock.patch.object(env.indexer, "hits", side_effect=fake_hits), \
+             mock.patch("tools.registry.execute", side_effect=lambda ctx, tool, params, **kw: {
+                 "rule_id": "5715", "rule_level": 10,
+                 "rule_description": "SSHD brute force",
+                 "rule_groups": ["syslog", "sshd"],
+                 "full_log": fed.get("first", ""), "mitre": {}}) as reg, \
+             mock.patch.object(env, "delete_by_query", return_value={"deleted": 3}):
+            log = scen.run_scenario(env, "streamed_ssh_alert", {"feed": fake_feed})
+        st = log.scenario_status("streamed_ssh_alert")
+        self.assertEqual(st["status"], "PASS", st["failures"])
+        rows = {i.step: i for i in log.scenario_items("streamed_ssh_alert")}
+        self.assertEqual(rows["feed syslog events"].refs["sent"], 12)
+        self.assertEqual(rows["alert observed in indexer"].refs["alert_id"], "9001.1")
+        self.assertTrue(rows["why did alert trigger"].passed)
+        self.assertTrue(rows["cleanup: delete_by_query marker"].passed)
+        self.assertEqual(reg.call_args[0][1], "why_did_alert_trigger")
 
 
 class SecurityScenarioTests(unittest.TestCase):
