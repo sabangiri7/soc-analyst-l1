@@ -15,6 +15,8 @@ import re
 import xml.etree.ElementTree as ET
 from typing import Any
 
+from tools.base import ToolError
+
 LOCAL_RULES_FILE = "local_rules.xml"
 LOCAL_DECODER_FILE = "local_decoder.xml"
 
@@ -243,6 +245,18 @@ def replace_decoder(file_text: str, name: str, decoder_xml: str) -> tuple[str, b
             return _serialize_file(root), True, issues
     issues.append(f"decoder '{name}' not found in local_decoder.xml")
     return file_text, False, issues
+
+
+def fetch_local_file(ctx: Any, filename: str) -> str:
+    """Fetch a local rules/decoder file from the manager, returning '' for a
+    missing file (fresh local rules file). Shared by rules/decoders tools and
+    the detection engine."""
+    try:
+        return ctx.wazuh.get_rules_file(filename, raw=True)
+    except Exception as e:  # noqa: BLE001 - missing file = empty file
+        if "not found" in str(e).lower():
+            return ""
+        raise ToolError(f"Failed to read {filename}: {e}") from e
 
 
 __all__ = [

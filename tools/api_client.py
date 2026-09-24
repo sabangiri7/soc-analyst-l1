@@ -221,16 +221,27 @@ class WazuhManagerAPI:
     def get_rules(self, limit: int = 50, offset: int = 0, search: str | None = None,
                   group: str | None = None, level: int | None = None,
                   filename: str | None = None, status: str | None = None,
-                  sort: str | None = None) -> dict[str, Any]:
+                  sort: str | None = None, q: str | None = None) -> dict[str, Any]:
         params: dict[str, Any] = {"limit": limit, "offset": offset}
         for key, val in (("search", search), ("group", group), ("level", level),
-                         ("filename", filename), ("status", status), ("sort", sort)):
+                         ("filename", filename), ("status", status), ("sort", sort),
+                         ("q", q)):
             if val is not None:
                 params[key] = val
         return self.get("/rules", params=params)
 
     def get_rule(self, rule_id: int | str) -> dict[str, Any]:
-        return self.get(f"/rules/{rule_id}")
+        """GET /rules/{id}. This API build (4.14) does not expose the per-rule
+        detail endpoint for built-in rules (404), so fall back to the list
+        endpoint filtered by exact id - same data, different route."""
+        try:
+            resp = self.get(f"/rules/{rule_id}")
+            if resp.get("data", {}).get("total_affected_items", 0):
+                return resp
+            raise WazuhAPIError("no rule returned")
+        except Exception:  # noqa: BLE001 - fall back below for any failure
+            pass
+        return self.get("/rules", params={"q": f"id={int(rule_id)}", "limit": 1, "offset": 0})
 
     def create_rule(self, rule_xml: str, overwrite: bool = False) -> dict[str, Any]:
         """POST /rules - NOT available on this API build (4.14 removed per-rule
