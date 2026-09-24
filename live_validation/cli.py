@@ -60,6 +60,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--syslog-listener-remove", action="store_true",
                    help="dev-stack cleanup: remove the UDP 514 syslog <remote> block "
                         "from ossec.conf and restart the manager")
+    p.add_argument("--cleanup-rule-ids", default="",
+                   help="extra rule ids to remove during --cleanup (comma-separated) - "
+                        "for test rules deployed by earlier validation runs whose ids "
+                        "this run did not create")
+    p.add_argument("--reset-stores", action="store_true",
+                   help="admin/dev-environment op: restore the approval + audit stores "
+                        "to the PHASE 14 baseline snapshot, keeping phase evidence "
+                        "copies next to them (.phase14.*)")
+    p.add_argument("--snapshot-approvals", default="/tmp/opencode/phase14_backup/approvals_pre_phase14.json",
+                   help="approvals snapshot to restore (default: pre-PHASE-14 baseline)")
+    p.add_argument("--snapshot-audit", default="/tmp/opencode/phase14_backup/audit_log_pre_phase14.jsonl",
+                   help="audit log snapshot to restore (default: pre-PHASE-14 baseline)")
     return p
 
 
@@ -175,11 +187,27 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cleanup:
         print("\n[cleanup] removing PHASE 14 test artifacts ...")
-        from live_validation.cleanup import reject_leftover_proposals, cleanup_rules, cleanup_dashboards
+        from live_validation.cleanup import (reject_leftover_proposals, cleanup_rules,
+                                             cleanup_dashboards, cleanup_syslog_listener)
         n = reject_leftover_proposals(env)
         print(f"  rejected {n} leftover pending proposals")
         cleanup_dashboards(env, log)
+        for rid_s in (args.cleanup_rule_ids or "").split(","):
+            rid_s = rid_s.strip()
+            if rid_s.isdigit() and int(rid_s) not in env.created_rules:
+                env.created_rules.append(int(rid_s))
         cleanup_rules(env, log)
+        cleanup_syslog_listener(env, log)
+        if args.reset_stores:
+            from live_validation.cleanup import reset_stores
+            out = reset_stores(
+                env,
+                args.approvals_path or cfg.APPROVALS_PATH,
+                args.audit_path or cfg.AUDIT_LOG_PATH,
+                args.snapshot_approvals, args.snapshot_audit,
+            )
+            for k, v in out.items():
+                print(f"  {k}: {v}")
         print("  cleanup done (see evidence for per-artifact results)")
 
     if args.out:

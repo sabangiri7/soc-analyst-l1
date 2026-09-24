@@ -173,10 +173,30 @@ class LiveEnv:
         proc.check_returncode()
         return proc.stdout
 
-    _SYSLOG_REMOTE_BLOCK = (
-        "\n  <remote>\n    <connection>syslog</connection>\n"
-        "    <port>514</port>\n    <protocol>udp</protocol>\n  </remote>\n"
-    )
+    def _syslog_remote_block(self, container: str | None = None) -> str:
+        """Build the syslog <remote> block for this stack. Wazuh 4.x disables
+        the syslog server unless <allowed-ips> is present (remoted logs 1501).
+        Datagrams forwarded by docker-proxy appear with the bridge gateway as
+        source IP, so allow the container gateway(s) + loopback."""
+        gw = "127.0.0.1"
+        try:
+            cname = container or getattr(cfg, "WAZUH_MANAGER_CONTAINER",
+                                         "single-node_wazuh.manager_1")
+            proc = subprocess.run(
+                ["docker", "inspect", cname, "-f",
+                 "{{range .NetworkSettings.Networks}}{{.Gateway}} {{end}}"],
+                capture_output=True, text=True, timeout=60)
+            gws = [g for g in (proc.stdout or "").strip().split() if g and g != "127.0.0.1"]
+            if gws:
+                gw = ",".join(gws)
+        except Exception:  # noqa: BLE001 - fall back to loopback
+            pass
+        # Wazuh's <allowed-ips> accepts ONE ip/network per element (error 1237
+        # on comma lists), so emit one element per allowed host.
+        allowed = "".join(f"    <allowed-ips>{ip}</allowed-ips>\n"
+                          for ip in ["127.0.0.1", *gw.split(",")])
+        return (f"\n  <remote>\n    <connection>syslog</connection>\n    <port>514</port>\n"
+                f"    <protocol>udp</protocol>\n{allowed}  </remote>\n")
 
     def has_syslog_514(self, container: str | None = None) -> bool:
         try:
@@ -192,15 +212,16 @@ class LiveEnv:
         approved EXECUTE path. Reverted by remove_syslog_514()."""
         if self.has_syslog_514(container):
             return False, "syslog 514 listener already configured"
-        block = self._SYSLOG_REMOTE_BLOCK
-        base = "python3 -c"
+        block = self._syslog_remote_block(container)
         script = (
-            "import pathlib; p = pathlib.Path('/var/ossec/etc/ossec.conf'); t = p.read_text();"
+            "import pathlib, sys;"
+            "p = pathlib.Path('/var/ossec/etc/ossec.conf'); t = p.read_text();"
             "marker = '</ossec_config>';"
-            "assert t.count(marker) == 1 and 'syslog' not in t, 'unexpected ossec.conf shape';"
-            f"p.write_text(t.replace(marker, '{block}' + marker))"
+            "assert '<connection>syslog</connection>' not in t, 'syslog remote already present';"
+            "idx = t.index(marker);"
+            "p.write_text(t[:idx] + sys.argv[1] + t[idx:])"
         )
-        self.docker_exec([base, script], container=container)
+        self.docker_exec(["python3", "-c", script, block], container=container)
         if not self.has_syslog_514(container):
             raise RuntimeError("ossec.conf edit did not take effect")
         return True, "added UDP 514 syslog <remote> block to ossec.conf"
@@ -213,7 +234,8 @@ class LiveEnv:
             "import pathlib, re; p = pathlib.Path('/var/ossec/etc/ossec.conf');"
             "t = p.read_text();"
             "t2 = re.sub(r'\\s*<remote>\\s*<connection>syslog</connection>\\s*"
-            "<port>514</port>\\s*<protocol>udp</protocol>\\s*</remote>', '', t);"
+            "<port>514</port>\\s*<protocol>udp</protocol>\\s*"
+            "(?:(?:<allowed-ips>[^<]+</allowed-ips>\\s*)+)?</remote>', '', t);"
             "assert t2 != t, 'syslog block regex failed'; p.write_text(t2)"
         )
         self.docker_exec(["python3", "-c", script], container=container)

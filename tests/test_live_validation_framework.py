@@ -457,6 +457,31 @@ class PromptInjectionTests(unittest.TestCase):
         self.assertEqual(st["status"], "PASS", st["failures"])
 
 
+class SyslogListenerHelperTests(unittest.TestCase):
+    def test_block_fallbacks_and_detection(self):
+        env = make_env()
+        # hermetic: simulate docker being unavailable -> no false positives
+        with mock.patch.object(env, "docker_exec", side_effect=RuntimeError("no docker")):
+            self.assertFalse(env.has_syslog_514())
+        # block builder (docker inspect fails -> loopback-only allowed-ips,
+        # one element per IP - Wazuh rejects comma lists with error 1237)
+        block = env._syslog_remote_block()
+        self.assertIn("<allowed-ips>127.0.0.1</allowed-ips>", block)
+        self.assertNotIn("127.0.0.1,", block)
+        self.assertIn("<connection>syslog</connection>", block)
+        self.assertIn("<port>514</port>", block)
+        self.assertIn("<protocol>udp</protocol>", block)
+        # the removal regex must strip a block with multiple allowed-ips
+        import re
+        config = "<ossec_config>\n  <remote>\n    <connection>secure</connection>\n  </remote>\n" + block + "</ossec_config>"
+        pat = (r"\s*<remote>\s*<connection>syslog</connection>\s*"
+               r"<port>514</port>\s*<protocol>udp</protocol>\s*"
+               r"(?:(?:<allowed-ips>[^<]+</allowed-ips>\s*)+)?</remote>")
+        stripped = re.sub(pat, "", config)
+        self.assertNotIn("<connection>syslog</connection>", stripped)
+        self.assertIn("<connection>secure</connection>", stripped)
+
+
 class DashboardWorkflowTests(unittest.TestCase):
     def test_full_dashboard_chain(self):
         env = make_env()

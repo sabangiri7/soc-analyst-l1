@@ -115,6 +115,35 @@ def cleanup_rules(env: LiveEnv, log: EvidenceLog) -> None:
                      "error", False, detail=str(e)[:160])
 
 
+def cleanup_syslog_listener(env: LiveEnv, log: EvidenceLog) -> None:
+    """Restore ossec.conf to its pre-phase shape: remove the UDP 514 syslog
+    <remote> block and restart the manager (docker exec - dev-stack admin op,
+    not an application tool). Idempotent."""
+    s = "cleanup"
+    try:
+        changed, detail = env.remove_syslog_514()
+    except Exception as e:  # noqa: BLE001 - docker may be unavailable
+        log.step(s, "syslog listener removal", "docker.exec", "error", False,
+                 detail=f"docker unavailable or failed: {str(e)[:160]}")
+        return
+    if not changed:
+        log.step(s, "syslog listener removal", "docker.exec", "info", True,
+                 detail="no UDP 514 listener to remove (environment never modified)")
+        return
+    log.step(s, "syslog listener removal", "docker.exec", "wazuh_confirmed", True,
+             detail="removed UDP 514 syslog <remote> block from ossec.conf")
+    try:
+        env.docker_exec(["/var/ossec/bin/wazuh-control", "restart"])
+        ok = env.wait_for_manager(timeout_s=300) and env.wait_for_logtest(timeout_s=300)
+        log.step(s, "manager restart after listener removal", "docker.exec+wazuh-control",
+                 "wazuh_confirmed", ok,
+                 detail="manager restarted and logtest responsive" if ok
+                        else "manager NOT ready after restart")
+    except Exception as e:  # noqa: BLE001
+        log.step(s, "manager restart after listener removal", "docker.exec", "error", False,
+                 detail=str(e)[:160])
+
+
 def reset_stores(env: LiveEnv, approvals_json: str, audit_jsonl: str,
                  approvals_snapshot: str, audit_snapshot: str) -> dict[str, Any]:
     """Restore the approval/audit stores to the PHASE 14 baseline snapshot.

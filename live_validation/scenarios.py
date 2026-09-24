@@ -485,9 +485,13 @@ def _scenario_streamed_ssh_alert(env: LiveEnv, log: EvidenceLog, opts: dict) -> 
     test_ip = opts.get("test_ip", "203.0.113.60")
     marker = f"phase14strm{time.strftime('%H%M%S')}"
     stamp = time.strftime("%b %d ")
+    # marker is the full ssh username - a STANDALONE token in the log line so
+    # the indexer's analyzed `match` on full_log and delete_by_query hit it
+    # (token-with-suffix never matches token-without-suffix - same trap as the
+    # Wazuh <match> field). 12 events, same marker/srcip, varying sshd pid/port.
     lines = [
         f"<133>{stamp}{time.strftime('06:%M:%S')} testhost sshd[{1000 + i}]: "
-        f"Failed password for {marker}{i} from {test_ip} port 22 ssh2"
+        f"Failed password for {marker} from {test_ip} port {22 + (i % 4)} ssh2"
         for i in range(12)
     ]
 
