@@ -782,8 +782,9 @@ def _scenario_security_approval_bypass(env: LiveEnv, log: EvidenceLog, opts: dic
         log.step(s, "no rule deployed", "manager_api.get_rules_file", "error", False,
                  detail=str(e)[:160])
 
-    # 2) restart without approval -> blocked
-    out = attempt("restart_wazuh_manager", {})
+    # 2) restart without approval -> blocked (schema needs reason; gate fires
+    #    after schema validation)
+    out = attempt("restart_wazuh_manager", {"reason": "bypass attempt (must be blocked)"})
     blocked = out.get("status") == "approval_required"
     log.step(s, "restart without approval", "restart_wazuh_manager", "wazuh_confirmed", blocked,
              detail=f"status={out.get('status')} - EXECUTE blocked without approval"
@@ -808,9 +809,20 @@ def _scenario_security_approval_bypass(env: LiveEnv, log: EvidenceLog, opts: dic
         log.step(s, "nothing deleted", "manager_api.get_rule", "error", False,
                  detail=str(e)[:160])
 
-    # 5) EXECUTE with approval but WITHOUT explicit confirm -> refused
+    # 5) EXECUTE with approval but WITHOUT explicit confirm -> refused.
+    # delete_wazuh_rule rejects nonexistent ids BEFORE proposing, so probe on a
+    # rule that actually exists: the harness's own just-deployed rule
+    # (env.created_rules), or an explicit opt. If none is available the step
+    # is skipped honestly - it cannot be exercised.
+    probe_rid = int(opts.get("bypass_rule_id") or 0) or (env.created_rules[-1]
+                                                         if env.created_rules else None)
+    if not probe_rid:
+        log.step(s, "execute without confirm", "delete_wazuh_rule", "info", True,
+                 detail="skipped: no rule available to probe (run detection "
+                        "first or pass bypass_rule_id=<rid>)")
+        return
     try:
-        out = env.propose("delete_wazuh_rule", {"rule_id": 999999999,
+        out = env.propose("delete_wazuh_rule", {"rule_id": probe_rid,
                                                 "reason": "confirm-gate probe (must refuse)"})
         if out.get("status") == "approval_required":
             prop = out["proposal"]
@@ -834,6 +846,18 @@ def _scenario_security_approval_bypass(env: LiveEnv, log: EvidenceLog, opts: dic
     except Exception as e:  # noqa: BLE001
         log.step(s, "execute without confirm", "delete_wazuh_rule", "error", False,
                  detail=str(e)[:200])
+
+    # 6) the probed rule must still exist (the refused execute deleted nothing)
+    if probe_rid:
+        try:
+            r = env.wazuh.get_rule(probe_rid)
+            still = bool((r.get("data") or {}).get("affected_items"))
+            log.step(s, "refused execute left rule intact", "manager_api.get_rule",
+                     "wazuh_confirmed", still,
+                     detail=f"rule {probe_rid} still present after refused execute = {still}")
+        except Exception as e:  # noqa: BLE001
+            log.step(s, "refused execute left rule intact", "manager_api.get_rule", "error",
+                     False, detail=str(e)[:160])
 
 
 # --------------------------------------------------------------------------- #
@@ -939,7 +963,8 @@ def _scenario_dashboard_workflow(env: LiveEnv, log: EvidenceLog, opts: dict) -> 
     # 2) verify a focused OpenSearch query against the real indexer (READ)
     try:
         q = {"bool": {"filter": [{"term": {"rule.groups": focus}}]}}
-        check = run_tool(ctx, "verify_opensearch_query", {"query": q}, silent=True)
+        check = run_tool(ctx, "verify_opensearch_query",
+                         {"query_body": {"query": q, "size": 0}}, silent=True)
         check = check if isinstance(check, dict) else {}
         log.step(s, "panel query verified", "verify_opensearch_query", "wazuh_confirmed",
                  bool(check.get("valid")),

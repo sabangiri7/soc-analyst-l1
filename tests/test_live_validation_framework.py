@@ -431,20 +431,22 @@ class ApprovalBypassTests(unittest.TestCase):
              mock.patch.object(env, "propose", return_value={
                  "status": "approval_required", "proposal": {
                      "id": "appr-delete", "action": "delete_wazuh_rule",
-                     "permission": "execute", "payload": {"rule_id": 999999999}}}), \
+                     "permission": "execute", "payload": {"rule_id": 424242}}}), \
              mock.patch.object(env, "approve", side_effect=lambda p, by=None: {**p, "status": "approved"}), \
              mock.patch.object(env, "execute_approved", return_value={
                  "ok": False, "error": "EXECUTE-level action: requires an explicit "
                                        "confirmation on top of the approval"}), \
              mock.patch.object(env.wazuh, "get_rule", side_effect=lambda rid: {
-                 "data": {"affected_items": [{"id": rid}]} if rid in (5760, 100001) else []}):
-            log = scen.run_scenario(env, "security_approval_bypass", {})
+                 "data": {"affected_items": [{"id": rid}]} if rid in (5760, 100001, 424242) else []}):
+            log = scen.run_scenario(env, "security_approval_bypass",
+                                    {"bypass_rule_id": "424242"})
         st = log.scenario_status("security_approval_bypass")
         self.assertEqual(st["status"], "PASS", st["failures"])
         rows = {i.step: i for i in log.scenario_items("security_approval_bypass")}
         for step in ("create rule without approval", "restart without approval",
                      "delete rule without approval", "nothing deleted",
-                     "no rule deployed", "execute without confirm"):
+                     "no rule deployed", "execute without confirm",
+                     "refused execute left rule intact"):
             self.assertTrue(rows[step].passed, step)
             self.assertEqual(rows[step].result_kind, "wazuh_confirmed", step)
 
