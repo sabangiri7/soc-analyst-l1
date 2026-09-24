@@ -44,8 +44,9 @@ Full reference in [`docs/`](docs/): [`permissions.md`](docs/permissions.md)
 [`rule_engineering.md`](docs/rule_engineering.md),
 [`dashboard_engineering.md`](docs/dashboard_engineering.md),
 [`detection_gaps.md`](docs/detection_gaps.md),
-[`prompt_injection_defense.md`](docs/prompt_injection_defense.md), and
-[`rag_knowledge_base.md`](docs/rag_knowledge_base.md).
+[`prompt_injection_defense.md`](docs/prompt_injection_defense.md),
+[`rag_knowledge_base.md`](docs/rag_knowledge_base.md), and the live
+validation report [`phase14-validation.md`](docs/phase14-validation.md).
 
 ---
 

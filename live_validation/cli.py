@@ -64,6 +64,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="extra rule ids to remove during --cleanup (comma-separated) - "
                         "for test rules deployed by earlier validation runs whose ids "
                         "this run did not create")
+    p.add_argument("--cleanup-dashboard-ids", default="",
+                   help="extra dashboard ids to remove during --cleanup "
+                        "(comma-separated) - for dashboards created by earlier "
+                        "validation runs this process did not create")
     p.add_argument("--reset-stores", action="store_true",
                    help="admin/dev-environment op: restore the approval + audit stores "
                         "to the PHASE 14 baseline snapshot, keeping phase evidence "
@@ -191,11 +195,15 @@ def main(argv: list[str] | None = None) -> int:
                                              cleanup_dashboards, cleanup_syslog_listener)
         n = reject_leftover_proposals(env)
         print(f"  rejected {n} leftover pending proposals")
-        cleanup_dashboards(env, log)
         for rid_s in (args.cleanup_rule_ids or "").split(","):
             rid_s = rid_s.strip()
             if rid_s.isdigit() and int(rid_s) not in env.created_rules:
                 env.created_rules.append(int(rid_s))
+        for did_s in (args.cleanup_dashboard_ids or "").split(","):
+            did_s = did_s.strip()
+            if did_s and did_s not in env.created_dashboards:
+                env.created_dashboards.append(did_s)
+        cleanup_dashboards(env, log)
         cleanup_rules(env, log)
         cleanup_syslog_listener(env, log)
         if args.reset_stores:
