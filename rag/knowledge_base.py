@@ -1,11 +1,15 @@
 """
 Local RAG store (ChromaDB, on-disk - nothing leaves the box).
 
-Three logical collections, kept separate so retrieval can be targeted:
+Four logical collections, kept separate so retrieval can be targeted:
   - playbooks   : your org's SOPs for handling alert types
   - cases       : closed historical alerts with analyst verdict + reasoning
   - lessons     : short, self-written notes distilled from analyst feedback
                   (this is the "self-improvement" memory - see agent/memory.py)
+  - wazuh_docs  : curated engineering reference for the AI SOC engineer
+                  (rule authoring, logtest semantics, API quirks, indexer
+                  query conventions, MITRE mapping - see wazuh_docs/ and
+                  scripts_ingest_wazuh_docs.py)
 
 By default this downloads a small local sentence-embedding model on first use
 (one-time, needs internet); everything after that runs fully offline. Set
@@ -27,7 +31,7 @@ import chromadb
 from config import cfg
 from rag.embeddings import HashingEmbeddingFunction
 
-COLLECTIONS = ("playbooks", "cases", "lessons")
+COLLECTIONS = ("playbooks", "cases", "lessons", "wazuh_docs")
 
 
 def _embedding_function():
