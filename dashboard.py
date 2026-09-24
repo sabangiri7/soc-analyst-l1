@@ -538,22 +538,29 @@ def _spawn_agent(agent_id: str, provider_id: str | None = None) -> int:
 
 
 def _signal_agent(agent_id: str, sig: int) -> bool:
-    """Signal a watcher's pid (heartbeat) AND drop its stop-file.
+    """Signal a watcher AND drop its stop-file.
 
-    The stop-file alone makes the watcher exit at the end of the current
-    cycle; the signal makes that immediate. Both together mean Stop/Kill work
-    even if the recorded pid is stale or the heartbeat was overwritten.
+    The stop-file alone makes the watcher exit at the top of its next cycle
+    (even when idle); the signal makes that immediate. Find the watcher by its
+    live command line first (heartbeat pids can be stale or missing for older
+    watchers), and only trust a heartbeat pid when /proc discovery found
+    nothing to signal - so a recycled pid is never signalled by accident.
     """
     agent_id = ac.sanitize_id(agent_id)
     hb = ac.read_heartbeat(agent_id)
-    pid = hb.get("pid")
+    try:
+        pid = int(hb["pid"]) if hb.get("pid") else None
+    except (TypeError, ValueError):
+        pid = None
+    proc_pids = ac.find_watcher_pids(agent_id)
+    candidates = proc_pids or ([pid] if pid else [])
     hit = False
-    if pid:
+    for p in dict.fromkeys(candidates):
         try:
-            os.kill(int(pid), sig)
+            os.kill(p, sig)
             hit = True
         except (ProcessLookupError, OSError):
-            pass
+            continue
     ac.stop_file_path(agent_id).touch(exist_ok=True)
     return hit
 

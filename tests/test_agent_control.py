@@ -111,6 +111,21 @@ class TestRunHeartbeatEveryCycle(AgentControlTestBase):
         self.assertEqual(hb["status"], "running")
         self.assertEqual(hb["cycle"], 1)
 
+    def test_idle_watcher_exits_on_stop_file(self):
+        """The 'can't stop it' bug: an idle watcher ignored the stop-file."""
+        import agent_control as ac
+        import run as runm
+        with mock.patch.object(runm, "AGENT_ID", "t-idle"):
+            class FakeSiem:
+                name = "mock"
+                def get_new_alerts(self):
+                    return []
+            sp = ac.stop_file_path("t-idle")
+            sp.parent.mkdir(parents=True, exist_ok=True)
+            sp.touch()  # dashboard pressed Stop
+            should_stop = runm._run_cycle(FakeSiem(), cycle=1, exit_after=0)
+            self.assertTrue(should_stop, "an idle watcher must honour the stop-file")
+
 
 class TestDashboardAgentEndpoints(AgentControlTestBase):
     """Flask test-client coverage for the /api/agents endpoints."""
@@ -231,6 +246,36 @@ class TestDashboardAgentEndpoints(AgentControlTestBase):
         self.assertEqual(body["lines"], [])
         self.assertEqual(body["agent"]["agent_id"], "never-deployed")
 
+    def test_stop_finds_watcher_without_heartbeat_pid(self):
+        """Stop must still kill a watcher whose heartbeat lost its pid
+        (older watchers overwrote the pid after the first alert cycle)."""
+        import agent_control as ac
+        watcher = subprocess.Popen(
+            [sys.executable, "run.py", "--agent-id", "ghost",
+             "--provider", "mock", "--interval", "60"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: watcher.kill() if watcher.poll() is None else None)
+        try:
+            time.sleep(6)  # let it boot and write heartbeats
+        finally:
+            pass
+        # simulate an old-code heartbeat that has no pid at all
+        ac.write_heartbeat("ghost", {"status": "running", "at": _ts()})
+        hb = ac.read_heartbeat("ghost")
+        hb.pop("pid", None)
+        ac.heartbeat_path("ghost").write_text(json.dumps(hb))
+        self.assertIsNone(ac.read_heartbeat("ghost").get("pid"))
+        # /proc discovery must find it anyway
+        self.assertIn(watcher.pid, ac.find_watcher_pids("ghost"))
+
+        r = self.client.post("/api/agents/ghost/stop", json={})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.get_json()["ok"])
+        watcher.wait(timeout=15)
+        self.assertIsNotNone(watcher.poll(), "watcher must die via /proc discovery")
+        self.assertEqual(watcher.returncode, 0)  # clean SIGTERM shutdown
+        self.assertTrue(ac.stop_file_path("ghost").exists())
+
     def test_legacy_default_agent_status_and_stop_still_work(self):
         import agent_control as ac
         r = self.client.get("/api/agent")
@@ -239,8 +284,14 @@ class TestDashboardAgentEndpoints(AgentControlTestBase):
         self.assertIn("running", body)
         self.assertIn("last_heartbeat", body)
         self.assertEqual(body["agent_id"], "default")
-        # stop with no live watcher is graceful: ok, not killed, stop file set
-        r2 = self.client.post("/api/agent/stop", json={})
+        # stop with no live watcher is graceful: ok, not killed, stop file set.
+        # Deterministic: no heartbeat pid and no /proc-discovered watcher.
+        ac.write_heartbeat("default", {"status": "running"})
+        hb = ac.read_heartbeat("default")
+        hb.pop("pid", None)
+        ac.heartbeat_path("default").write_text(json.dumps(hb))
+        with mock.patch("dashboard.ac.find_watcher_pids", return_value=[]):
+            r2 = self.client.post("/api/agent/stop", json={})
         self.assertEqual(r2.status_code, 200)
         body2 = r2.get_json()
         self.assertTrue(body2["ok"])

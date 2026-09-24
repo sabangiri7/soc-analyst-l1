@@ -101,10 +101,24 @@ def mark_stopped(agent_id: str, reason: str, **extra) -> None:
 # --------------------------------------------------------------------------- #
 # Liveness + status
 # --------------------------------------------------------------------------- #
+def _proc_state(pid) -> str | None:
+    """/proc process state char (R/S/D/T/Z/...), or None when not readable."""
+    try:
+        stat = Path(f"/proc/{int(pid)}/stat").read_text(errors="replace")
+        return stat[stat.rfind(")") + 2] if ")" in stat else None
+    except (OSError, ValueError):
+        return None
+
+
 def pid_alive(pid) -> bool:
+    """True when the pid is a live, non-zombie process.
+
+    `os.kill(pid, 0)` alone is not enough: it also succeeds on zombies (dead
+    children awaiting reap), which would make a stopped watcher look alive.
+    """
     try:
         os.kill(int(pid), 0)
-        return True
+        return _proc_state(pid) not in (None, "Z")
     except (ProcessLookupError, PermissionError, OSError, TypeError, ValueError):
         return False
 
@@ -190,3 +204,39 @@ def tail_lines(path: Path, n: int) -> list[str]:
         return []
     lines = data.splitlines()
     return lines[-n:]
+
+
+def find_watcher_pids(agent_id: str) -> list[int]:
+    """Pids of live `run.py` watchers for `agent_id`, found via /proc cmdline.
+
+    This is the authoritative process discovery used by Stop/Kill: it works
+    even when the heartbeat pid is missing or stale (e.g. a watcher started
+    outside the dashboard, or an older watcher whose heartbeat file lost its
+    pid after the first alert cycle). For the default agent it also matches
+    legacy invocations (`python run.py` with no --agent-id at all).
+    """
+    import glob
+    aid = sanitize_id(agent_id)
+    found: list[int] = []
+    try:
+        entries = glob.glob("/proc/[0-9]*/cmdline")
+    except OSError:
+        return found
+    for path in entries:
+        try:
+            raw = Path(path).read_bytes().split(b"\x00")
+        except OSError:
+            continue
+        args = [p for p in (a.decode(errors="replace") for a in raw) if p]
+        if not args or not any("run.py" in a for a in args):
+            continue
+        if "--agent-id" in args:
+            i = args.index("--agent-id")
+            if i + 1 < len(args) and args[i + 1] == aid:
+                if _proc_state(int(Path(path).parent.name)) != "Z":
+                    found.append(int(Path(path).parent.name))
+        elif aid == "default":
+            # legacy `python run.py` with no agent-id - it IS the default watcher
+            if _proc_state(int(Path(path).parent.name)) != "Z":
+                found.append(int(Path(path).parent.name))
+    return sorted(set(found))

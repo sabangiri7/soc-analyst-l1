@@ -104,6 +104,8 @@ def _run_cycle(siem, *, cycle: int, exit_after: int) -> bool:
     """Run one poll cycle. Returns True when the watcher should stop."""
     alerts = _pull_alerts(siem)
     if not alerts:
+        if stop_file_path().exists():
+            return True  # dashboard Stop pressed - exit at end of cycle
         if cycle == 1:
             print("  [run] No alerts in the first poll - watching...")
         # Heartbeat EVERY cycle, even with nothing to triage - this is how the
@@ -221,6 +223,13 @@ def run_watch(*, siem, interval: float, exit_after: int) -> int:
     while True:
         cycle += 1
         _CYCLES_DONE = cycle
+        # Stop-file is checked EVERY cycle, before anything else - an idle
+        # watcher (no alerts to triage) must still honour a dashboard Stop.
+        if stop_file_path().exists():
+            print("  [run] stop-file found - stopping.")
+            mark_stopped()
+            print("  [run] stop requested via stop-file; exiting 0.")
+            return 0
         try:
             if _run_cycle(siem, cycle=cycle, exit_after=exit_after):
                 mark_stopped()
