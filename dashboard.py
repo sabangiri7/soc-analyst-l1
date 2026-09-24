@@ -34,14 +34,50 @@ from flask import Flask, jsonify, render_template, request
 
 import siem_providers as store
 from connectors.siem import PLATFORM_FIELDS
-from agent.triage_agent import TriageAgent
+from agent.triage_agent import TriageAgent, needs_human_review
 from agent.chat_agent import ChatAgent
 import lookup_tables as lookup
+import rules
+import notify
+import metrics
+import cases
 
 app = Flask(__name__)
 
 TRIAGE_LOG = Path("data/triage_log.jsonl")
 TRIAGE_LIMIT_DEFAULT = 5
+
+
+# --------------------------------------------------------------------------- #
+# Auth - optional single-shared-secret token (DASHBOARD_TOKEN). Empty (the
+# default) means no auth, which is fine for strictly local use bound to
+# 127.0.0.1; set it before pointing --host at anything else, since every
+# route here (including ones that write to the SIEM, start/stop the
+# overnight watcher, and CRUD lookup tables/rules) is otherwise wide open.
+# The token is accepted as `Authorization: Bearer <token>` or `?token=...`;
+# the page shell (`/`) always loads so the JS can read `?token=` off the URL
+# and attach it to every subsequent /api/* call - see api() in index.html.
+# --------------------------------------------------------------------------- #
+def _token_ok() -> bool:
+    from config import cfg
+    supplied = request.headers.get("Authorization", "")
+    if supplied.startswith("Bearer "):
+        supplied = supplied[len("Bearer "):]
+    else:
+        supplied = request.args.get("token", "")
+    return supplied == cfg.DASHBOARD_TOKEN
+
+
+@app.before_request
+def _require_dashboard_token():
+    from config import cfg
+    if not cfg.DASHBOARD_TOKEN:
+        return None  # auth disabled (default) - purely local use
+    if request.path == "/":
+        return None  # let the page shell load; every /api/* call below is still gated
+    if not _token_ok():
+        return jsonify({"error": "Unauthorized - set Authorization: Bearer <token> or ?token=<token>."}), 401
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -81,9 +117,30 @@ def api_platforms():
     return jsonify({"platforms": out})
 
 
+@app.get("/api/metrics")
+def api_metrics():
+    """Aggregate stats over data/triage_log.jsonl (+ analyst-agreement rate
+    from data/feedback_log.jsonl, when any review history exists) - see
+    metrics.py for the actual computation."""
+    return jsonify(metrics.compute_metrics())
+
+
+@app.get("/api/cases")
+def api_cases():
+    """Alerts from data/triage_log.jsonl clustered by shared host/user
+    within a time window - see cases.py. Query params: window_minutes,
+    limit, min_alerts (default 1 - pass 2 to only see actual clusters)."""
+    window = float(request.args.get("window_minutes", cases.DEFAULT_WINDOW_MINUTES))
+    limit = int(request.args.get("limit", cases.DEFAULT_SCAN_LIMIT))
+    min_alerts = int(request.args.get("min_alerts", 1))
+    grouped = cases.group_cases(window_minutes=window, limit=limit)
+    grouped = [c for c in grouped if c["alert_count"] >= min_alerts]
+    return jsonify({"cases": grouped})
+
+
 @app.get("/api/providers")
 def api_providers():
-    return jsonify({"providers": store.load_providers()})
+    return jsonify({"providers": [store.redact_provider(p) for p in store.load_providers()]})
 
 
 @app.post("/api/providers")
@@ -93,7 +150,7 @@ def api_add_provider():
         provider = store.add_provider(payload)
     except store.ProviderError as e:
         return jsonify({"error": str(e)}), 400
-    return jsonify({"provider": provider}), 201
+    return jsonify({"provider": store.redact_provider(provider)}), 201
 
 
 @app.delete("/api/providers/<provider_id>")
@@ -154,19 +211,27 @@ def api_triage(provider_id: str):
     results = []
     for alert in alerts[:limit]:
         try:
+            rule_matches = rules.evaluate_all(alert)
+        except Exception as e:  # noqa: BLE001 - a bad rule should never block triage
+            rule_matches = []
+        triggered = [m for m in rule_matches if m["triggered"]]
+        if triggered:
+            try:
+                notify.notify_rule_matches(alert, rule_matches)
+            except Exception as e:  # noqa: BLE001 - a bad webhook must never block triage
+                pass
+
+        try:
             result = agent.triage(alert)
         except Exception as e:  # noqa: BLE001
             results.append({"alert_id": alert.get("alert_id", "?"), "error": str(e)})
             continue
-        needs_human = (
-            result.verdict == "escalate"
-            or result.confidence < 0.9
-            or result.recommended_action in ("isolate_host", "disable_account")
-        )
+        needs_human = needs_human_review(result, rule_matches)
         with open(TRIAGE_LOG, "a") as f:
             f.write(json.dumps({
                 "alert": alert,
                 "result": asdict(result),
+                "rule_matches": rule_matches,
                 "needs_human_review": needs_human,
                 "siem_provider": {"id": provider_id, "name": provider["name"], "platform": provider["platform"]},
             }, default=str) + "\n")
@@ -177,6 +242,7 @@ def api_triage(provider_id: str):
             "confidence": result.confidence,
             "recommended_action": result.recommended_action,
             "rationale": result.rationale,
+            "rule_matches": [m["name"] for m in triggered],
             "needs_human_review": needs_human,
         })
 
@@ -310,6 +376,123 @@ def api_delete_lookup_table(name: str):
 
 
 # --------------------------------------------------------------------------- #
+# Alert rules CRUD + test routes.
+# --------------------------------------------------------------------------- #
+@app.get("/api/rules/ops")
+def api_rule_ops():
+    """The valid condition operators - single source of truth is rules.VALID_OPS."""
+    return jsonify({"ops": list(rules.VALID_OPS)})
+
+
+@app.get("/api/rules")
+def api_rules():
+    return jsonify({"rules": rules.list_rules()})
+
+
+@app.post("/api/rules")
+def api_create_rule():
+    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        rule = rules.create_rule(payload)
+    except rules.RuleError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"rule": rule}), 201
+
+
+@app.get("/api/rules/<rule_id>")
+def api_read_rule(rule_id: str):
+    rule = rules.read_rule(rule_id)
+    if not rule:
+        return jsonify({"error": f"Rule '{rule_id}' not found."}), 404
+    return jsonify({"rule": rule})
+
+
+@app.patch("/api/rules/<rule_id>")
+def api_update_rule(rule_id: str):
+    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        rule = rules.update_rule(rule_id, payload)
+    except rules.RuleError as e:
+        return jsonify({"error": str(e)}), 400
+    if not rule:
+        return jsonify({"error": f"Rule '{rule_id}' not found."}), 404
+    return jsonify({"rule": rule})
+
+
+@app.delete("/api/rules/<rule_id>")
+def api_delete_rule(rule_id: str):
+    if not rules.delete_rule(rule_id):
+        return jsonify({"error": f"Rule '{rule_id}' not found."}), 404
+    return jsonify({"ok": True})
+
+
+@app.post("/api/rules/<rule_id>/backtest")
+def api_backtest_rule(rule_id: str):
+    """How often would this saved rule have fired on historical alerts?
+    Reads data/triage_log.jsonl - never touches the real threshold state."""
+    rule = rules.read_rule(rule_id)
+    if not rule:
+        return jsonify({"error": f"Rule '{rule_id}' not found."}), 404
+    body = request.get_json(force=True, silent=True) or {}
+    limit = body.get("limit")
+    result = rules.backtest_rule(rule, limit=int(limit) if limit else None)
+    return jsonify({"result": result})
+
+
+@app.post("/api/rules/<rule_id>/test")
+def api_test_rule(rule_id: str):
+    """Dry-run a stored rule against a sample alert - never mutates threshold state."""
+    rule = rules.read_rule(rule_id)
+    if not rule:
+        return jsonify({"error": f"Rule '{rule_id}' not found."}), 404
+    body = request.get_json(force=True, silent=True) or {}
+    alert = body.get("alert")
+    if not isinstance(alert, dict):
+        return jsonify({"error": "Provide 'alert' as a JSON object to test against."}), 400
+    result = rules.evaluate_rule(rule, alert, dry_run=True)
+    return jsonify({"result": result})
+
+
+@app.post("/api/rules/preview")
+def api_preview_rule():
+    """Dry-run an unsaved rule draft against a sample alert (rule-builder 'test before save')."""
+    body = request.get_json(force=True, silent=True) or {}
+    draft = body.get("rule")
+    alert = body.get("alert")
+    if not isinstance(draft, dict) or not isinstance(alert, dict):
+        return jsonify({"error": "Provide 'rule' and 'alert' as JSON objects."}), 400
+    try:
+        valid = rules.validate_rule(draft)
+    except rules.RuleError as e:
+        return jsonify({"error": str(e)}), 400
+    valid["id"] = "preview"
+    result = rules.evaluate_rule(valid, alert, dry_run=True)
+    return jsonify({"result": result})
+
+
+@app.get("/api/rules/export")
+def api_export_rules():
+    """Portable rule set (no id/created/updated) - download or pipe into
+    seed_data/rules/ to share across environments."""
+    rule_ids = request.args.getlist("id") or None
+    return jsonify({"rules": rules.export_rules(rule_ids)})
+
+
+@app.post("/api/rules/import")
+def api_import_rules():
+    body = request.get_json(force=True, silent=True) or {}
+    rule_defs = body.get("rules")
+    if not isinstance(rule_defs, list):
+        return jsonify({"error": "Provide 'rules' as a JSON list."}), 400
+    on_conflict = "overwrite" if body.get("overwrite") else "skip"
+    try:
+        result = rules.import_rules(rule_defs, on_conflict=on_conflict)
+    except rules.RuleError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(result)
+
+
+# --------------------------------------------------------------------------- #
 # Agent control routes - overnight watcher status / start / stop.
 # --------------------------------------------------------------------------- #
 AGENT_POLL_TOLERANCE = 120  # seconds: heartbeat fresher than this counts as "running"
@@ -394,9 +577,19 @@ if __name__ == "__main__":
     parser.add_argument("--port", default=5001, type=int, help="bind port (default 5001)")
     args = parser.parse_args()
 
+    from config import cfg
+
     print("=" * 60)
     print("SOC triage dashboard")
     print(f"  Open:      http://{args.host}:{args.port}")
     print(f"  Providers: {store.default_providers_path()}")
+    if cfg.DASHBOARD_TOKEN:
+        print(f"  Auth:      ON - open with ?token=<your DASHBOARD_TOKEN>")
+    elif args.host not in ("127.0.0.1", "localhost"):
+        print("  Auth:      OFF - WARNING: binding to a non-local host with no "
+              "DASHBOARD_TOKEN set means every route here is open to anyone "
+              "who can reach this address. Set DASHBOARD_TOKEN in .env.")
+    else:
+        print("  Auth:      OFF (fine for local-only use - set DASHBOARD_TOKEN before exposing this beyond 127.0.0.1)")
     print("=" * 60)
     app.run(host=args.host, port=args.port, debug=False)

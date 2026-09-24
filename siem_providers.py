@@ -108,6 +108,24 @@ def get_provider(provider_id: str, path: Path | None = None) -> dict[str, Any] |
     return None
 
 
+def redact_provider(provider: dict[str, Any]) -> dict[str, Any]:
+    """Mask fields PLATFORM_FIELDS marks `secret: True` before a provider
+    dict leaves the process (API responses, logs, etc). `load_providers()`/
+    `get_provider()` still return the real values - `connector_for()` needs
+    them to actually authenticate - so callers must redact explicitly at
+    the point they hand a provider to something outside the process."""
+    from connectors.siem import PLATFORM_FIELDS
+    fields = (PLATFORM_FIELDS.get(provider.get("platform") or "") or {}).get("fields", [])
+    secret_keys = {f["key"] for f in fields if f.get("secret")}
+    if not secret_keys:
+        return provider
+    config = dict(provider.get("config") or {})
+    for key in secret_keys:
+        if config.get(key):
+            config[key] = "••••••••"
+    return {**provider, "config": config}
+
+
 # --------------------------------------------------------------------------- #
 def _validate(payload: dict[str, Any]) -> dict[str, Any]:
     name = str(payload.get("name") or "").strip()

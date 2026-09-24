@@ -23,8 +23,10 @@ from pathlib import Path
 from dataclasses import asdict
 
 from config import cfg
-from agent.triage_agent import TriageAgent
+from agent.triage_agent import TriageAgent, needs_human_review
 from connectors.siem import SIEMConnector
+import rules
+import notify
 
 TRIAGE_LOG = Path("data/triage_log.jsonl")
 
@@ -66,6 +68,19 @@ def _run_batch(alerts: list[dict], provider: str | None = None, siem: SIEMConnec
         alert_id = alert.get("alert_id", "unknown")
         print(f"\n{'=' * 70}\nTriaging {alert_id}: {alert.get('rule_name', alert.get('description', ''))}\n{'=' * 70}")
 
+        try:
+            rule_matches = rules.evaluate_all(alert)
+        except Exception as e:  # noqa: BLE001 - a bad rule should never block triage
+            print(f"  [rules] evaluation failed (continuing without rule tags): {e}")
+            rule_matches = []
+        triggered = [m for m in rule_matches if m["triggered"]]
+        if triggered:
+            print(f"  Rule matches:       {', '.join(m['name'] for m in triggered)}")
+            try:
+                notify.notify_rule_matches(alert, rule_matches)
+            except Exception as e:  # noqa: BLE001 - a bad webhook must never block triage
+                print(f"  [notify] failed (continuing): {e}")
+
         result = agent.triage(alert)
 
         print(f"  Verdict:            {result.verdict}")
@@ -74,17 +89,14 @@ def _run_batch(alerts: list[dict], provider: str | None = None, siem: SIEMConnec
         print(f"  Rationale:          {result.rationale}")
         print(f"  Evidence used:      {result.evidence_used}")
 
-        needs_human = (
-            result.verdict == "escalate"
-            or result.confidence < cfg.AUTO_CLOSE_CONFIDENCE_THRESHOLD
-            or result.recommended_action in ("isolate_host", "disable_account")
-        )
+        needs_human = needs_human_review(result, rule_matches)
         print(f"  --> {'NEEDS HUMAN REVIEW' if needs_human else 'auto-closeable (still logged for spot-check)'}")
 
         with open(TRIAGE_LOG, "a") as f:
             f.write(json.dumps({
                 "alert": alert,
                 "result": asdict(result),
+                "rule_matches": rule_matches,
                 "needs_human_review": needs_human,
             }, default=str) + "\n")
 

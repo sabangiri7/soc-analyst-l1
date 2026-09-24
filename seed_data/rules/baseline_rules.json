@@ -1,0 +1,39 @@
+{
+  "rules": [
+    {
+      "name": "Brute force without MFA",
+      "description": "High/critical severity auth-failure alert where MFA was not satisfied - matches the pattern in seed_data/playbooks/brute_force.md.",
+      "enabled": true,
+      "match": {
+        "mode": "all",
+        "conditions": [
+          {"field": "severity", "op": "in", "value": ["high", "critical"]},
+          {"field": "mfa_satisfied", "op": "eq", "value": false}
+        ]
+      },
+      "threshold": null,
+      "action": {"tag": "credential_stuffing", "escalate": true, "notify": ""}
+    },
+    {
+      "name": "Repeated alerts from the same source IP",
+      "description": "5 alerts from the same src_ip within 15 minutes - possible scanning/automated attack, regardless of which specific rule fired.",
+      "enabled": true,
+      "match": {"mode": "all", "conditions": []},
+      "threshold": {"group_by": "src_ip", "window_minutes": 15, "count": 5},
+      "action": {"tag": "repeated_source", "escalate": true, "notify": ""}
+    },
+    {
+      "name": "Known-bad IP",
+      "description": "src_ip appears in the 'known_bad_ips' lookup table - create that table via the dashboard's Lookup Tables panel or the chat agent before enabling this.",
+      "enabled": false,
+      "match": {
+        "mode": "all",
+        "conditions": [
+          {"field": "src_ip", "op": "in_lookup", "value": "known_bad_ips"}
+        ]
+      },
+      "threshold": null,
+      "action": {"tag": "known_bad_ip", "escalate": true, "notify": ""}
+    }
+  ]
+}

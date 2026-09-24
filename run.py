@@ -43,8 +43,10 @@ from typing import Any
 
 from config import cfg
 from llm import get_provider
-from agent.triage_agent import TriageAgent
+from agent.triage_agent import TriageAgent, needs_human_review
 from siem_providers import connector_for, load_providers, resolve_connector
+import rules
+import notify
 
 
 # --------------------------------------------------------------------------- #
@@ -104,11 +106,30 @@ def _run_cycle(siem, *, cycle: int, exit_after: int) -> bool:
 
     agent = TriageAgent(siem=siem)
     triaged = 0
-    log = Path(cfg.TRIAGE_LOG_PATH or "data/chat_log.jsonl")
+    # This is the same audit trail main.py/dashboard.py write to - the
+    # variable used to fall back to "data/chat_log.jsonl" (a confusing
+    # leftover from the chat-agent panel's own, separate log) even though
+    # cfg.TRIAGE_LOG_PATH is never actually empty; that dead fallback is
+    # gone now, and this always lands in data/triage_log.jsonl by default.
+    log = Path(cfg.TRIAGE_LOG_PATH or "data/triage_log.jsonl")
 
     for alert in alerts:
         if stop_file_path().exists():
             return True
+        try:
+            rule_matches = rules.evaluate_all(alert)
+        except Exception as e:  # noqa: BLE001 - a bad rule should never kill the watch
+            print(f"  [run] rule evaluation failed for {alert.get('alert_id')}: {e}")
+            rule_matches = []
+        triggered = [m for m in rule_matches if m["triggered"]]
+        if triggered:
+            print(f"  [run] cycle {cycle}: {alert.get('alert_id')} matched rule(s): "
+                  f"{', '.join(m['name'] for m in triggered)}")
+            try:
+                notify.notify_rule_matches(alert, rule_matches)
+            except Exception as e:  # noqa: BLE001 - a bad webhook must never kill the watch
+                print(f"  [run] notify failed (continuing): {e}")
+
         try:
             result = agent.triage(alert)
         except Exception as e:  # noqa: BLE001 - never let one alert kill the watch
@@ -124,6 +145,8 @@ def _run_cycle(siem, *, cycle: int, exit_after: int) -> bool:
                 "recommended_action": result.recommended_action,
                 "rationale": (result.rationale or "")[:500],
             },
+            "rule_matches": rule_matches,
+            "needs_human_review": needs_human_review(result, rule_matches),
             "cycle": cycle,
         }
         log.parent.mkdir(parents=True, exist_ok=True)

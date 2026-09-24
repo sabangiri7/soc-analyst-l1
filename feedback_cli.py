@@ -1,22 +1,31 @@
 """
 Analyst-facing feedback loop.
 
-  python feedback_cli.py review
+  python feedback_cli.py review [--analyst NAME]
       Walk through cases in data/triage_log.jsonl that need human review,
       confirm or correct the agent's verdict. Every response is captured via
       MemoryStore.capture_feedback (see agent/memory.py) - this both logs
       raw feedback AND immediately stores the closed case into the RAG
       'cases' collection for future retrieval.
 
-  python feedback_cli.py distill
+  python feedback_cli.py distill [--analyst NAME]
       Batch job (run nightly / weekly). Looks at recent disagreements and
       proposes candidate "lessons". YOU approve each one before it's written
       to the 'lessons' collection the live agent retrieves from - this is
       the human checkpoint that keeps self-improvement from drifting on
       noisy feedback.
+
+Analyst identity: every correction and every lesson approval is tagged with
+who did it (data/feedback_log.jsonl's "analyst" field; a lesson's
+"approved_by" metadata) - this is a single free-text name, not an account
+system (see dashboard.py's DASHBOARD_TOKEN docstring for why this project
+doesn't do full multi-user auth). Resolved in this order: --analyst NAME,
+then the ANALYST_NAME env var, then an interactive prompt (once per run).
 """
 from __future__ import annotations
+import argparse
 import json
+import os
 import sys
 import time
 import uuid
@@ -38,7 +47,19 @@ def _save_reviewed(ids: set[str]) -> None:
     REVIEWED_MARKER.write_text(json.dumps(sorted(ids)))
 
 
-def review():
+def _resolve_analyst(cli_value: str | None) -> str:
+    """--analyst NAME > ANALYST_NAME env var > interactive prompt (once)."""
+    if cli_value:
+        return cli_value
+    env_value = os.getenv("ANALYST_NAME", "").strip()
+    if env_value:
+        return env_value
+    if sys.stdin.isatty():
+        return input("Your name (for the audit trail - enter to leave blank): ").strip()
+    return ""
+
+
+def review(analyst: str = ""):
     if not TRIAGE_LOG.exists():
         print("No triage log yet - run main.py first.")
         return
@@ -48,7 +69,10 @@ def review():
     records = [json.loads(l) for l in TRIAGE_LOG.read_text().splitlines()]
 
     pending = [r for r in records if r["needs_human_review"]]
-    print(f"{len(pending)} case(s) flagged for review.\n")
+    print(f"{len(pending)} case(s) flagged for review.")
+    if analyst:
+        print(f"Reviewing as: {analyst}")
+    print()
 
     for rec in pending:
         alert = rec["alert"]
@@ -72,7 +96,7 @@ def review():
             analyst_verdict = input("Correct verdict [false_positive/true_positive/escalate]: ").strip()
             reasoning = input("Why? (this becomes training signal - be specific): ").strip()
 
-        store.capture_feedback(case_id, alert, result, analyst_verdict, reasoning)
+        store.capture_feedback(case_id, alert, result, analyst_verdict, reasoning, analyst=analyst)
         reviewed.add(case_id)
         _save_reviewed(reviewed)
         print("Feedback captured.")
@@ -80,7 +104,7 @@ def review():
     print("\nReview complete.")
 
 
-def distill():
+def distill(analyst: str = ""):
     store = MemoryStore()
     # Look at all feedback ever captured; in production you'd pass the
     # timestamp of the last distill run instead of 0.
@@ -99,6 +123,7 @@ def distill():
             store.approve_and_store_lesson(
                 c["lesson"],
                 {"supporting_case_ids": json.dumps(c.get("supporting_case_ids", [])), "added": time.time()},
+                approved_by=analyst,
             )
             print("Stored.")
         else:
@@ -106,10 +131,15 @@ def distill():
 
 
 if __name__ == "__main__":
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "review"
-    if cmd == "review":
-        review()
-    elif cmd == "distill":
-        distill()
-    else:
-        print("usage: python feedback_cli.py [review|distill]")
+    parser = argparse.ArgumentParser(description="SOC analyst feedback loop")
+    parser.add_argument("cmd", nargs="?", default="review", choices=["review", "distill"])
+    parser.add_argument("--analyst", default=None,
+                         help="Your name, recorded with every correction/approval (default: "
+                              "ANALYST_NAME env var, or an interactive prompt).")
+    args = parser.parse_args()
+
+    analyst_name = _resolve_analyst(args.analyst)
+    if args.cmd == "review":
+        review(analyst=analyst_name)
+    elif args.cmd == "distill":
+        distill(analyst=analyst_name)

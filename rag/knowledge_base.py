@@ -7,8 +7,17 @@ Three logical collections, kept separate so retrieval can be targeted:
   - lessons     : short, self-written notes distilled from analyst feedback
                   (this is the "self-improvement" memory - see agent/memory.py)
 
-On first run this downloads a small local sentence-embedding model (one-time,
-needs internet). Everything after that runs fully offline.
+By default this downloads a small local sentence-embedding model on first use
+(one-time, needs internet); everything after that runs fully offline. Set
+KB_EMBEDDING_MODE=hashing (or just MOCK_MODE=true, which implies it) to skip
+that download entirely and use the deterministic offline embedding in
+rag/embeddings.py instead - retrieval quality is worse, but it needs no
+network and no model file, which matters for CI, air-gapped deployments, and
+tests. A collection's embedding function is fixed at creation time in its
+on-disk data; if CHROMA_DB_PATH already has data created under a different
+mode, KnowledgeBase falls back to whatever's actually persisted there rather
+than erroring - so flipping MOCK_MODE on an existing data dir degrades
+gracefully to the embedding it was already using, it doesn't crash.
 """
 from __future__ import annotations
 import uuid
@@ -16,16 +25,40 @@ from typing import Any
 import chromadb
 
 from config import cfg
+from rag.embeddings import HashingEmbeddingFunction
 
 COLLECTIONS = ("playbooks", "cases", "lessons")
 
 
+def _embedding_function():
+    """None means "let chromadb use its own default" (the downloaded
+    sentence-transformer model) - the historical, unconfigured behavior."""
+    mode = (getattr(cfg, "KB_EMBEDDING_MODE", "") or "auto").strip().lower()
+    if mode == "hashing" or (mode == "auto" and cfg.MOCK_MODE):
+        return HashingEmbeddingFunction()
+    return None
+
+
 class KnowledgeBase:
-    def __init__(self, path: str | None = None):
+    def __init__(self, path: str | None = None, embedding_function: Any = None):
         self.client = chromadb.PersistentClient(path=path or cfg.CHROMA_DB_PATH)
-        self._collections = {
-            name: self.client.get_or_create_collection(name) for name in COLLECTIONS
-        }
+        ef = embedding_function if embedding_function is not None else _embedding_function()
+        kwargs = {"embedding_function": ef} if ef is not None else {}
+        self._collections = {}
+        for name in COLLECTIONS:
+            try:
+                self._collections[name] = self.client.get_or_create_collection(name, **kwargs)
+            except ValueError as e:
+                # An existing on-disk collection was created with a different
+                # embedding function than the one we'd use now (e.g. this
+                # CHROMA_DB_PATH already has real-model data and someone set
+                # MOCK_MODE=true / KB_EMBEDDING_MODE=hashing afterwards).
+                # Respect what's actually persisted rather than crashing -
+                # get_or_create_collection with no embedding_function lets
+                # chromadb use the one already stored for this collection.
+                if "embedding function" not in str(e).lower() or not kwargs:
+                    raise
+                self._collections[name] = self.client.get_or_create_collection(name)
 
     # ------------------------------------------------------------------ #
     def add(self, collection: str, text: str, metadata: dict[str, Any], doc_id: str | None = None) -> str:

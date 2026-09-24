@@ -29,6 +29,10 @@ DEFAULT_RELATED_INDEX = "wazuh-archives-*"  # raw events, for correlation lookup
 DEFAULT_QUERY_SIZE = 20
 
 
+def _looks_local(host: str) -> bool:
+    return any(marker in host for marker in ("localhost", "127.0.0.1", "0.0.0.0", "::1"))
+
+
 def wazuh_severity(level: Any) -> str:
     """Map the Wazuh rule level (0-15) onto the common severity vocabulary."""
     try:
@@ -54,6 +58,23 @@ class WazuhConnector(SIEMConnector):
         self.host = resolve_cfg(config, "host", cfg.WAZUH_HOST).rstrip("/")
         self.username = resolve_cfg(config, "username", cfg.WAZUH_USERNAME) or "admin"
         self.password = resolve_cfg(config, "password", cfg.WAZUH_PASSWORD) or "admin"
+        # The bundled wazuh/docker-compose.yml stack genuinely uses admin/admin
+        # (self-signed, local-only) - that's a documented, intentional default.
+        # It's a *silent* default credential the moment WAZUH_HOST points
+        # somewhere that isn't local, so refuse to connect there without an
+        # explicit password rather than quietly authenticating with admin/admin.
+        if (
+            not cfg.MOCK_MODE
+            and self.password == "admin"
+            and self.host
+            and not _looks_local(self.host)
+        ):
+            raise ValueError(
+                f"Wazuh host '{self.host}' isn't local, but no WAZUH_PASSWORD "
+                "(or per-provider 'password') is set - refusing to connect with "
+                "the default admin/admin credential. Set a real password, or "
+                "explicitly pass password=admin if that's genuinely correct."
+            )
         self.index = resolve_cfg(config, "index", cfg.WAZUH_INDEX) or DEFAULT_INDEX
         self.related_index = resolve_cfg(config, "related_index", cfg.WAZUH_RELATED_INDEX) or DEFAULT_RELATED_INDEX
         # Self-signed by default with these deployments; a ca_cert path wins.

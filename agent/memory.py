@@ -51,7 +51,7 @@ class MemoryStore:
     # ------------------------------------------------------------------ #
     def capture_feedback(self, case_id: str, alert: dict[str, Any],
                           agent_verdict: dict[str, Any], analyst_verdict: str,
-                          analyst_reasoning: str) -> None:
+                          analyst_reasoning: str, analyst: str = "") -> None:
         record = {
             "case_id": case_id,
             "timestamp": time.time(),
@@ -59,6 +59,7 @@ class MemoryStore:
             "agent_verdict": agent_verdict,
             "analyst_verdict": analyst_verdict,
             "analyst_reasoning": analyst_reasoning,
+            "analyst": analyst,
             "agreed": agent_verdict.get("verdict") == analyst_verdict,
         }
         with open(self.feedback_path, "a") as f:
@@ -110,6 +111,8 @@ class MemoryStore:
             start, end = text.find("["), text.rfind("]")
             return json.loads(text[start:end + 1]) if start != -1 else []
 
-    def approve_and_store_lesson(self, lesson_text: str, metadata: dict[str, Any]) -> str:
+    def approve_and_store_lesson(self, lesson_text: str, metadata: dict[str, Any], approved_by: str = "") -> str:
         """Call this only after a human has reviewed the candidate lesson."""
+        if approved_by:
+            metadata = {**metadata, "approved_by": approved_by}
         return self.kb.add("lessons", lesson_text, metadata)

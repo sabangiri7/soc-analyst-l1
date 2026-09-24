@@ -158,6 +158,19 @@ class TriageResult:
     transcript: list[dict[str, Any]] = field(default_factory=list)
 
 
+def needs_human_review(result: TriageResult, rule_matches: list[dict[str, Any]] | None = None) -> bool:
+    """Single source of truth for the "does a human need to look at this"
+    check - main.py, run.py, and dashboard.py's on-demand triage route all
+    call this instead of each re-implementing the same three conditions."""
+    rule_escalate = any(m.get("action", {}).get("escalate") for m in (rule_matches or []) if m.get("triggered"))
+    return (
+        result.verdict == "escalate"
+        or result.confidence < cfg.AUTO_CLOSE_CONFIDENCE_THRESHOLD
+        or result.recommended_action in ("isolate_host", "disable_account")
+        or rule_escalate
+    )
+
+
 class TriageAgent:
     def __init__(self, provider: str | None = None, siem: SIEMConnector | None = None):
         """`provider` overrides the LLM_PROVIDER env var (e.g. mock/anthropic).

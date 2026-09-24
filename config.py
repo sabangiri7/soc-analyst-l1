@@ -53,6 +53,8 @@ class Config:
     AGENT_HEARTBEAT_PATH = os.getenv("AGENT_HEARTBEAT_PATH", "data/agent_heartbeat.json")
     # Seconds between poll cycles (--interval default in run.py).
     AGENT_POLL_INTERVAL = float(os.getenv("AGENT_POLL_INTERVAL", "30"))
+    # Stop cleanly after N poll cycles (0 = run forever) - --exit-after default.
+    AGENT_EXIT_AFTER = int(os.getenv("AGENT_EXIT_AFTER", "0"))
 
     # --- LLM retry/backoff (openai_compat_provider._post) ---
     # Free gateways (FreeLLMAPI, OpenRouter free tier, ...) throw 429/5xx under
@@ -62,14 +64,23 @@ class Config:
     LLM_RETRY_BACKOFF_BASE = float(os.getenv("LLM_RETRY_BACKOFF_BASE", "1.5"))
     LLM_RETRY_BACKOFF_MAX = float(os.getenv("LLM_RETRY_BACKOFF_MAX", "30"))
 
-    # --- Audit / triage logs ---
-    # Chat + triage transcripts land here as JSONL (same file the dashboard's
-    # "chat" and "triage" panels append to).
+    # --- Audit / storage (JSONL + JSON stores under data/) ---
+    # Triage verdicts - main.py / run.py / dashboard.py's on-demand triage
+    # route all append here. This is also the input queue feedback_cli.py
+    # reads for analyst review + lesson distillation.
     TRIAGE_LOG_PATH = os.getenv("TRIAGE_LOG_PATH", "data/triage_log.jsonl")
+    # Chat agent transcripts (separate from triage - conversational, not verdicts).
+    CHAT_LOG_PATH = os.getenv("CHAT_LOG_PATH", "data/chat_log.jsonl")
 
     # Lookup tables - small named threat-intel stores for the chat agent and
     # dashboard (see lookup_tables.py). Single atomic JSON file.
     LOOKUP_TABLES_PATH = os.getenv("LOOKUP_TABLES_PATH", "data/lookup_tables.json")
+
+    # Alert rules - local correlation/filtering evaluated before LLM triage
+    # (see rules.py). RULES_PATH holds rule definitions; RULE_STATE_PATH
+    # holds the rolling window counters for threshold/grouping rules.
+    RULES_PATH = os.getenv("RULES_PATH", "data/rules.json")
+    RULE_STATE_PATH = os.getenv("RULE_STATE_PATH", "data/rule_state.json")
 
     # --- Web search (OSINT enrichment, no API key) ---
     # OFF by default so triage never blocks on an external lookup. When on,
@@ -77,35 +88,22 @@ class Config:
     WEB_SEARCH_ENABLED = _bool("WEB_SEARCH_ENABLED", False)
     SEARXNG_URL = os.getenv("SEARXNG_URL", "")
 
-    # ---------------------------------------------------------------------- #
-    # Overnight watcher (run.py) + chat agent paths + LLM retry behavior.
-    # These are the attributes the dashboard's chat / lookup-table / agent
-    # control panels wire up; they used to be referenced but never defined,
-    # which crashed run.py on the very first poll. All offline-safe.
-    AGENT_STOP_FILE = os.getenv("AGENT_STOP_FILE", "data/agent_stop.txt")
-    AGENT_HEARTBEAT_PATH = os.getenv("AGENT_HEARTBEAT_PATH", "data/agent_heartbeat.json")
-    AGENT_POLL_INTERVAL = float(os.getenv("AGENT_POLL_INTERVAL", "30"))
-    AGENT_EXIT_AFTER = int(os.getenv("AGENT_EXIT_AFTER", "0"))
+    # --- Outbound notifications (rules.py action.notify) ---
+    # Generic webhook (Slack/Teams-compatible {"text": "..."} payload, or any
+    # endpoint that accepts a JSON POST) fired when a rule's action.notify is
+    # set. Empty = notifications are logged but never actually sent.
+    NOTIFY_WEBHOOK_URL = os.getenv("NOTIFY_WEBHOOK_URL", "")
+    NOTIFY_TIMEOUT_SECONDS = float(os.getenv("NOTIFY_TIMEOUT_SECONDS", "10"))
+    NOTIFICATIONS_LOG_PATH = os.getenv("NOTIFICATIONS_LOG_PATH", "data/notifications.jsonl")
 
-    # LLM retry/backoff - retried transient failures (429/5xx/network) with
-    # exponential backoff + jitter instead of killing a whole triage batch.
-    LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "5"))
-    LLM_RETRY_BACKOFF_BASE = float(os.getenv("LLM_RETRY_BACKOFF_BASE", "1.5"))
-    LLM_RETRY_BACKOFF_MAX = float(os.getenv("LLM_RETRY_BACKOFF_MAX", "30"))
+    # --- Dashboard auth ---
+    # If set, every dashboard.py route (except a couple of static assets)
+    # requires this token, either as `Authorization: Bearer <token>` or
+    # `?token=<token>`. Empty = no auth (fine for strictly local use on
+    # 127.0.0.1; set this before binding --host to anything else).
+    DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "")
 
-    # Audit / storage (JSONL + JSON stores under data/)
-    TRIAGE_LOG_PATH = os.getenv("TRIAGE_LOG_PATH", "data/triage_log.jsonl")
-    CHAT_LOG_PATH = os.getenv("CHAT_LOG_PATH", "data/chat_log.jsonl")
-    LOOKUP_TABLES_PATH = os.getenv("LOOKUP_TABLES_PATH", "data/lookup_tables.json")
-
-    # Web search / OSINT enrichment for the chat agent - no API key needed
-    # (DuckDuckGo instant answers + optional self-hosted SearXNG). Off keeps
-    # triage fully offline.
-    WEB_SEARCH_ENABLED = _bool("WEB_SEARCH_ENABLED", False)
-    SEARXNG_URL = os.getenv("SEARXNG_URL", "")
-
-
-    # Splunk
+    # Splunk (also configurable per-provider via the dashboard)
     SPLUNK_HOST = os.getenv("SPLUNK_HOST", "")
     SPLUNK_TOKEN = os.getenv("SPLUNK_TOKEN", "")
     SPLUNK_VERIFY_SSL = _bool("SPLUNK_VERIFY_SSL", True)
@@ -129,12 +127,6 @@ class Config:
     # through the dashboard (data/siem_providers.json) - see siem_providers.py.
     SIEM_PROVIDER = os.getenv("SIEM_PROVIDER", "splunk")
 
-    # Splunk (also configurable per-provider via the dashboard)
-    SPLUNK_HOST = os.getenv("SPLUNK_HOST", "")
-    SPLUNK_TOKEN = os.getenv("SPLUNK_TOKEN", "")
-    SPLUNK_VERIFY_SSL = _bool("SPLUNK_VERIFY_SSL", True)
-    SPLUNK_SEARCH = os.getenv("SPLUNK_SEARCH", "search index=notable status=new | head 20")
-
     # IBM QRadar
     QRADAR_HOST = os.getenv("QRADAR_HOST", "")
     QRADAR_TOKEN = os.getenv("QRADAR_TOKEN", "")
@@ -155,7 +147,9 @@ class Config:
     SENTINEL_QUERY = os.getenv("SENTINEL_QUERY", "")
 
     # Wazuh (indexer / OpenSearch API) - docker deployment lives in wazuh/
-    # on localhost:9200 with default admin/admin credentials.
+    # on localhost:9200 with default admin/admin credentials. WazuhConnector
+    # (connectors/siem/wazuh.py) refuses to use that default against a
+    # non-local host - see its docstring.
     WAZUH_HOST = os.getenv("WAZUH_HOST", "")
     WAZUH_USERNAME = os.getenv("WAZUH_USERNAME", "admin")
     WAZUH_PASSWORD = os.getenv("WAZUH_PASSWORD", "admin")
@@ -173,6 +167,15 @@ class Config:
     # Storage
     CHROMA_DB_PATH = os.getenv("CHROMA_DB_PATH", "./data/chroma")
     FEEDBACK_LOG_PATH = os.getenv("FEEDBACK_LOG_PATH", "./data/feedback_log.jsonl")
+
+    # RAG embedding backend (rag/knowledge_base.py). "auto" (default) uses
+    # the real downloaded sentence-transformer model, except under
+    # MOCK_MODE, where it uses the offline hashing fallback (no download,
+    # no network) automatically. "hashing" forces the offline fallback even
+    # outside MOCK_MODE (air-gapped deployments, CI); "default" always uses
+    # the downloaded model. See rag/embeddings.py for what the fallback
+    # trades away.
+    KB_EMBEDDING_MODE = os.getenv("KB_EMBEDDING_MODE", "auto")
 
 
 cfg = Config()

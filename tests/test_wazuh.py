@@ -76,6 +76,42 @@ class TestWazuhRegistry(unittest.TestCase):
         self.assertEqual(conn.index, "wazuh-alerts-*")
 
 
+class TestWazuhCredentialGuard(unittest.TestCase):
+    """WazuhConnector should refuse the admin/admin default against a
+    non-local host outside MOCK_MODE - see wazuh.py's docstring/guard."""
+
+    def setUp(self):
+        from config import cfg
+        self._orig_mock_mode = cfg.MOCK_MODE
+        self._orig_password = cfg.WAZUH_PASSWORD
+        cfg.MOCK_MODE = False
+        # Hermetic: clear WAZUH_PASSWORD so resolve_cfg() falls back to the
+        # silent "admin" default. Without this, a real WAZUH_PASSWORD in
+        # .env (used by live connectors) would legitimately bypass the guard
+        # and these tests would not exercise the guard itself.
+        cfg.WAZUH_PASSWORD = ""
+
+    def tearDown(self):
+        from config import cfg
+        cfg.MOCK_MODE = self._orig_mock_mode
+        cfg.WAZUH_PASSWORD = self._orig_password
+
+    def test_default_creds_against_local_host_ok(self):
+        WazuhConnector(config={"host": "https://localhost:9200"})  # should not raise
+
+    def test_default_creds_against_remote_host_raises(self):
+        with self.assertRaises(ValueError):
+            WazuhConnector(config={"host": "https://wazuh.prod.corp.local:9200"})
+
+    def test_explicit_password_against_remote_host_ok(self):
+        WazuhConnector(config={"host": "https://wazuh.prod.corp.local:9200", "password": "a-real-password"})
+
+    def test_mock_mode_bypasses_the_guard(self):
+        from config import cfg
+        cfg.MOCK_MODE = True
+        WazuhConnector(config={"host": "https://wazuh.prod.corp.local:9200"})  # should not raise
+
+
 class TestWazuhConnector(unittest.TestCase):
     def setUp(self):
         self.conn = WazuhConnector(name="wazuh-test", config={"host": "https://wazuh:9200", "verify_ssl": False})

@@ -3,188 +3,632 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SOC Triage · SIEM Dashboard</title>
+<title>SOC Triage · Analyst L1 Console</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
 <style>
   :root {
-    --bg: #0d1117; --panel: #161b22; --panel2: #1c2230; --border: #2d333b;
-    --text: #e6edf3; --muted: #8b949e; --accent: #2f81f7; --green: #3fb950;
-    --red: #f85149; --amber: #d29922; --radius: 10px;
+    --bg: #0a0a0c;
+    --panel: #131316;
+    --panel2: #1a1b20;
+    --border: rgba(255,255,255,.07);
+    --border-strong: rgba(255,255,255,.12);
+    --text: #e9eaed;
+    --muted: #9aa1ab;
+    --accent: #34d399;
+    --accent-rgb: 52,211,153;
+    --accent-soft: rgba(52,211,153,.14);
+    --red: #f87171;
+    --amber: #fbbf24;
+    --radius: 14px;
+    --mono: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+    --sans: "SF Pro Display", "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: var(--bg); color: var(--text); font: 14px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif; padding: 24px; }
-  header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
-  header h1 { font-size: 20px; }
-  .pill { background: var(--panel2); border: 1px solid var(--border); border-radius: 999px; padding: 3px 12px; font-size: 12px; color: var(--muted); }
-  .pill b { color: var(--text); font-weight: 600; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; margin-top: 16px; }
-  .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; display: flex; flex-direction: column; gap: 10px; }
-  .card .top { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
-  .card .title { font-size: 15px; font-weight: 600; }
-  .badge { font-size: 11px; border: 1px solid var(--accent); color: var(--accent); padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
-  .badge.mock { border-color: var(--amber); color: var(--amber); }
-  .badge.env { border-color: var(--muted); color: var(--muted); }
+  html { color-scheme: dark; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 14px/1.55 var(--sans);
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+  }
+  /* subtle top tint - fixed, pointer-events-none only */
+  body::before {
+    content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 0;
+    background:
+      radial-gradient(900px 320px at 15% -8%, rgba(var(--accent-rgb),.10), transparent 60%),
+      radial-gradient(700px 260px at 85% -10%, rgba(255,255,255,.035), transparent 60%);
+  }
+  .shell { position: relative; z-index: 1; max-width: 1400px; margin: 0 auto; padding: 0 28px 72px; }
+
+  /* ---------------- app bar ---------------- */
+  .appbar {
+    position: sticky; top: 0; z-index: 20;
+    display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+    padding: 16px 0;
+    backdrop-filter: blur(14px);
+    background: linear-gradient(180deg, rgba(10,10,12,.92), rgba(10,10,12,.72));
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 26px;
+  }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .brand-mark {
+    width: 34px; height: 34px; border-radius: 10px;
+    display: grid; place-items: center;
+    background: var(--accent-soft); border: 1px solid rgba(var(--accent-rgb),.35);
+    color: var(--accent);
+  }
+  .brand b { font-size: 15px; letter-spacing: -.01em; }
+  .brand small { display: block; color: var(--muted); font-size: 11px; font-weight: 400; margin-top: 1px; }
+  .nav { display: flex; gap: 4px; margin-left: 8px; flex-wrap: wrap; }
+  .nav button {
+    background: transparent; border: 1px solid transparent; color: var(--muted);
+    font: 600 12px var(--sans); letter-spacing: .02em;
+    padding: 7px 13px; border-radius: 999px; cursor: pointer;
+    transition: color .2s ease, background .2s ease, border-color .2s ease, transform .12s ease;
+  }
+  .nav button:hover { color: var(--text); background: rgba(255,255,255,.04); }
+  .nav button.active { color: var(--accent); background: var(--accent-soft); border-color: rgba(var(--accent-rgb),.3); }
+  .nav button:active { transform: scale(.97); }
+  .pill {
+    background: var(--panel2); border: 1px solid var(--border);
+    border-radius: 999px; padding: 4px 12px; font-size: 11px; color: var(--muted);
+    display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+  }
+  .pill b { color: var(--text); font-weight: 600; font-family: var(--mono); font-size: 10.5px; }
+
+  /* ---------------- views ---------------- */
+  .view { display: none; animation: fadein .28s ease both; }
+  .view.active { display: block; }
+  @keyframes fadein { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+
+  .section-label {
+    font-size: 11px; font-weight: 600; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--muted); margin: 30px 0 12px;
+  }
+  .section-label:first-child { margin-top: 0; }
+
+  /* ---------------- metric hero (asymmetric, no equal cards) ---------------- */
+  .metrics-hero {
+    display: grid; gap: 14px; margin-top: 4px;
+    grid-template-columns: 1.6fr 1fr 1fr;
+  }
+  .metric {
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 18px 20px; position: relative; overflow: hidden;
+  }
+  .metric::after {
+    content: ""; position: absolute; inset: 0 0 auto 0; height: 1px;
+    background: linear-gradient(90deg, rgba(var(--accent-rgb),.5), transparent 70%);
+    opacity: 0; transition: opacity .25s ease;
+  }
+  .metric:hover::after { opacity: 1; }
+  .metric .k { color: var(--muted); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; }
+  .metric .v { font-family: var(--mono); font-size: 34px; font-weight: 600; letter-spacing: -.02em; margin-top: 6px; line-height: 1; }
+  .metric .v small { font-size: 15px; color: var(--muted); font-weight: 500; }
+  .metric .s { margin-top: 8px; font-size: 12px; color: var(--muted); }
+
+  /* asymmetric chart band */
+  .charts-band { display: grid; gap: 14px; grid-template-columns: 1.5fr 1fr; margin-top: 14px; }
+  .chart-card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 20px; }
+  .chart-card h3 { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; font-weight: 600; margin-bottom: 12px; }
+
+  /* ---------------- generic surfaces ---------------- */
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 20px; }
+  .card.top-hairline { border-top: 2px solid rgba(var(--accent-rgb),.4); }
+  .card + .card { margin-top: 14px; }
+  .card .top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+  .card .title { font-size: 15px; font-weight: 650; letter-spacing: -.01em; display: flex; align-items: center; gap: 9px; }
+  .card .title svg { color: var(--accent); flex-shrink: 0; }
   .meta { color: var(--muted); font-size: 12px; }
-  .status { display: flex; align-items: center; gap: 6px; font-size: 12px; }
-  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); display: inline-block; }
-  .dot.ok { background: var(--green); }
+
+  .badge {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-size: 10.5px; font-weight: 600; letter-spacing: .04em;
+    border: 1px solid rgba(var(--accent-rgb),.4); color: var(--accent);
+    padding: 2px 8px; border-radius: 999px; white-space: nowrap;
+  }
+  .badge.env { border-color: var(--border-strong); color: var(--muted); }
+
+  .status { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); display: inline-block; flex-shrink: 0; }
+  .dot.ok { background: var(--accent); animation: breathe 2.2s ease-in-out infinite; }
   .dot.err { background: var(--red); }
-  .btn { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; font-size: 12px; cursor: pointer; }
-  .btn:hover { border-color: var(--accent); }
-  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  .btn.danger:hover { border-color: var(--red); color: var(--red); }
-  .btn:disabled { opacity: .55; cursor: wait; }
+  .dot.warn { background: var(--amber); }
+  @keyframes breathe {
+    0%,100% { box-shadow: 0 0 0 0 rgba(var(--accent-rgb),.45); }
+    50% { box-shadow: 0 0 0 5px rgba(var(--accent-rgb),0); }
+  }
+
+  .btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: var(--panel2); color: var(--text);
+    border: 1px solid var(--border-strong); border-radius: 9px;
+    padding: 7px 13px; font: 600 12px var(--sans); cursor: pointer;
+    transition: border-color .18s ease, background .18s ease, color .18s ease, transform .12s ease;
+  }
+  .btn:hover { border-color: rgba(var(--accent-rgb),.5); color: var(--text); }
+  .btn:active { transform: scale(.97); }
+  .btn.primary { background: rgba(var(--accent-rgb),.92); border-color: transparent; color: #04120d; }
+  .btn.primary:hover { background: var(--accent); }
+  .btn.danger:hover { border-color: var(--red); color: var(--red); background: rgba(248,113,113,.07); }
+  .btn:disabled { opacity: .45; cursor: default; }
   .actions { display: flex; gap: 8px; flex-wrap: wrap; }
-  .panel { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin-top: 8px; font-size: 12px; display: none; }
-  .panel.open { display: block; }
-  .panel h4 { font-size: 12px; color: var(--muted); margin-bottom: 8px; text-transform: uppercase; letter-spacing: .05em; }
-  table { width: 100%; border-collapse: collapse; font-size: 12px; }
-  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
-  th { color: var(--muted); font-weight: 600; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; letter-spacing: .05em; text-transform: uppercase; }
+  td.mono, th.mono, .num { font-family: var(--mono); }
+  tr:last-child td { border-bottom: 0; }
   .sev { font-weight: 600; }
-  .sev.critical { color: var(--red); } .sev.high { color: #ffa657; } .sev.medium { color: var(--amber); }
-  pre.detail { white-space: pre-wrap; word-break: break-word; color: var(--muted); margin: 4px 0; max-height: 220px; overflow: auto; }
-  /* add form */
-  #add-form { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; margin-top: 8px; }
-  #add-form .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
-  #add-form .field { display: flex; flex-direction: column; gap: 4px; min-width: 180px; flex: 1; }
-  label { font-size: 11px; color: var(--muted); }
-  input, select { background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 7px 9px; font-size: 13px; }
-  input:focus, select:focus { outline: none; border-color: var(--accent); }
+  .sev.critical { color: var(--red); } .sev.high { color: #fca5a5; } .sev.medium { color: var(--amber); }
+  pre.detail { white-space: pre-wrap; word-break: break-word; color: var(--muted); margin: 4px 0; max-height: 240px; overflow: auto; font: 12px/1.5 var(--mono); }
+  .empty { color: var(--muted); padding: 14px 4px; font-size: 12.5px; font-style: italic; }
+
+  /* forms - label above input */
+  .field { display: flex; flex-direction: column; gap: 5px; min-width: 180px; flex: 1; }
+  label { font-size: 11px; color: var(--muted); letter-spacing: .03em; }
+  input, select, textarea {
+    background: var(--bg); border: 1px solid var(--border-strong); color: var(--text);
+    border-radius: 9px; padding: 8px 11px; font: 13px var(--sans);
+    transition: border-color .18s ease, box-shadow .18s ease;
+  }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: rgba(var(--accent-rgb),.55); box-shadow: 0 0 0 3px rgba(var(--accent-rgb),.1); }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
   #dynamic-fields { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
-  .toast { position: fixed; right: 16px; bottom: 16px; background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; font-size: 13px; max-width: 340px; box-shadow: 0 6px 24px #0008; z-index: 10; }
+
+  .toast {
+    position: fixed; right: 18px; bottom: 18px; z-index: 60;
+    background: var(--panel2); border: 1px solid var(--border-strong); border-radius: 11px;
+    padding: 12px 16px; font-size: 13px; max-width: 360px;
+    box-shadow: 0 18px 48px -12px rgba(0,0,0,.6);
+    animation: toastin .25s cubic-bezier(.16,1,.3,1) both;
+  }
+  @keyframes toastin { from { opacity: 0; transform: translateY(10px) scale(.98); } to { opacity: 1; transform: none; } }
+  .toast.ok { border-color: rgba(var(--accent-rgb),.5); }
   .toast.err { border-color: var(--red); }
-  .toast.ok { border-color: var(--green); }
-  .empty { color: var(--muted); font-style: italic; padding: 8px 0; }
-  .summary li { list-style: none; }
-  /* chat / lookup / agent panels */
-  .chat-wrap { display: flex; flex-direction: column; gap: 8px; max-height: 420px; overflow: auto; }
-  .chat-msg { padding: 8px 10px; border-radius: 6px; font-size: 12px; white-space: pre-wrap; }
-  .chat-msg.user { background: #1a2332; border: 1px solid var(--border); }
-  .chat-msg.agent { background: #1a2f23; border: 1px solid #234; }
-  .chat-input { display: flex; gap: 8px; }
-  .chat-input input { flex: 1; }
-  .lookup-row { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
+
+  /* ---------------- chat (GPT style) ---------------- */
+  .chat-shell { max-width: 840px; margin: 0 auto; }
+  .chat-stage {
+    display: flex; flex-direction: column; gap: 14px;
+    min-height: 62vh; max-height: calc(100vh - 300px); overflow-y: auto;
+    padding: 6px 4px 16px;
+  }
+  .chat-msg { max-width: 78%; padding: 11px 15px; border-radius: 14px; font-size: 13px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+  .chat-msg.user { align-self: flex-end; background: rgba(var(--accent-rgb),.16); border: 1px solid rgba(var(--accent-rgb),.3); color: var(--text); border-bottom-right-radius: 4px; }
+  .chat-msg.agent { align-self: flex-start; background: var(--panel2); border: 1px solid var(--border); border-bottom-left-radius: 4px; color: var(--text); }
+  .chat-msg.agent .who { display: flex; align-items: center; gap: 6px; color: var(--accent); font-size: 10.5px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; margin-bottom: 5px; }
+  .chat-msg.error { border-color: var(--red); color: #fecaca; }
+  .typing { display: inline-flex; gap: 4px; padding: 4px 2px; }
+  .typing i { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: blink 1.2s ease-in-out infinite; }
+  .typing i:nth-child(2) { animation-delay: .18s; } .typing i:nth-child(3) { animation-delay: .36s; }
+  @keyframes blink { 0%,80%,100% { opacity: .25; transform: translateY(0); } 40% { opacity: 1; transform: translateY(-3px); } }
+  .chat-bar {
+    position: sticky; bottom: 0;
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    background: linear-gradient(180deg, transparent, var(--bg) 30%);
+    padding: 14px 0 2px;
+  }
+  .chat-bar textarea {
+    flex: 1; min-width: 220px; resize: none; min-height: 46px; max-height: 140px;
+    background: var(--panel2); border-color: var(--border-strong); border-radius: 12px; padding: 11px 14px;
+  }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0 4px; }
+  .chip {
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 999px;
+    color: var(--muted); font-size: 11.5px; padding: 6px 12px; cursor: pointer;
+    transition: border-color .18s ease, color .18s ease, transform .12s ease;
+  }
+  .chip:hover { border-color: rgba(var(--accent-rgb),.45); color: var(--accent); }
+  .chip:active { transform: scale(.98); }
+
+  /* lookups + rules rows */
+  .lookup-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
   .lookup-row input { flex: 1; min-width: 0; }
-  .agent-status { display: flex; align-items: center; gap: 10px; padding: 8px 0; }
-  .heartbeat-age { color: var(--muted); font-size: 11px; }
+  .list-row {
+    display: flex; justify-content: space-between; align-items: center; gap: 10px;
+    padding: 10px 2px; border-bottom: 1px solid var(--border); flex-wrap: wrap;
+  }
+  .list-row:last-child { border-bottom: 0; }
+  .kv b { font-size: 13px; }
+  .kv code { font-family: var(--mono); font-size: 11.5px; color: var(--accent); background: var(--accent-soft); padding: 1px 6px; border-radius: 6px; }
+  .kv .meta { margin-left: 8px; }
+
+  /* two-column workbench */
+  .workbench { display: grid; grid-template-columns: 340px 1fr; gap: 14px; align-items: start; }
+  .workbench .stack { display: flex; flex-direction: column; gap: 14px; }
+
+  /* skeleton shimmer */
+  .skeleton { border-radius: 8px; background: linear-gradient(100deg, var(--panel2) 40%, rgba(255,255,255,.06) 50%, var(--panel2) 60%); background-size: 200% 100%; animation: shimmer 1.4s infinite; }
+  @keyframes shimmer { to { background-position: -200% 0; } }
+  .skeleton.row { height: 18px; margin: 10px 0; }
+
+  .heartbeat-age { color: var(--muted); font-size: 11px; font-family: var(--mono); }
+  .agent-status { display: flex; align-items: center; gap: 10px; padding: 6px 0; }
+  .code-block { font-family: var(--mono); font-size: 12px; }
+  .divider { border: 0; border-top: 1px solid var(--border); margin: 14px 0; }
+
+  /* mobile collapse */
+  @media (max-width: 768px) {
+    .shell { padding: 0 14px 60px; }
+    .metrics-hero, .charts-band, .workbench { grid-template-columns: 1fr; }
+    .chat-msg { max-width: 92%; }
+    .appbar { gap: 10px; }
+  }
 </style>
 </head>
 <body>
-<header>
-  <h1>🛡️ SOC Triage · Multi-SIEM Dashboard</h1>
-  <span class="pill" id="health"></span>
-  <span class="pill">connections <b id="conn-count">0</b></span>
-</header>
+<div class="shell">
 
-<form id="add-form">
-  <div class="row">
-    <div class="field" style="min-width:140px;">
-      <label for="p-name">Provider name</label>
-      <input id="p-name" placeholder="e.g. Prod Splunk" required>
-    </div>
-    <div class="field" style="min-width:220px;">
-      <label for="p-platform">Platform</label>
-      <select id="p-platform"></select>
-      <small style="color:var(--muted); font-size:11px;" id="platform-desc"></small>
-    </div>
-    <div class="field" style="min-width:120px;">
-      <label>&nbsp;</label>
-      <button type="submit" class="btn primary" id="add-btn">+ Add provider</button>
-    </div>
-  </div>
-  <div id="dynamic-fields"></div>
-</form>
-
-<div class="grid" id="providers"></div>
-
-<!-- Chat panel -->
-<div class="card">
-  <div class="top">
-    <div class="title">💬 SOC Chat Assistant</div>
-    <div class="meta">R/W lookup tables · SIEM enrichment</div>
-  </div>
-  <div class="panel open" id="panel-chat">
-    <div class="chat-wrap" id="chat-wrap"></div>
-    <div style="margin-top:8px">
-      <label>Provider (optional — for SIEM-aware questions)</label>
-      <select id="chat-provider" style="width:100%">
-        <option value="">(none)</option>
-      </select>
-    </div>
-    <div class="chat-input" style="margin-top:6px">
-      <input id="chat-input" placeholder="e.g. 'what's the status of alert ...'" />
-      <button class="btn primary" onclick="sendChat()">Send</button>
-    </div>
-    <div class="actions" style="margin-top:6px">
-      <button class="btn" onclick="loadChatHistory()">History</button>
-      <button class="btn danger" onclick="clearChat()">Clear</button>
-    </div>
-  </div>
-</div>
-
-<!-- Lookup tables panel -->
-<div class="card">
-  <div class="top">
-    <div class="title">📋 Lookup Tables</div>
-    <div class="meta">CRUD · threat intel · watchlists</div>
-  </div>
-  <div class="panel" id="panel-lookup">
-    <div id="lookup-list"><div class="empty">No tables loaded.</div></div>
-    <div style="margin-top:10px; border-top:1px solid var(--border); padding-top:10px">
-      <h4>Create / Manage</h4>
-      <div class="lookup-row">
-        <input id="lookup-name" placeholder="Table name" style="flex:2" />
-        <input id="lookup-desc" placeholder="Description" style="flex:3" />
-        <button class="btn primary" onclick="createLookupTable()">Create</button>
-      </div>
-      <div class="lookup-row" id="lookup-entry-row" style="display:none">
-        <input id="lookup-key" placeholder="Key" style="flex:1" />
-        <input id="lookup-value" placeholder='{"value": "..."}' style="flex:2" />
-        <button class="btn" onclick="upsertLookupEntry()">Upsert</button>
-        <button class="btn danger" onclick="deleteLookupEntry()">Del</button>
-      </div>
-      <div class="actions" style="margin-top:6px">
-        <button class="btn" onclick="loadLookupTables()">Refresh</button>
+  <div class="appbar">
+    <div class="brand">
+      <span class="brand-mark">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4 5.5v5.2c0 5 3.4 9.6 8 10.8 4.6-1.2 8-5.8 8-10.8V5.5L12 2Z"/><path d="m9.2 12 2 2 3.6-3.9"/></svg>
+      </span>
+      <div>
+        <b>SOC Triage</b>
+        <small>Analyst L1 · tri · verify · escalate</small>
       </div>
     </div>
+    <nav class="nav" id="nav">
+      <button data-view="dashboard" class="active">Dashboard</button>
+      <button data-view="chat">Chat</button>
+      <button data-view="watchlist">Watchlist</button>
+      <button data-view="watcher">Overnight watcher</button>
+      <button data-view="settings">Settings</button>
+    </nav>
+    <span style="flex:1"></span>
+    <span class="pill" id="health">Connecting…</span>
+    <span class="pill">connections <b id="conn-count">0</b></span>
   </div>
-</div>
 
-<!-- Agent control panel -->
-<div class="card">
-  <div class="top">
-    <div class="title">🤖 Overnight Watcher</div>
-    <div class="meta">run.py · start / stop / heartbeat</div>
-  </div>
-  <div class="panel" id="panel-agent">
-    <div class="agent-status" id="agent-status-row">
-      <span class="dot" id="agent-dot"></span>
-      <span id="agent-state">Checking...</span>
+  <!-- ============ DASHBOARD / METRICS ============ -->
+  <section class="view active" id="view-dashboard">
+    <div class="metrics-hero">
+      <div class="metric">
+        <div class="k">Total alerts triaged</div>
+        <div class="v" id="m-total">–</div>
+        <div class="s">from data/triage_log.jsonl</div>
+      </div>
+      <div class="metric">
+        <div class="k">Needs human review</div>
+        <div class="v" id="m-review">–</div>
+        <div class="s">routed to analyst queue</div>
+      </div>
+      <div class="metric">
+        <div class="k">Analyst agreement</div>
+        <div class="v" id="m-agree">–</div>
+        <div class="s">feedback_cli.py reviews</div>
+      </div>
     </div>
-    <div class="meta" id="agent-meta"></div>
-    <div class="actions" style="margin-top:8px">
-      <button class="btn primary" id="agent-start-btn" onclick="agentStart()">Start</button>
-      <button class="btn danger" id="agent-stop-btn" onclick="agentStop()">Stop</button>
-      <button class="btn" onclick="agentRefresh()">Refresh status</button>
+
+    <div class="charts-band">
+      <div class="chart-card">
+        <h3>Verdicts by day</h3>
+        <canvas id="chart-verdicts-by-day" height="190"></canvas>
+      </div>
+      <div class="chart-card">
+        <h3>Confidence distribution</h3>
+        <canvas id="chart-confidence" height="190"></canvas>
+      </div>
     </div>
-    <div class="meta" style="margin-top:6px; font-size:11px">
-      💡 Stop-file kill switch: creates data/agent_stop.txt so the watcher exits cleanly on its next cycle.
+
+    <div class="charts-band">
+      <div class="chart-card">
+        <h3>Top triggered rules</h3>
+        <div id="metrics-rules-table"><div class="empty">No rule matches logged yet.</div></div>
+      </div>
+      <div class="chart-card">
+        <h3>By SIEM provider</h3>
+        <div id="metrics-provider-table"><div class="empty">No triaged alerts logged yet.</div></div>
+      </div>
     </div>
-  </div>
-</div>
+
+    <div class="section-label">Verdict mix</div>
+    <div id="verdict-pills" class="actions" style="gap:8px;"></div>
+
+    <div class="section-label">Cases — alerts grouped by shared host / user</div>
+    <div class="row" style="align-items:flex-end; margin-bottom:10px;">
+      <div class="field" style="min-width:130px; max-width:160px;">
+        <label for="case-window">Window (minutes)</label>
+        <input id="case-window" type="number" value="30">
+      </div>
+      <div class="field" style="min-width:150px; max-width:190px;">
+        <label for="case-min-alerts">Min alerts</label>
+        <select id="case-min-alerts">
+          <option value="1">1 (show all)</option>
+          <option value="2" selected>2+ (clusters only)</option>
+          <option value="3">3+</option>
+        </select>
+      </div>
+      <button class="btn primary" onclick="loadCases()">Load cases</button>
+    </div>
+    <div class="card top-hairline" id="cases-card">
+      <div class="top">
+        <div class="title">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/></svg>
+          Case groups
+        </div>
+      </div>
+      <div id="cases-list"><div class="empty">Click "Load cases" to group recent alerts.</div></div>
+    </div>
+  </section>
+
+  <!-- ============ CHAT ============ -->
+  <section class="view" id="view-chat">
+    <div class="chat-shell">
+      <div class="card" style="margin-top:14px; background:transparent; border:0; padding:0;">
+        <div class="top" style="margin-bottom:4px;">
+          <div class="title">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a8 8 0 0 1-8 8H4l2.2-2.6A8 8 0 1 1 21 12Z"/></svg>
+            Ask the analyst
+          </div>
+          <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+            <label for="chat-provider" style="margin:0;">SIEM context</label>
+            <select id="chat-provider" style="min-width:200px;">
+              <option value="">(none)</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div class="chips" id="chat-chips"></div>
+
+      <div class="chat-stage" id="chat-wrap">
+        <div class="chat-msg agent" id="chat-intro">
+          <div class="who"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4 5.5v5.2c0 5 3.4 9.6 8 10.8 4.6-1.2 8-5.8 8-10.8V5.5L12 2Z"/></svg>analyst · online</div>
+          Ask me anything about the alerts in your queue — verdicts, IOCs, lookup tables, or what to do next.
+        </div>
+      </div>
+
+      <div class="chat-bar">
+        <textarea id="chat-input" rows="1" placeholder="e.g. summarize today's critical alerts, or enrich 185.220.101.7" style="flex:1"></textarea>
+        <div class="actions">
+          <button class="btn" onclick="loadChatHistory()" title="Load history">History</button>
+          <button class="btn danger" onclick="clearChat()" title="Clear thread">Clear</button>
+          <button class="btn primary" onclick="sendChat()">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m22 2-11 11M22 2l-7 20-4-9-9-4 20-7Z"/></svg>
+            Send
+          </button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ WATCHLIST (lookup + rules) ============ -->
+  <section class="view" id="view-watchlist">
+    <div class="workbench">
+      <div class="stack">
+        <div class="card">
+          <div class="top">
+            <div class="title">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16v16H4z"/><path d="M4 9h16M9 4v16"/></svg>
+              Lookup tables
+            </div>
+            <button class="btn" onclick="loadLookupTables()">Refresh</button>
+          </div>
+          <div id="lookup-list"><div class="empty">No tables loaded.</div></div>
+          <hr class="divider">
+          <div class="field" style="margin-bottom:10px;">
+            <label for="lookup-name">Table name</label>
+            <input id="lookup-name" placeholder="e.g. known_bad_iocs">
+          </div>
+          <div class="field" style="margin-bottom:10px;">
+            <label for="lookup-desc">Description</label>
+            <input id="lookup-desc" placeholder="optional">
+          </div>
+          <button class="btn primary" onclick="createLookupTable()">Create table</button>
+          <hr class="divider">
+          <div class="lookup-row" id="lookup-entry-row" style="display:none; flex-wrap:wrap;">
+            <input id="lookup-key" placeholder="Key" style="flex:1; min-width:110px;">
+            <input id="lookup-value" placeholder='{"value": "..."}' style="flex:2; min-width:140px;">
+            <button class="btn" onclick="upsertLookupEntry()">Upsert</button>
+            <button class="btn danger" onclick="deleteLookupEntry()">Del</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="stack">
+        <div class="card">
+          <div class="top">
+            <div class="title">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></svg>
+              Alert rules
+            </div>
+            <button class="btn" onclick="loadRules()">Refresh list</button>
+          </div>
+          <div id="rules-list"><div class="empty">No rules loaded.</div></div>
+        </div>
+
+        <div class="card" style="margin-top:14px;">
+          <div class="top">
+            <div class="title" id="rule-form-heading">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+              New rule
+            </div>
+          </div>
+          <div class="row">
+            <div class="field" style="min-width:200px; flex:2;">
+              <label for="rule-name">Name</label>
+              <input id="rule-name" placeholder="e.g. Brute force from known-bad ASN">
+            </div>
+            <div class="field" style="min-width:200px; flex:3;">
+              <label for="rule-desc">Description</label>
+              <input id="rule-desc" placeholder="optional">
+            </div>
+          </div>
+          <div class="row" style="margin-top:10px;">
+            <div class="field" style="min-width:110px;">
+              <label for="rule-mode">Match</label>
+              <select id="rule-mode"><option value="all">ALL conditions</option><option value="any">ANY condition</option></select>
+            </div>
+            <div class="field" style="min-width:100px;">
+              <label for="rule-enabled">Enabled</label>
+              <select id="rule-enabled"><option value="true">true</option><option value="false">false</option></select>
+            </div>
+          </div>
+          <div style="margin-top:12px;">
+            <label>Conditions</label>
+            <div id="rule-conditions" style="margin-top:6px;"></div>
+            <button type="button" class="btn" onclick="addConditionRow()" style="margin-top:6px">+ Condition</button>
+          </div>
+          <div class="row" style="margin-top:12px;">
+            <div class="field" style="min-width:100px;">
+              <label for="rule-threshold-on">Threshold</label>
+              <select id="rule-threshold-on" onchange="toggleThresholdFields()"><option value="false">off</option><option value="true">on</option></select>
+            </div>
+            <div class="field" style="min-width:200px;" id="rule-threshold-fields-wrap">
+              <label>&nbsp;</label>
+              <div style="display:flex; gap:6px;">
+                <input id="rule-group-by" placeholder="group_by field, e.g. src_ip" style="flex:1.4" disabled>
+                <input id="rule-window" type="number" placeholder="window (min)" style="flex:1" disabled>
+                <input id="rule-count" type="number" placeholder="count" style="flex:.8" disabled>
+              </div>
+            </div>
+          </div>
+          <div class="row" style="margin-top:12px;">
+            <div class="field" style="min-width:150px;">
+              <label for="rule-tag">Action: tag</label>
+              <input id="rule-tag" placeholder="e.g. credential_stuffing">
+            </div>
+            <div class="field" style="min-width:110px;">
+              <label for="rule-escalate">Escalate?</label>
+              <select id="rule-escalate"><option value="false">false</option><option value="true">true</option></select>
+            </div>
+            <div class="field" style="min-width:170px; flex:1;">
+              <label for="rule-notify">Action: notify (optional)</label>
+              <input id="rule-notify" placeholder="e.g. #soc-alerts">
+            </div>
+          </div>
+          <div class="actions" style="margin-top:12px;">
+            <button class="btn primary" id="rule-save-btn" onclick="saveRule()">Save rule</button>
+            <button class="btn" onclick="resetRuleForm()">Clear form</button>
+          </div>
+          <hr class="divider">
+          <div class="row" style="align-items:flex-end;">
+            <div class="field" style="min-width:220px; flex:1;">
+              <label for="rule-test-alert">Test against a sample alert (JSON) — dry run, never affects saved threshold counts</label>
+              <textarea id="rule-test-alert" rows="3" placeholder='{"alert_id": "SPLK-1", "severity": "high", "src_ip": "185.220.101.7", "raw_fields": {"mfa_satisfied": false}}'></textarea>
+            </div>
+            <button class="btn" onclick="testRuleForm()">Test</button>
+            <button class="btn" onclick="exportRules()">Export</button>
+            <button class="btn" onclick="$('rule-import-file').click()">Import…</button>
+            <input type="file" id="rule-import-file" accept="application/json" style="display:none" onchange="importRulesFromFile(this.files[0])">
+          </div>
+          <label for="rule-import-overwrite" style="display:flex; align-items:center; gap:6px; margin-top:8px; font-size:12px; color:var(--muted);">
+            <input type="checkbox" id="rule-import-overwrite" style="width:auto;"> Overwrite existing rules with the same name (default: skip conflicts)
+          </label>
+          <div id="rule-import-result" class="meta" style="margin-top:4px;"></div>
+          <pre class="detail" id="rule-test-result" style="margin-top:10px;"></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ OVERNIGHT WATCHER ============ -->
+  <section class="view" id="view-watcher">
+    <div class="metrics-hero" style="grid-template-columns: 1fr;">
+      <div class="card" style="max-width:640px;">
+        <div class="top">
+          <div class="title">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M9 9h6v6H9z"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3"/></svg>
+            Overnight watcher
+          </div>
+          <span class="pill">run.py</span>
+        </div>
+        <div class="agent-status">
+          <span class="dot" id="agent-dot"></span>
+          <span id="agent-state" style="font-weight:600;">Checking…</span>
+        </div>
+        <div class="meta" id="agent-meta" style="margin-top:6px; font-family:var(--mono); font-size:11.5px;"></div>
+        <div class="actions" style="margin-top:14px;">
+          <button class="btn primary" id="agent-start-btn" onclick="agentStart()">Start watcher</button>
+          <button class="btn danger" id="agent-stop-btn" onclick="agentStop()" disabled>Stop</button>
+          <button class="btn" onclick="agentRefresh()">Refresh status</button>
+        </div>
+        <p class="meta" style="margin-top:14px; font-size:11.5px; max-width:46ch;">
+          Stop-file kill switch: a stop request writes data/agent_stop.txt so the watcher
+          exits cleanly at the end of its current cycle. Heartbeats are written each poll.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ SETTINGS (API keys + SIEM) ============ -->
+  <section class="view" id="view-settings">
+    <div class="section-label">API keys &amp; environment</div>
+    <div class="card" id="api-keys-card">
+      <div class="top">
+        <div class="title">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="4"/><path d="m10.8 12.2 9-9M14 9l3 3M17.5 5.5 20 8"/></svg>
+          API keys
+        </div>
+        <span class="badge env">from .env · masked</span>
+      </div>
+      <div id="api-keys-list"><div class="empty">Loading…</div></div>
+    </div>
+
+    <div class="section-label">SIEM connections</div>
+    <div class="card top-hairline" style="margin-bottom:14px;">
+      <div class="top">
+        <div class="title">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5 6h1l3.5 6M13 6l3.5 6H19"/><path d="M2 12v5h20v-5"/></svg>
+          Add a connection
+        </div>
+        <span class="meta">live log sources · no mock entries</span>
+      </div>
+      <form id="add-form">
+        <div class="row">
+          <div class="field" style="min-width:150px; max-width:240px;">
+            <label for="p-name">Provider name</label>
+            <input id="p-name" placeholder="e.g. Prod Splunk" required>
+          </div>
+          <div class="field" style="min-width:220px;">
+            <label for="p-platform">Platform</label>
+            <select id="p-platform"></select>
+            <small style="color:var(--muted); font-size:11px;" id="platform-desc"></small>
+          </div>
+          <div class="field" style="min-width:130px; max-width:170px;">
+            <label>&nbsp;</label>
+            <button type="submit" class="btn primary" id="add-btn">+ Add provider</button>
+          </div>
+        </div>
+        <div id="dynamic-fields"></div>
+      </form>
+    </div>
+    <div class="grid" id="providers" style="display:flex; flex-direction:column; gap:14px;"></div>
+  </section>
+
+</div><!-- /shell -->
 
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
 
-let PLATFORMS = {};     // platform -> {label, description, fields[]}
-let PROVIDERS = [];     // provider list
-const CONFIG_LABEL = {}; // cache platform field labels for summaries
+let PLATFORMS = {};      // platform -> {label, description, fields[]}
+let PROVIDERS = [];      // provider list (env + stored, filtered of mock)
+let CONFIG_LABEL = {};   // cache platform field labels for summaries
+let DASHBOARD_TOKEN = "";
+
+(function initToken() {
+  const url = new URL(window.location.href);
+  const fromUrl = url.searchParams.get("token");
+  if (fromUrl) {
+    DASHBOARD_TOKEN = fromUrl;
+    try { sessionStorage.setItem("dashboard_token", fromUrl); } catch (_) {}
+    url.searchParams.delete("token");
+    window.history.replaceState({}, "", url.toString());
+  } else {
+    try { DASHBOARD_TOKEN = sessionStorage.getItem("dashboard_token") || ""; } catch (_) { DASHBOARD_TOKEN = ""; }
+  }
+})();
 
 async function api(path, opts) {
-  const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts });
+  const headers = { "Content-Type": "application/json" };
+  if (DASHBOARD_TOKEN) headers["Authorization"] = "Bearer " + DASHBOARD_TOKEN;
+  const res = await fetch(path, { headers, ...opts });
   let body = null;
-  try { body = await res.json(); } catch (_) { /* non-json */ }
+  try { body = await res.json(); } catch (_) {}
   if (!res.ok) throw new Error((body && body.error) || res.statusText);
   return body;
 }
@@ -197,11 +641,23 @@ function toast(msg, ok = false) {
   setTimeout(() => t.remove(), 5000);
 }
 
+/* ---------------- view switching ---------------- */
+function showView(name) {
+  for (const b of document.querySelectorAll("#nav button")) b.classList.toggle("active", b.dataset.view === name);
+  for (const s of document.querySelectorAll(".view")) s.classList.toggle("active", s.id === "view-" + name);
+  if (name === "watchlist") { loadLookupTables(); loadRules(); }
+  if (name === "settings") { renderApiKeys(); renderProviders(); }
+  if (name === "dashboard") { loadMetrics(); loadCases(); }
+  if (name === "watcher") { agentRefresh(); }
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+for (const b of document.querySelectorAll("#nav button")) b.addEventListener("click", () => showView(b.dataset.view));
+
 /* ---------------- health / platforms ---------------- */
 async function loadHealth() {
   try {
     const h = await api("/api/health");
-    $("health").innerHTML = `LLM <b>${h.llm_provider}</b> · SIEM <b>${h.siem_provider}</b> · mock <b>${h.mock_mode}</b>`;
+    $("health").innerHTML = `LLM <b>${h.llm_provider}</b> · SIEM <b>${h.siem_provider}</b>`;
   } catch (e) { $("health").textContent = "API unreachable: " + e.message; }
 }
 
@@ -211,6 +667,7 @@ async function loadPlatforms() {
   const sel = $("p-platform");
   sel.innerHTML = "";
   for (const p of platforms) {
+    if (p.platform === "mock") continue; // never offer mock in the console
     PLATFORMS[p.platform] = p;
     const opt = document.createElement("option");
     opt.value = p.platform;
@@ -251,14 +708,24 @@ function renderDynamicFields() {
 }
 $("p-platform").addEventListener("change", renderDynamicFields);
 
-/* ---------------- providers ---------------- */
+/* ---------------- providers (live only) ---------------- */
 async function loadProviders() {
   const { providers } = await api("/api/providers");
-  PROVIDERS = providers;
-  $("conn-count").textContent = providers.length;
+  PROVIDERS = providers.filter(p => p.platform !== "mock"); // no mock in the console
+  $("conn-count").textContent = PROVIDERS.length;
+  renderProviders();
+  renderChatProviders();
+  renderApiKeys();
+}
+
+function renderProviders() {
   const grid = $("providers");
   grid.innerHTML = "";
-  for (const p of providers) grid.appendChild(providerCard(p));
+  if (!PROVIDERS.length) {
+    grid.innerHTML = '<div class="card"><div class="empty">No live connections yet — add one in the form above.</div></div>';
+    return;
+  }
+  for (const p of PROVIDERS) grid.appendChild(providerCard(p));
 }
 
 function providerCard(p) {
@@ -268,32 +735,59 @@ function providerCard(p) {
 
   const meta = PLATFORMS[p.platform] || {};
   const sourceTag = p.source === "env" ? `<span class="badge env">.env</span>` : "";
-  const mockTag = p.platform === "mock" ? `<span class="badge mock">mock</span>` : "";
 
+  const secrets = (meta.fields || []).filter(f => f.secret);
   const summary = Object.entries(p.config || {})
     .filter(([k, v]) => v && k !== "alerts_file")
-    .map(([k, v]) => `<li><b>${CONFIG_LABEL[k] || k}:</b> ${(meta.fields || []).find(f => f.key === k)?.secret ? "••••••••" : v}</li>`)
+    .map(([k, v]) => `<li><b>${CONFIG_LABEL[k] || k}:</b> ${(meta.fields || []).find(f => f.key === k)?.secret ? "••••••••" : `<span class="code-block">${esc(v)}</span>`}</li>`)
     .join("");
 
+  const revealBtn = secrets.length
+    ? `<button class="btn" onclick="toggleSecrets('${p.id}')" title="Reveal / mask keys">Keys</button>`
+    : "";
+
   card.innerHTML = `
-    <div class="top">
-      <div>
-        <div class="title">${esc(p.name)}</div>
-        <div class="meta">${meta.label || p.platform} ${sourceTag} ${mockTag}</div>
+    <div style="display:flex; align-items:center; gap:12px;">
+      <div class="brand-mark" style="width:30px;height:30px;border-radius:8px;">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a8 8 0 0 1-8 8H4l2.2-2.6A8 8 0 1 1 21 12Z"/></svg>
+      </div>
+      <div style="flex:1;">
+        <div class="title" style="margin:0;">${esc(p.name)}</div>
+        <div class="meta">${meta.label || p.platform} ${sourceTag}</div>
       </div>
       <span class="badge">${p.platform}</span>
     </div>
-    <div class="status"><span class="dot" id="dot-${p.id}"></span><span id="status-${p.id}">not tested</span></div>
-    <ul class="summary">${summary || '<li class="empty">no extra config</li>'}</ul>
+    <div class="status" style="margin:10px 0 4px;"><span class="dot" id="dot-${p.id}"></span><span id="status-${p.id}">not tested</span></div>
+    <ul class="summary" style="list-style:none; font-size:12px; color:var(--muted); margin:6px 0 10px;">${summary || '<li class="empty">no extra config</li>'}</ul>
     <div class="actions">
       <button class="btn" onclick="testConn('${p.id}')">Test</button>
       <button class="btn" onclick="fetchAlerts('${p.id}')">Alerts</button>
       <button class="btn" onclick="runTriage('${p.id}')">Run triage</button>
+      ${revealBtn}
       ${p.source !== "env" ? `<button class="btn danger" onclick="removeConn('${p.id}')">Delete</button>` : ""}
     </div>
-    <div class="panel" id="panel-${p.id}"></div>
+    <div class="panel" id="panel-${p.id}" style="margin-top:10px;"></div>
   `;
+  // stash secrets for the Keys toggle
+  card._secrets = Object.fromEntries(Object.entries(p.config || {}).filter(([k, v]) => (meta.fields || []).find(f => f.key === k)?.secret));
   return card;
+}
+
+function toggleSecrets(id) {
+  const card = document.querySelector(`.card[data-id="${id}"]`);
+  if (!card) return;
+  card._secretsShown = !card._secretsShown;
+  const p = PROVIDERS.find(x => x.id === id);
+  if (!p) return;
+  const meta = PLATFORMS[p.platform] || {};
+  const summary = Object.entries(p.config || {})
+    .filter(([k, v]) => v && k !== "alerts_file")
+    .map(([k, v]) => `<li><b>${CONFIG_LABEL[k] || k}:</b> ${(meta.fields || []).find(f => f.key === k)?.secret
+      ? (card._secretsShown ? `<span class="code-block">${esc(v)}</span>` : "••••••••")
+      : `<span class="code-block">${esc(v)}</span>`}</li>`)
+    .join("");
+  const ul = card.querySelector(".summary");
+  if (ul) ul.innerHTML = summary || '<li class="empty">no extra config</li>';
 }
 
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
@@ -308,7 +802,7 @@ async function testConn(id) {
   setStatus(id, false, "testing…");
   try {
     const r = await api(`/api/providers/${id}/test`, { method: "POST" });
-    setStatus(id, r.ok, (r.ok ? "✓ " : "✗ ") + `${r.latency_ms}ms · ${r.detail}`);
+    setStatus(id, r.ok, (r.ok ? "OK " : "FAIL ") + `${r.latency_ms}ms · ${r.detail}`);
     toast(r.ok ? `Test OK (${r.latency_ms}ms)` : `Test failed: ${r.detail}`, r.ok);
   } catch (e) { setStatus(id, false, "test failed"); toast(e.message); }
 }
@@ -316,51 +810,51 @@ async function testConn(id) {
 function panel(id, html) {
   const p = $("panel-" + id);
   p.innerHTML = html;
-  p.classList.add("open");
+  p.style.display = "block";
 }
 
 async function fetchAlerts(id) {
-  panel(id, '<h4>Loading alerts…</h4>');
+  panel(id, '<h4 style="margin-bottom:8px;">Loading alerts…</h4><div class="skeleton row"></div><div class="skeleton row"></div>');
   try {
     const r = await api(`/api/providers/${id}/alerts?limit=50`);
-    if (!r.count) return panel(id, `<h4>Alerts</h4><div class="empty">No alerts returned.</div>`);
-    panel(id, `<h4>${esc(r.provider_name)} · ${r.count} alerts (showing ${Math.min(50, r.alerts.length)})</h4>` +
+    if (!r.count) return panel(id, `<h4 style="margin-bottom:6px;">Alerts</h4><div class="empty">No alerts returned.</div>`);
+    panel(id, `<h4 style="margin-bottom:8px;">${esc(r.provider_name)} · ${r.count} alerts (showing ${Math.min(50, r.alerts.length)})</h4>` +
       alertTable(r.alerts));
-  } catch (e) { panel(id, `<h4>Alerts</h4><pre class="detail">${esc(e.message)}</pre>`); }
+  } catch (e) { panel(id, `<h4 style="margin-bottom:6px;">Alerts</h4><pre class="detail">${esc(e.message)}</pre>`); }
 }
 
 function alertTable(alerts) {
   const rows = alerts.map(a => `
     <tr>
-      <td>${esc(a.alert_id || "-")}</td>
+      <td class="mono">${esc(a.alert_id || "-")}</td>
       <td class="sev ${String(a.severity || "").toLowerCase()}">${esc(a.severity || "-")}</td>
       <td>${esc(a.rule_name || "-")}</td>
       <td>${esc(a.host || "-")}</td>
       <td>${esc(a.user || "-")}</td>
-      <td>${esc(a.src_ip || "-")}</td>
+      <td class="mono">${esc(a.src_ip || "-")}</td>
     </tr>`).join("");
   return `<table><thead><tr><th>ID</th><th>Sev</th><th>Rule</th><th>Host</th><th>User</th><th>Src IP</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 async function runTriage(id) {
-  panel(id, '<h4>Triaging (this can take a while)…</h4>');
+  panel(id, '<h4 style="margin-bottom:8px;">Triaging, this can take a while…</h4><div class="skeleton row"></div><div class="skeleton row"></div>');
   try {
     const r = await api(`/api/providers/${id}/triage`, { method: "POST" });
-    if (r.triaged === 0) return panel(id, `<h4>Triage</h4><div class="empty">${esc(r.note || "No alerts.")}</div>`);
+    if (r.triaged === 0) return panel(id, `<h4 style="margin-bottom:6px;">Triage</h4><div class="empty">${esc(r.note || "No alerts.")}</div>`);
     const rows = r.results.map(x => x.error
-      ? `<tr><td>${esc(x.alert_id)}</td><td colspan="5" style="color:var(--red)">${esc(x.error)}</td></tr>`
+      ? `<tr><td class="mono">${esc(x.alert_id)}</td><td colspan="5" style="color:var(--red)">${esc(x.error)}</td></tr>`
       : `<tr>
-          <td>${esc(x.alert_id)}</td>
+          <td class="mono">${esc(x.alert_id)}</td>
           <td>${esc(x.verdict)}</td>
-          <td>${Number(x.confidence).toFixed(2)}</td>
+          <td class="mono">${Number(x.confidence).toFixed(2)}</td>
           <td>${esc(x.recommended_action)}</td>
-          <td>${x.needs_human_review ? "👤 human review" : "auto-closeable"}</td>
+          <td>${x.needs_human_review ? '<span class="badge env">human review</span>' : '<span class="badge">auto-closeable</span>'}</td>
           <td>${esc(x.rationale)}</td>
         </tr>`).join("");
-    panel(id, `<h4>${esc(r.provider_name)} · triaged ${r.triaged} alert(s) → data/triage_log.jsonl</h4>` +
+    panel(id, `<h4 style="margin-bottom:8px;">${esc(r.provider_name)} · triaged ${r.triaged} alert(s) → data/triage_log.jsonl</h4>` +
       `<table><thead><tr><th>Alert ID</th><th>Verdict</th><th>Conf</th><th>Action</th><th>Routing</th><th>Rationale</th></tr></thead><tbody>${rows}</tbody></table>`);
     toast(`Triaged ${r.triaged} alert(s) from ${r.provider_name}`, true);
-  } catch (e) { panel(id, `<h4>Triage</h4><pre class="detail">${esc(e.message)}</pre>`); toast(e.message); }
+  } catch (e) { panel(id, `<h4 style="margin-bottom:6px;">Triage</h4><pre class="detail">${esc(e.message)}</pre>`); toast(e.message); }
 }
 
 async function removeConn(id) {
@@ -389,8 +883,223 @@ $("add-form").addEventListener("submit", async (ev) => {
   } catch (e) { toast(e.message); }
 });
 
-/* ---------------- chat ---------------- */
+/* ---------------- API keys (env providers, masked w/ reveal) ---------------- */
+function renderApiKeys() {
+  const el = $("api-keys-list");
+  const env = PROVIDERS.filter(p => p.source === "env");
+  if (!env.length) {
+    el.innerHTML = '<div class="empty">No API keys from .env are exposed. Keys are set in the server\u2019s .env file and used by env-scoped connections.</div>';
+    return;
+  }
+  const groups = env.map(p => {
+    const rows = Object.entries(p.config || {})
+      .filter(([k, v]) => v && (PLATFORMS[p.platform]?.fields || []).find(f => f.key === k)?.secret)
+      .map(([k, v]) => `<div class="list-row">
+          <div class="kv"><b>${esc(CONFIG_LABEL[k] || k)}</b><span class="meta">${esc(p.name)}</span></div>
+          <code class="code-block" style="color:var(--muted);">••••••••${String(v).slice(-4)}</code>
+        </div>`).join("");
+    return rows
+      ? `<div class="list-row" style="border-top:1px solid var(--border);"><div class="kv"><b>${esc(p.name)}</b><span class="badge env">.env</span></div></div>${rows}`
+      : "";
+  }).join("");
+  el.innerHTML = groups || '<div class="empty">No masked keys available.</div>';
+}
+
+/* ---------------- chat providers ---------------- */
+function renderChatProviders() {
+  const sel = $("chat-provider");
+  sel.innerHTML = '<option value="">(none)</option>';
+  for (const p of PROVIDERS) {
+    const opt = document.createElement("option");
+    opt.value = p.id;
+    opt.textContent = `${p.name} (${p.platform})`;
+    sel.appendChild(opt);
+  }
+}
+
+/* ---------------- metrics ---------------- */
+let VERDICT_CHART = null;
+let CONFIDENCE_CHART = null;
+const VERDICT_COLORS = { true_positive: "#f87171", false_positive: "#34d399", escalate: "#fbbf24", unknown: "#9aa1ab" };
+
+function pill(label, value) {
+  return `<span class="pill"><b>${esc(value)}</b> ${esc(label)}</span>`;
+}
+
+async function loadMetrics() {
+  const el = $("metrics-rules-table");
+  el.innerHTML = '<div class="skeleton row"></div><div class="skeleton row"></div><div class="skeleton row"></div>';
+  try {
+    const m = await api("/api/metrics");
+    renderMetricsSummary(m);
+    renderVerdictsByDayChart(m.verdict_by_day);
+    renderConfidenceChart(m.confidence_distribution);
+    renderRulesTable(m.top_rules);
+    renderProviderTable(m.by_provider);
+  } catch (e) { toast("Failed to load metrics: " + e.message); }
+}
+
+function renderMetricsSummary(m) {
+  $("m-total").textContent = m.total_alerts;
+  $("m-review").innerHTML = `${(m.needs_human_review_rate * 100).toFixed(0)}<small>%</small>`;
+  const aa = m.analyst_agreement;
+  $("m-agree").innerHTML = aa ? `${(aa.agreement_rate * 100).toFixed(0)}<small>%</small>` : "–";
+  const pills = [];
+  for (const [verdict, count] of Object.entries(m.verdict_totals || {})) {
+    pills.push(pill(verdict, count));
+  }
+  if (aa) {
+    for (const [name, s] of Object.entries(aa.by_analyst || {})) {
+      pills.push(pill(name, `${(s.agreement_rate * 100).toFixed(0)}% (${s.reviewed})`));
+    }
+  }
+  $("verdict-pills").innerHTML = pills.join("");
+}
+
+function renderVerdictsByDayChart(byDay) {
+  const canvas = $("chart-verdicts-by-day");
+  if (VERDICT_CHART) VERDICT_CHART.destroy();
+  const days = Object.keys(byDay || {}).sort();
+  const verdicts = [...new Set(days.flatMap(d => Object.keys(byDay[d])))];
+  const datasets = verdicts.map(v => ({
+    label: v,
+    data: days.map(d => byDay[d][v] || 0),
+    backgroundColor: VERDICT_COLORS[v] || "#9aa1ab",
+    borderRadius: 3,
+  }));
+  if (!days.length || typeof Chart === "undefined") return;
+  VERDICT_CHART = new Chart(canvas, {
+    type: "bar",
+    data: { labels: days, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        x: { stacked: true, ticks: { color: "#9aa1ab" }, grid: { color: "rgba(255,255,255,.05)" } },
+        y: { stacked: true, ticks: { color: "#9aa1ab" }, grid: { color: "rgba(255,255,255,.05)" }, beginAtZero: true },
+      },
+      plugins: { legend: { labels: { color: "#e9eaed", boxWidth: 10 } } },
+    },
+  });
+}
+
+function renderConfidenceChart(dist) {
+  const canvas = $("chart-confidence");
+  if (CONFIDENCE_CHART) CONFIDENCE_CHART.destroy();
+  const labels = Object.keys(dist || {});
+  const values = Object.values(dist || {});
+  if (!labels.length || typeof Chart === "undefined") return;
+  CONFIDENCE_CHART = new Chart(canvas, {
+    type: "bar",
+    data: { labels, datasets: [{ label: "alerts", data: values, backgroundColor: "rgba(52,211,153,.75)", borderRadius: 3 }] },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        x: { ticks: { color: "#9aa1ab" }, grid: { color: "rgba(255,255,255,.05)" } },
+        y: { ticks: { color: "#9aa1ab" }, grid: { color: "rgba(255,255,255,.05)" }, beginAtZero: true },
+      },
+      plugins: { legend: { display: false } },
+    },
+  });
+}
+
+function renderRulesTable(topRules) {
+  const el = $("metrics-rules-table");
+  if (!topRules || !topRules.length) {
+    el.innerHTML = '<div class="empty">No rule matches logged yet.</div>';
+    return;
+  }
+  const rows = topRules.map(r => `
+    <tr>
+      <td>${esc(r.name)}</td>
+      <td class="mono">${r.triggered}</td>
+      <td class="mono">${r.true_positive}</td>
+      <td class="mono">${(r.true_positive_rate * 100).toFixed(0)}%</td>
+    </tr>`).join("");
+  el.innerHTML = `<table><thead><tr><th>Rule</th><th>Triggered</th><th>TP</th><th>TP rate</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function renderProviderTable(byProvider) {
+  const el = $("metrics-provider-table");
+  const names = Object.keys(byProvider || {});
+  if (!names.length) {
+    el.innerHTML = '<div class="empty">No triaged alerts logged yet.</div>';
+    return;
+  }
+  const rows = names.map(name => {
+    const s = byProvider[name];
+    return `<tr><td>${esc(name)}</td><td class="mono">${s.count}</td><td class="mono">${(s.needs_review_rate * 100).toFixed(0)}%</td></tr>`;
+  }).join("");
+  el.innerHTML = `<table><thead><tr><th>Provider</th><th>Triaged</th><th>Needs review</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+/* ---------------- cases ---------------- */
+async function loadCases() {
+  const el = $("cases-list");
+  const windowMinutes = Number($("case-window").value || 30);
+  const minAlerts = Number($("case-min-alerts").value || 1);
+  el.innerHTML = '<div class="skeleton row"></div><div class="skeleton row"></div>';
+  try {
+    const r = await api(`/api/cases?window_minutes=${windowMinutes}&min_alerts=${minAlerts}`);
+    renderCasesList(r.cases);
+  } catch (e) {
+    el.innerHTML = `<div class="empty">Failed to load cases: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderCasesList(caseList) {
+  const el = $("cases-list");
+  if (!caseList || !caseList.length) {
+    el.innerHTML = '<div class="empty">No cases match this window / threshold.</div>';
+    return;
+  }
+  el.innerHTML = caseList.map(c => {
+    const verdictBadges = Object.entries(c.verdicts || {})
+      .map(([v, n]) => `<span class="badge ${v === "true_positive" ? "env" : ""}">${esc(v)} x${n}</span>`).join(" ");
+    const tagBadges = (c.rule_tags || []).map(t => `<span class="badge env">${esc(t)}</span>`).join(" ");
+    const label = c.host || c.user || "(no host / user)";
+    const first = new Date(c.first_seen * 1000).toLocaleString();
+    const last = new Date(c.last_seen * 1000).toLocaleString();
+    return `
+      <div class="list-row">
+        <div class="kv">
+          <b>${esc(label)}</b>
+          <div class="meta">${c.alert_count} alert(s) · ${esc(first)} → ${esc(last)}${c.needs_review_count ? ` · ${c.needs_review_count} need review` : ""}</div>
+        </div>
+        <div>
+          <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:4px;">${verdictBadges} ${tagBadges}</div>
+          <div class="meta">Alerts: ${c.alert_ids.map(esc).join(", ")}</div>
+        </div>
+      </div>`;
+  }).join("");
+}
+
+/* ---------------- chat (GPT style) ---------------- */
 let CHAT_HISTORY = [];
+const CHAT_SUGGESTIONS = [
+  "Summarize today's critical alerts",
+  "Enrich 185.220.101.7",
+  "Explain the last triage verdict",
+  "Which IOCs appear in lookup tables?",
+];
+
+function renderChatChips() {
+  const wrap = $("chat-chips");
+  wrap.innerHTML = "";
+  for (const s of CHAT_SUGGESTIONS) {
+    const c = document.createElement("button");
+    c.className = "chip";
+    c.textContent = s;
+    c.onclick = () => { $("chat-input").value = s; sendChat(); };
+    wrap.appendChild(c);
+  }
+}
+
+function autoGrow(el) {
+  el.style.height = "auto";
+  el.style.height = Math.min(el.scrollHeight, 140) + "px";
+}
 
 async function sendChat() {
   const input = $("chat-input");
@@ -398,12 +1107,13 @@ async function sendChat() {
   if (!msg) return;
   const providerId = $("chat-provider").value;
   input.value = "";
+  autoGrow(input);
   CHAT_HISTORY.push({ role: "user", content: msg });
   renderChatMessages();
   const wrap = $("chat-wrap");
   const loading = document.createElement("div");
   loading.className = "chat-msg agent";
-  loading.textContent = "...";
+  loading.innerHTML = `<div class="who">analyst · thinking</div><div class="typing"><i></i><i></i><i></i></div>`;
   wrap.appendChild(loading);
   wrap.scrollTop = wrap.scrollHeight;
   try {
@@ -413,13 +1123,14 @@ async function sendChat() {
     });
     loading.remove();
     CHAT_HISTORY.push({ role: "assistant", content: r.reply });
-    const replyEl = document.createElement("div");
-    replyEl.className = "chat-msg agent";
-    replyEl.textContent = r.reply;
-    wrap.appendChild(replyEl);
-    toast("Chat reply received", true);
+    renderChatMessages();
+    toast("Reply received", true);
   } catch (e) {
     loading.remove();
+    const el = document.createElement("div");
+    el.className = "chat-msg agent error";
+    el.textContent = "Chat failed: " + e.message;
+    wrap.appendChild(el);
     toast("Chat failed: " + e.message);
   }
   wrap.scrollTop = wrap.scrollHeight;
@@ -427,11 +1138,17 @@ async function sendChat() {
 
 function renderChatMessages() {
   const wrap = $("chat-wrap");
+  const intro = $("chat-intro");
   wrap.innerHTML = "";
+  if (intro) wrap.appendChild(intro);
   for (const m of CHAT_HISTORY) {
     const el = document.createElement("div");
     el.className = "chat-msg " + (m.role === "user" ? "user" : "agent");
-    el.textContent = m.content;
+    if (m.role === "agent") {
+      el.innerHTML = `<div class="who">analyst</div>` + esc(m.content);
+    } else {
+      el.textContent = m.content;
+    }
     wrap.appendChild(el);
   }
   wrap.scrollTop = wrap.scrollHeight;
@@ -441,25 +1158,18 @@ async function loadChatHistory() {
   try {
     const r = await api("/api/chat/history?limit=20");
     CHAT_HISTORY = [];
-    const wrap = $("chat-wrap");
-    wrap.innerHTML = "";
     for (const entry of r.entries) {
-      const userEl = document.createElement("div");
-      userEl.className = "chat-msg user";
-      userEl.textContent = entry.message;
-      wrap.appendChild(userEl);
-      const agentEl = document.createElement("div");
-      agentEl.className = "chat-msg agent";
-      agentEl.textContent = entry.reply;
-      wrap.appendChild(agentEl);
+      CHAT_HISTORY.push({ role: "user", content: entry.message });
+      CHAT_HISTORY.push({ role: "assistant", content: entry.reply });
     }
-    toast(`Loaded ${r.count} chat entry(ies)`, true);
+    renderChatMessages();
+    toast(`Loaded ${r.count} conversation entr${r.count === 1 ? "y" : "ies"}`, true);
   } catch (e) { toast("Failed to load chat history: " + e.message); }
 }
 
 function clearChat() {
   CHAT_HISTORY = [];
-  $("chat-wrap").innerHTML = "";
+  renderChatMessages();
 }
 
 $("chat-input").addEventListener("keydown", (e) => {
@@ -468,6 +1178,7 @@ $("chat-input").addEventListener("keydown", (e) => {
     sendChat();
   }
 });
+$("chat-input").addEventListener("input", () => autoGrow($("chat-input")));
 
 /* ---------------- lookup tables ---------------- */
 async function loadLookupTables() {
@@ -475,14 +1186,14 @@ async function loadLookupTables() {
     const r = await api("/api/lookup-tables");
     const list = $("lookup-list");
     if (!r.tables.length) {
-      list.innerHTML = '<div class="empty">No lookup tables yet. Create one above.</div>';
+      list.innerHTML = '<div class="empty">No lookup tables yet. Create one below.</div>';
       return;
     }
     const rows = r.tables.map(t => `
-      <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--border)">
-        <div>
+      <div class="list-row">
+        <div class="kv">
           <b>${esc(t.name)}</b>
-          <span class="meta" style="margin-left:8px">${t.entry_count} entries · updated ${t.updated || "?"}</span>
+          <span class="meta">${t.entry_count} entries · updated ${t.updated || "?"}</span>
         </div>
         <div class="actions">
           <button class="btn" onclick="showLookupEntries('${esc(t.name)}')">View</button>
@@ -498,10 +1209,11 @@ async function showLookupEntries(name) {
     const r = await api(`/api/lookup-tables/${encodeURIComponent(name)}`);
     const entries = r.table.entries || {};
     const rows = Object.entries(entries).map(([k, v]) => `
-      <div style="padding:4px 0;border-bottom:1px solid var(--border);font-size:11px">
-        <b>${esc(k)}</b>: <code>${esc(JSON.stringify(v))}</code>
+      <div class="list-row" style="padding:7px 2px;">
+        <div class="kv"><b>${esc(k)}</b></div>
+        <code class="code-block" style="color:var(--text);">${esc(JSON.stringify(v))}</code>
       </div>`).join("");
-    $("lookup-list").innerHTML = `<div style="margin-bottom:6px"><b>${esc(name)}</b> <button class="btn" onclick="loadLookupTables()">← back</button></div>${rows || '<div class="empty">No entries.</div>'}`;
+    $("lookup-list").innerHTML = `<div class="actions" style="margin-bottom:8px;"><button class="btn" onclick="loadLookupTables()"><span style="margin-right:2px;">←</span> back</button><b style="margin-left:6px;">${esc(name)}</b></div>${rows || '<div class="empty">No entries.</div>'}`;
     $("lookup-entry-row").style.display = "flex";
     $("lookup-name").value = name;
   } catch (e) { toast("Failed to load table entries: " + e.message); }
@@ -559,6 +1271,280 @@ async function deleteLookupTable(name) {
   } catch (e) { toast("Failed to delete: " + e.message); }
 }
 
+/* ---------------- alert rules ---------------- */
+let RULE_OPS = [];
+let RULE_CONDITIONS = [];
+let EDITING_RULE_ID = null;
+
+async function loadRuleOps() {
+  try {
+    const r = await api("/api/rules/ops");
+    RULE_OPS = r.ops;
+  } catch (e) { RULE_OPS = ["eq", "neq", "contains", "not_contains", "in", "not_in", "gt", "gte", "lt", "lte", "exists", "not_exists", "in_lookup", "regex"]; }
+}
+
+async function loadRules() {
+  try {
+    const r = await api("/api/rules");
+    const list = $("rules-list");
+    if (!r.rules.length) {
+      list.innerHTML = '<div class="empty">No rules yet. Build one below.</div>';
+      return;
+    }
+    const rows = r.rules.map(rule => {
+      const tag = rule.action && rule.action.tag ? `<span class="badge">${esc(rule.action.tag)}</span>` : "";
+      const esc_ = rule.action && rule.action.escalate ? `<span class="badge env">escalates</span>` : "";
+      const thr = rule.has_threshold ? `<span class="badge env">threshold</span>` : "";
+      const dis = rule.enabled ? "" : '<span class="badge env">disabled</span>';
+      return `
+      <div class="list-row">
+        <div class="kv">
+          <b>${esc(rule.name)}</b> ${tag} ${esc_} ${thr} ${dis}
+          <div class="meta">${rule.condition_count} condition(s) · updated ${rule.updated || "?"}</div>
+        </div>
+        <div class="actions">
+          <button class="btn" onclick="editRule('${rule.id}')">Edit</button>
+          <button class="btn" onclick="backtestRule('${rule.id}', '${esc(rule.name)}')">Backtest</button>
+          <button class="btn" onclick="toggleRuleEnabled('${rule.id}', ${!rule.enabled})">${rule.enabled ? "Disable" : "Enable"}</button>
+          <button class="btn danger" onclick="deleteRuleConfirm('${rule.id}')">Delete</button>
+        </div>
+      </div>`;
+    }).join("");
+    list.innerHTML = rows;
+  } catch (e) { toast("Failed to load rules: " + e.message); }
+}
+
+function conditionRow(idx, c) {
+  const opsOpts = RULE_OPS.map(op => `<option value="${op}" ${c.op === op ? "selected" : ""}>${op}</option>`).join("");
+  return `
+    <div class="lookup-row" data-idx="${idx}">
+      <input value="${esc(c.field || "")}" placeholder="field, e.g. severity or raw_fields.mfa_satisfied" style="flex:2" oninput="RULE_CONDITIONS[${idx}].field = this.value">
+      <select style="flex:1" onchange="RULE_CONDITIONS[${idx}].op = this.value">${opsOpts}</select>
+      <input value="${esc(typeof c.value === 'object' ? JSON.stringify(c.value) : (c.value ?? ''))}" placeholder='value (plain text, or ["a","b"] / lookup table name)' style="flex:2" oninput="RULE_CONDITIONS[${idx}].value = this.value">
+      <button class="btn danger" onclick="removeConditionRow(${idx})">Del</button>
+    </div>`;
+}
+
+function renderConditions() {
+  $("rule-conditions").innerHTML = RULE_CONDITIONS.length
+    ? RULE_CONDITIONS.map((c, i) => conditionRow(i, c)).join("")
+    : '<div class="empty">No conditions — a rule with none matches every alert (useful with a threshold only).</div>';
+}
+
+function addConditionRow() {
+  RULE_CONDITIONS.push({ field: "", op: RULE_OPS[0] || "eq", value: "" });
+  renderConditions();
+}
+
+function removeConditionRow(idx) {
+  RULE_CONDITIONS.splice(idx, 1);
+  renderConditions();
+}
+
+function toggleThresholdFields() {
+  const on = $("rule-threshold-on").value === "true";
+  for (const id of ["rule-group-by", "rule-window", "rule-count"]) $(id).disabled = !on;
+}
+
+function resetRuleForm() {
+  EDITING_RULE_ID = null;
+  $("rule-form-heading").textContent = "Rule";
+  $("rule-save-btn").textContent = "Save rule";
+  $("rule-name").value = "";
+  $("rule-desc").value = "";
+  $("rule-mode").value = "all";
+  $("rule-enabled").value = "true";
+  RULE_CONDITIONS = [];
+  renderConditions();
+  $("rule-threshold-on").value = "false";
+  toggleThresholdFields();
+  $("rule-group-by").value = "";
+  $("rule-window").value = "";
+  $("rule-count").value = "";
+  $("rule-tag").value = "";
+  $("rule-escalate").value = "false";
+  $("rule-notify").value = "";
+  $("rule-test-result").textContent = "";
+}
+
+function parseConditionValue(raw) {
+  const s = String(raw).trim();
+  if (s === "") return "";
+  try { return JSON.parse(s); } catch (_) { return s; }
+}
+
+function collectRuleFromForm() {
+  const threshold = $("rule-threshold-on").value === "true" ? {
+    group_by: $("rule-group-by").value.trim(),
+    window_minutes: Number($("rule-window").value || 15),
+    count: Number($("rule-count").value || 5),
+  } : null;
+  return {
+    name: $("rule-name").value.trim(),
+    description: $("rule-desc").value.trim(),
+    enabled: $("rule-enabled").value === "true",
+    match: {
+      mode: $("rule-mode").value,
+      conditions: RULE_CONDITIONS
+        .filter(c => c.field)
+        .map(c => ({ field: c.field, op: c.op, value: parseConditionValue(c.value) })),
+    },
+    threshold,
+    action: {
+      tag: $("rule-tag").value.trim(),
+      escalate: $("rule-escalate").value === "true",
+      notify: $("rule-notify").value.trim(),
+    },
+  };
+}
+
+async function editRule(id) {
+  try {
+    const r = await api(`/api/rules/${encodeURIComponent(id)}`);
+    const rule = r.rule;
+    EDITING_RULE_ID = id;
+    $("rule-form-heading").textContent = "Editing: " + rule.name;
+    $("rule-save-btn").textContent = "Update rule";
+    $("rule-name").value = rule.name || "";
+    $("rule-desc").value = rule.description || "";
+    $("rule-mode").value = (rule.match || {}).mode || "all";
+    $("rule-enabled").value = String(rule.enabled !== false);
+    RULE_CONDITIONS = ((rule.match || {}).conditions || []).map(c => ({ ...c }));
+    renderConditions();
+    const thr = rule.threshold;
+    $("rule-threshold-on").value = String(!!thr);
+    toggleThresholdFields();
+    $("rule-group-by").value = thr ? thr.group_by : "";
+    $("rule-window").value = thr ? thr.window_minutes : "";
+    $("rule-count").value = thr ? thr.count : "";
+    const action = rule.action || {};
+    $("rule-tag").value = action.tag || "";
+    $("rule-escalate").value = String(!!action.escalate);
+    $("rule-notify").value = action.notify || "";
+    $("rule-test-result").textContent = "";
+    if (window.innerWidth < 768) {
+      $("view-watchlist").scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  } catch (e) { toast("Failed to load rule: " + e.message); }
+}
+
+async function saveRule() {
+  const payload = collectRuleFromForm();
+  if (!payload.name) { toast("Rule name is required."); return; }
+  try {
+    if (EDITING_RULE_ID) {
+      await api(`/api/rules/${encodeURIComponent(EDITING_RULE_ID)}`, { method: "PATCH", body: JSON.stringify(payload) });
+      toast(`Updated rule '${payload.name}'`, true);
+    } else {
+      await api("/api/rules", { method: "POST", body: JSON.stringify(payload) });
+      toast(`Created rule '${payload.name}'`, true);
+    }
+    resetRuleForm();
+    loadRules();
+  } catch (e) { toast("Failed to save rule: " + e.message); }
+}
+
+async function toggleRuleEnabled(id, enabled) {
+  try {
+    await api(`/api/rules/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify({ enabled }) });
+    toast(enabled ? "Rule enabled" : "Rule disabled", true);
+    loadRules();
+  } catch (e) { toast("Failed to update rule: " + e.message); }
+}
+
+async function deleteRuleConfirm(id) {
+  if (!confirm("Delete this rule? Its threshold counters are deleted too.")) return;
+  try {
+    await api(`/api/rules/${encodeURIComponent(id)}`, { method: "DELETE" });
+    toast("Rule deleted.", true);
+    if (EDITING_RULE_ID === id) resetRuleForm();
+    loadRules();
+  } catch (e) { toast("Failed to delete rule: " + e.message); }
+}
+
+async function testRuleForm() {
+  const out = $("rule-test-result");
+  let alert;
+  try {
+    alert = JSON.parse($("rule-test-alert").value || "{}");
+  } catch (e) {
+    out.textContent = "Sample alert is not valid JSON: " + e.message;
+    return;
+  }
+  const rule = collectRuleFromForm();
+  if (!rule.name) rule.name = "(preview)";
+  try {
+    const r = await api("/api/rules/preview", { method: "POST", body: JSON.stringify({ rule, alert }) });
+    out.textContent = JSON.stringify(r.result, null, 2);
+  } catch (e) { out.textContent = "Test failed: " + e.message; }
+}
+
+async function backtestRule(id, name) {
+  const out = $("rule-test-result");
+  out.textContent = `Backtesting '${name}' against data/triage_log.jsonl…`;
+  try {
+    const r = await api(`/api/rules/${encodeURIComponent(id)}/backtest`, { method: "POST", body: JSON.stringify({}) });
+    const res = r.result;
+    let text = `Backtest: ${name}\n` +
+      `  Log entries scanned: ${res.total_alerts}\n` +
+      `  Conditions matched:  ${res.matched}\n` +
+      `  Would have fired:    ${res.triggered}\n`;
+    if (res.note) text += `  Note: ${res.note}\n`;
+    if (res.sample && res.sample.length) {
+      text += "  Sample triggers:\n" + res.sample.map(s => `    - ${s.alert_id}  ts=${s.ts || "?"}  count=${s.count ?? ""}`).join("\n");
+    }
+    out.textContent = text;
+    toast(`Backtest: would have fired ${res.triggered}/${res.total_alerts} times`, true);
+  } catch (e) { out.textContent = "Backtest failed: " + e.message; toast(e.message); }
+}
+
+/* ---------------- rule import / export ---------------- */
+async function exportRules() {
+  try {
+    const r = await api("/api/rules/export");
+    const blob = new Blob([JSON.stringify({ rules: r.rules }, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `soc-rules-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    toast(`Exported ${r.rules.length} rule(s)`, true);
+  } catch (e) { toast("Export failed: " + e.message); }
+}
+
+async function importRulesFromFile(file) {
+  const resultEl = $("rule-import-result");
+  if (!file) return;
+  let parsed;
+  try {
+    parsed = JSON.parse(await file.text());
+  } catch (e) {
+    resultEl.textContent = "That file isn't valid JSON: " + e.message;
+    return;
+  }
+  const ruleDefs = Array.isArray(parsed) ? parsed : parsed.rules;
+  if (!Array.isArray(ruleDefs)) {
+    resultEl.textContent = 'Expected a JSON list of rules, or {"rules": [...]}.';
+    return;
+  }
+  const overwrite = $("rule-import-overwrite").checked;
+  try {
+    const r = await api("/api/rules/import", { method: "POST", body: JSON.stringify({ rules: ruleDefs, overwrite }) });
+    let text = `Created ${r.created.length}, updated ${r.updated.length}, skipped ${r.skipped.length}`;
+    if (r.errors.length) text += `, ${r.errors.length} error(s): ${r.errors.map(e => e.name).join(", ")}`;
+    resultEl.textContent = text;
+    toast(text, r.errors.length === 0);
+    loadRules();
+  } catch (e) {
+    resultEl.textContent = "Import failed: " + e.message;
+    toast(e.message);
+  }
+  $("rule-import-file").value = "";
+}
+
 /* ---------------- agent control ---------------- */
 let AGENT_POLL_TIMER = null;
 
@@ -575,9 +1561,9 @@ function renderAgentStatus(r) {
   const meta = $("agent-meta");
   if (r.running) {
     dot.className = "dot ok";
-    state.textContent = `Running (cycle ${r.cycle || "?"})`;
+    state.textContent = `Running · cycle ${r.cycle || "?"}`;
     const age = r.last_heartbeat_age_s != null ? `${Math.round(r.last_heartbeat_age_s)}s ago` : "?";
-    meta.textContent = `Last heartbeat: ${r.last_heartbeat || "?"} · ${age} · PID ${r.pid || "?"}`;
+    meta.textContent = `heartbeat ${r.last_heartbeat || "?"} · ${age} · pid ${r.pid || "?"}`;
   } else {
     dot.className = "dot err";
     state.textContent = "Stopped";
@@ -613,16 +1599,11 @@ function startAgentPolling() {
 /* ---------------- init ---------------- */
 (async () => {
   try {
-    await Promise.all([loadHealth(), loadPlatforms(), loadLookupTables()]);
+    await Promise.all([loadHealth(), loadPlatforms(), loadLookupTables(), loadRuleOps()]);
+    resetRuleForm();
+    renderChatChips();
     await loadProviders();
-    // Populate chat provider dropdown
-    const provSel = $("chat-provider");
-    for (const p of PROVIDERS) {
-      const opt = document.createElement("option");
-      opt.value = p.id;
-      opt.textContent = `${p.name} (${p.platform})`;
-      provSel.appendChild(opt);
-    }
+    await Promise.all([loadRules(), loadMetrics(), loadCases()]);
     agentRefresh();
     startAgentPolling();
   } catch (e) { toast("Could not load dashboard: " + e.message); }

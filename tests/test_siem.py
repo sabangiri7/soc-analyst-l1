@@ -115,6 +115,79 @@ class TestProviderStore(unittest.TestCase):
         with self.assertRaises(store.ProviderError):
             store.add_provider({"name": "x", "platform": "not-a-siem"}, path=self.path)
 
+    def test_redact_provider_masks_secret_fields_only(self):
+        import siem_providers as store
+        added = store.add_provider(
+            {"name": "QA Splunk", "platform": "splunk",
+             "config": {"host": "https://qa.splunk:8089", "token": "sekret"}},
+            path=self.path,
+        )
+        redacted = store.redact_provider(added)
+        self.assertEqual(redacted["config"]["host"], "https://qa.splunk:8089")  # not secret - untouched
+        self.assertNotEqual(redacted["config"]["token"], "sekret")  # secret - masked
+        self.assertNotIn("sekret", str(redacted))
+        # the real (unredacted) value is unaffected by producing a redacted copy
+        self.assertEqual(added["config"]["token"], "sekret")
+
+    def test_redact_provider_mock_platform_has_no_secrets(self):
+        import siem_providers as store
+        mock_provider = {"id": "env-mock", "name": "Mock SIEM", "platform": "mock", "config": {}}
+        self.assertEqual(store.redact_provider(mock_provider), mock_provider)
+
+
+class TestDashboardAuth(unittest.TestCase):
+    """DASHBOARD_TOKEN gate - off by default, on when set, page shell always loads."""
+
+    @classmethod
+    def setUpClass(cls):
+        from dashboard import app
+        app.config["TESTING"] = True
+        cls.client = app.test_client()
+
+    def setUp(self):
+        from config import cfg
+        self._orig_token = cfg.DASHBOARD_TOKEN
+
+    def tearDown(self):
+        from config import cfg
+        cfg.DASHBOARD_TOKEN = self._orig_token
+
+    def test_no_token_configured_means_open(self):
+        from config import cfg
+        cfg.DASHBOARD_TOKEN = ""
+        r = self.client.get("/api/providers")
+        self.assertEqual(r.status_code, 200)
+
+    def test_api_call_without_token_is_401(self):
+        from config import cfg
+        cfg.DASHBOARD_TOKEN = "s3cr3t"
+        r = self.client.get("/api/providers")
+        self.assertEqual(r.status_code, 401)
+
+    def test_page_shell_always_loads(self):
+        from config import cfg
+        cfg.DASHBOARD_TOKEN = "s3cr3t"
+        r = self.client.get("/")
+        self.assertEqual(r.status_code, 200)
+
+    def test_bearer_header_authorizes(self):
+        from config import cfg
+        cfg.DASHBOARD_TOKEN = "s3cr3t"
+        r = self.client.get("/api/providers", headers={"Authorization": "Bearer s3cr3t"})
+        self.assertEqual(r.status_code, 200)
+
+    def test_wrong_bearer_token_is_401(self):
+        from config import cfg
+        cfg.DASHBOARD_TOKEN = "s3cr3t"
+        r = self.client.get("/api/providers", headers={"Authorization": "Bearer wrong"})
+        self.assertEqual(r.status_code, 401)
+
+    def test_query_param_authorizes(self):
+        from config import cfg
+        cfg.DASHBOARD_TOKEN = "s3cr3t"
+        r = self.client.get("/api/providers?token=s3cr3t")
+        self.assertEqual(r.status_code, 200)
+
 
 class TestDashboardAPI(unittest.TestCase):
     """Runs the Flask app against the test client - offline."""
@@ -151,9 +224,11 @@ class TestDashboardAPI(unittest.TestCase):
         r = self.client.post("/api/providers", json=payload)
         self.assertEqual(r.status_code, 201)
         pid = r.get_json()["provider"]["id"]
+        self.assertNotIn("t0ken", r.get_data(as_text=True))  # secret never echoed back
 
         r = self.client.get("/api/providers")
         self.assertIn(pid, {p["id"] for p in r.get_json()["providers"]})
+        self.assertNotIn("t0ken", r.get_data(as_text=True))  # ...nor on a later list
 
         r = self.client.delete(f"/api/providers/{pid}")
         self.assertEqual(r.status_code, 200)
