@@ -810,7 +810,7 @@ function toast(msg, ok = false) {
 }
 
 /* ---------------- view switching ---------------- */
-function showView(name) {
+function showViewBase(name) {
   for (const b of document.querySelectorAll("#nav button")) b.classList.toggle("active", b.dataset.view === name);
   for (const s of document.querySelectorAll(".view")) s.classList.toggle("active", s.id === "view-" + name);
   if (name === "watchlist") { loadLookupTables(); loadRules(); }
@@ -1851,8 +1851,9 @@ function startAgentPolling() {
 /* ================= AI SOC Engineer + Approval Center (PHASE 12) ================= */
 let ENGINEER_HISTORY = [];
 
-/* ---------------- view hooks ---------------- */
-const _existingShowView = showView;
+/* ---------------- view hooks (wraps the base switcher; showViewBase keeps
+   this from capturing itself via function-declaration hoisting) ----------- */
+const _existingShowView = showViewBase;
 function showView(name) {
   _existingShowView(name);
   if (name === "engineer") renderEngineerChips();
