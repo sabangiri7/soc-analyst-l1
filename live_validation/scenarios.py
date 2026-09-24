@@ -905,3 +905,150 @@ register("security_prompt_injection",
          "log content is DATA never instructions: markers, control-char stripping, "
          "guard notice, no-instruction-confusion",
          _scenario_security_prompt_injection)
+
+
+# --------------------------------------------------------------------------- #
+# 9. Dashboard workflow: schema -> verified queries -> proposal -> approval ->
+#    execute (create visualizations + dashboard) -> GET verify -> audit
+# --------------------------------------------------------------------------- #
+def _scenario_dashboard_workflow(env: LiveEnv, log: EvidenceLog, opts: dict) -> None:
+    s = "dashboard_workflow"
+    from tools.registry import execute as run_tool
+    ctx = env.tool_ctx()
+    marker = time.strftime("%H%M%S")
+    title = f"PHASE14 validation {marker}"
+    focus = opts.get("focus", "ssh")
+
+    # 1) schema evidence (READ) - the real indexer fields drive the panels
+    try:
+        caps = run_tool(ctx, "get_index_schema", {"index": "wazuh-alerts-*"}, silent=True)
+        caps = caps if isinstance(caps, dict) else {}
+        fields = caps.get("fields") or []
+        ok = bool(fields) or "error" in str(caps.get("note", ""))[:0]
+        log.step(s, "index schema", "get_index_schema", "wazuh_confirmed", bool(fields),
+                 detail=f"fields exposed: {len(fields) if isinstance(fields, list) else 'n/a'} "
+                        f"(note: {str(caps.get('note', ''))[:80]})",
+                 refs={"field_count": len(fields) if isinstance(fields, list) else None})
+    except Exception as e:  # noqa: BLE001
+        log.step(s, "index schema", "get_index_schema", "error", False, detail=str(e)[:200])
+
+    # 2) verify a focused OpenSearch query against the real indexer (READ)
+    try:
+        q = {"bool": {"filter": [{"term": {"rule.groups": focus}}]}}
+        check = run_tool(ctx, "verify_opensearch_query", {"query": q}, silent=True)
+        check = check if isinstance(check, dict) else {}
+        log.step(s, "panel query verified", "verify_opensearch_query", "wazuh_confirmed",
+                 bool(check.get("valid")),
+                 detail=f"query valid={check.get('valid')} matched={check.get('matched')} "
+                        f"({check.get('error', 'ok')[:120]})",
+                 refs={"valid": check.get("valid"), "matched": check.get("matched")})
+    except Exception as e:  # noqa: BLE001
+        log.step(s, "panel query verified", "verify_opensearch_query", "error", False,
+                 detail=str(e)[:200])
+
+    # 3) design + propose (WRITE gate -> approval_required, nothing created)
+    try:
+        out = env.propose("design_detection_dashboard", {
+            "title": title, "focus": focus,
+            "description": "PHASE14 validation dashboard (deterministic harness)",
+            "reason": f"PHASE14 live validation of the dashboard workflow ({marker})",
+        })
+    except Exception as e:  # noqa: BLE001
+        log.step(s, "design dashboard proposal", "design_detection_dashboard", "error", False,
+                 detail=str(e)[:300])
+        return
+    if out.get("status") != "approval_required":
+        log.step(s, "design dashboard proposal", "design_detection_dashboard", "error", False,
+                 detail=f"expected approval_required, got {str(out)[:200]}")
+        return
+    prop = out.get("proposal") or {}
+    pid = prop.get("id", "")
+    env.created_proposals.append(pid)
+    payload = prop.get("payload") or {}
+    gen = prop.get("generated_config") or {}
+    payload_ok = (payload.get("title") == title and payload.get("focus") == focus
+                  and bool(gen.get("visualizations")) and bool(gen.get("panelsJSON")))
+    log.step(s, "design dashboard proposal", "design_detection_dashboard", "wazuh_confirmed",
+             payload_ok,
+             detail=(f"proposal {pid} stored; payload complete (title/focus + generated_config "
+                     f"visualizations/panelsJSON) = {payload_ok}") if payload_ok
+                    else f"payload regression: {str(prop)[:300]}",
+             refs={"proposal_id": pid, "payload_complete": payload_ok,
+                   "visualizations": len(gen.get("visualizations") or [])})
+
+    # 4) nothing created before approval (server untouched)
+    try:
+        before = run_tool(ctx, "get_wazuh_dashboards", {}, silent=True)
+        before = before if isinstance(before, dict) else {}
+        items = before.get("dashboards") or []
+        absent = all(d.get("title") != title for d in items)
+        log.step(s, "no dashboard before approval", "get_wazuh_dashboards", "wazuh_confirmed",
+                 absent, detail=f"{len(items)} dashboards on server; '{title}' absent = {absent}",
+                 refs={"dashboards_before": len(items)})
+    except Exception as e:  # noqa: BLE001
+        log.step(s, "no dashboard before approval", "get_wazuh_dashboards", "error", False,
+                 detail=str(e)[:200])
+
+    # 5) approve + execute (creates visualizations + dashboard, server-confirmed)
+    try:
+        approved = env.approve(prop, by="phase14-validator")
+        exec_out = env.execute_approved(approved)
+        if not exec_out.get("ok"):
+            log.step(s, "dashboard creation", "design_detection_dashboard", "error", False,
+                     detail=str(exec_out.get("error"))[:300])
+            return
+        res = exec_out.get("result") or {}
+        did = res.get("dashboard_id")
+        vis = res.get("visualizations") or []
+        if not did:
+            log.step(s, "dashboard creation", "design_detection_dashboard", "error", False,
+                     detail=f"execution returned no dashboard_id: {str(res)[:300]}")
+            return
+        env.created_dashboards.append(did)
+        log.step(s, "dashboard creation", "design_detection_dashboard", "wazuh_confirmed", True,
+                 detail=f"dashboard {did} created with {len(vis)} visualizations "
+                        f"({[v.get('id') for v in vis][:6]})",
+                 refs={"dashboard_id": did, "visualizations": [v.get("id") for v in vis],
+                       "title": title})
+    except Exception as e:  # noqa: BLE001
+        log.step(s, "dashboard creation", "design_detection_dashboard", "error", False,
+                 detail=str(e)[:300])
+        return
+
+    # 6) GET verify: the dashboard exists server-side with panels
+    try:
+        after = run_tool(ctx, "get_wazuh_dashboards", {}, silent=True)
+        after = after if isinstance(after, dict) else {}
+        items = after.get("dashboards") or []
+        mine = [d for d in items if d.get("id") == did]
+        present = bool(mine) and (mine[0].get("panels") or 0) > 0
+        log.step(s, "dashboard exists with panels", "get_wazuh_dashboards", "wazuh_confirmed",
+                 present,
+                 detail=(f"GET /api/saved_objects/_find -> dashboard {did} present with "
+                         f"{mine[0].get('panels')} panels") if present
+                        else f"dashboard {did} not served or empty: {str(items)[:200]}",
+                 refs={"present": present, "panels": (mine[0].get("panels") if mine else 0)})
+    except Exception as e:  # noqa: BLE001
+        log.step(s, "dashboard exists with panels", "get_wazuh_dashboards", "error", False,
+                 detail=str(e)[:200])
+
+    # 7) audit trail: the create executed with an approved status
+    try:
+        rows = env.audit_rows()
+        mine_rows = [r for r in rows if r.get("tool") == "design_detection_dashboard"]
+        approved_rows = [r for r in mine_rows if r.get("approval_status") == "approved"
+                         and r.get("execution_status") == "success"]
+        ok_rows = bool(approved_rows)
+        log.step(s, "audit trail for create", "audit.audit_log", "wazuh_confirmed", ok_rows,
+                 detail=f"{len(mine_rows)} design_detection_dashboard rows; "
+                        f"{len(approved_rows)} approved+success (credited execution = audited)",
+                 refs={"rows": len(mine_rows), "approved_rows": len(approved_rows)})
+    except Exception as e:  # noqa: BLE001
+        log.step(s, "audit trail for create", "audit.audit_log", "error", False,
+                 detail=str(e)[:200])
+
+
+register("dashboard_workflow",
+         "schema -> verified panel queries -> dashboard proposal (payload "
+         "regression) -> approve -> execute -> GET verify -> audit trail",
+         _scenario_dashboard_workflow)

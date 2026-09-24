@@ -455,6 +455,58 @@ class PromptInjectionTests(unittest.TestCase):
         log = scen.run_scenario(env, "security_prompt_injection", {})
         st = log.scenario_status("security_prompt_injection")
         self.assertEqual(st["status"], "PASS", st["failures"])
+
+
+class DashboardWorkflowTests(unittest.TestCase):
+    def test_full_dashboard_chain(self):
+        env = make_env()
+
+        def fake_propose(tool_name, params):
+            return {"status": "approval_required", "proposal": {
+                "id": "appr-dash", "action": "design_detection_dashboard",
+                "permission": "propose",
+                "payload": {k: params[k] for k in
+                            ("title", "focus", "description", "reason") if k in params},
+                "generated_config": {
+                    "title": params["title"], "focus": params["focus"],
+                    "index_pattern": "wazuh-alerts-*",
+                    "visualizations": [{"slug": "a", "title": "t", "vis_type": "metric"}],
+                    "panelsJSON": '[{"id":"vis-a","x":0,"y":0,"w":24,"h":15}]',
+                },
+            }}
+
+        def fake_exec(ctx, tool, params, **kw):
+            if tool == "get_index_schema":
+                return {"fields": [{"name": "rule.groups"}, {"name": "data.srcip"}]}
+            if tool == "verify_opensearch_query":
+                return {"valid": True, "matched": 42}
+            if tool == "get_wazuh_dashboards":
+                return {"dashboards": [
+                    {"id": "dash-1", "title": "PHASE14 validation 120101", "panels": 3}]}
+            return {"status": "ok"}
+
+        audit_rows = [{
+            "tool": "design_detection_dashboard", "permission": "propose",
+            "approval_status": "approved", "execution_status": "success",
+            "result": "created"}]
+
+        with mock.patch("tools.registry.execute", side_effect=fake_exec), \
+             mock.patch.object(env, "propose", side_effect=fake_propose), \
+             mock.patch.object(env, "approve", side_effect=lambda p, by=None: {**p, "status": "approved"}), \
+             mock.patch.object(env, "execute_approved", return_value={
+                 "ok": True, "result": {"dashboard_id": "dash-1", "title": "PHASE14 validation 120101",
+                                        "visualizations": [{"slug": "a", "id": "vis-1"}]}}), \
+             mock.patch.object(env, "audit_rows", return_value=audit_rows):
+            log = scen.run_scenario(env, "dashboard_workflow", {"focus": "ssh"})
+        st = log.scenario_status("dashboard_workflow")
+        self.assertEqual(st["status"], "PASS", st["failures"])
+        rows = {i.step: i for i in log.scenario_items("dashboard_workflow")}
+        self.assertTrue(rows["design dashboard proposal"].refs["payload_complete"])
+        self.assertTrue(rows["dashboard creation"].passed)
+        self.assertEqual(rows["dashboard creation"].refs["dashboard_id"], "dash-1")
+        self.assertTrue(rows["dashboard exists with panels"].passed)
+        self.assertTrue(rows["audit trail for create"].passed)
+        self.assertIn("dash-1", env.created_dashboards)
 class CliTests(unittest.TestCase):
     def test_refuses_without_live_flag(self):
         from live_validation.cli import main
