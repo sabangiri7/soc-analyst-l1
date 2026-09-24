@@ -43,9 +43,10 @@ def _collect_tool_classes() -> list[type[BaseWazuhTool]]:
     from tools.dashboard import TOOLS as DASHBOARD_TOOLS
     from tools.investigate import TOOLS as INVESTIGATE_TOOLS
     from tools.detection import TOOLS as DETECTION_TOOLS
+    from tools.gaps import TOOLS as GAP_TOOLS
     from tools.propose import ProposeAction
     return [*INDEXER_TOOLS, *WAZUH_TOOLS, *DASHBOARD_TOOLS,
-            *INVESTIGATE_TOOLS, *DETECTION_TOOLS, ProposeAction]
+            *INVESTIGATE_TOOLS, *DETECTION_TOOLS, *GAP_TOOLS, ProposeAction]
 
 
 ALL_TOOL_CLASSES: list[type[BaseWazuhTool]] = _collect_tool_classes()
