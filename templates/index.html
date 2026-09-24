@@ -272,9 +272,15 @@
     </div>
     <nav class="nav" id="nav">
       <button data-view="dashboard" class="active">Dashboard</button>
+      <button data-view="engineer">AI Engineer</button>
+      <button data-view="approvals">Approvals</button>
       <button data-view="chat">Chat</button>
+      <button data-view="investigate">Investigate</button>
+      <button data-view="rule-builder">Rule Builder</button>
+      <button data-view="dashboard-builder">Dashboards</button>
       <button data-view="watchlist">Watchlist</button>
       <button data-view="watcher">Overnight watcher</button>
+      <button data-view="audit">Audit</button>
       <button data-view="settings">Settings</button>
     </nav>
     <span style="flex:1"></span>
@@ -597,6 +603,157 @@
       </form>
     </div>
     <div class="grid" id="providers" style="display:flex; flex-direction:column; gap:14px;"></div>
+  </section>
+
+<!-- ============ AI ENGINEER (chat + tool activity) ============ -->
+  <section class="view" id="view-engineer">
+    <div class="chat-shell">
+      <div class="card" style="margin-top:14px; background:transparent; border:0; padding:0;">
+        <div class="top" style="margin-bottom:4px;">
+          <div class="title">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="2" width="16" height="20" rx="2"/><path d="M9 22v-4h6v4M9 6h6M8 10h.01M12 10h.01M16 10h.01M8 14h.01M12 14h.01M16 14h.01"/></svg>
+            AI SOC Engineer · Wazuh
+          </div>
+          <span class="badge env">READ auto · writes need your approval</span>
+        </div>
+      </div>
+
+      <div class="chips" id="engineer-chips"></div>
+
+      <div class="chat-stage" id="engineer-wrap" style="max-height:420px; overflow:auto;">
+        <div class="chat-msg agent" id="engineer-intro">
+          <div class="who"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4 5.5v5.2c0 5 3.4 9.6 8 10.8 4.6-1.2 8-5.8 8-10.8V5.5L12 2Z"/></svg>engineer · connected to Wazuh</div>
+          I investigate Wazuh alerts/events, draft detection rules, design dashboards and find detection gaps. Write actions come back as proposals you approve here or in the Approval Center.
+        </div>
+      </div>
+
+      <div id="engineer-proposals" style="margin-top:10px;"></div>
+
+      <div class="chat-bar">
+        <textarea id="engineer-input" rows="1" placeholder="e.g. Investigate the top attacking IPs against my web servers in the last 24 hours" style="flex:1"></textarea>
+        <div class="actions">
+          <button class="btn danger" onclick="clearEngineer()" title="Clear thread">Clear</button>
+          <button class="btn primary" onclick="sendEngineer()" title="Send to engineer">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m22 2-11 11M22 2l-7 20-4-9-9-4 20-7Z"/></svg>
+            Send
+          </button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ APPROVAL CENTER ============ -->
+  <section class="view" id="view-approvals">
+    <div class="section-label">Approval Center — nothing writes to Wazuh without an approved proposal</div>
+    <div class="row" style="align-items:flex-end; margin-bottom:10px;">
+      <div class="field" style="min-width:150px; max-width:190px;">
+        <label for="appr-status">Filter</label>
+        <select id="appr-status" onchange="loadProposals()">
+          <option value="">all</option>
+          <option value="pending" selected>pending</option>
+          <option value="approved">approved</option>
+          <option value="rejected">rejected</option>
+          <option value="expired">expired</option>
+        </select>
+      </div>
+      <button class="btn" onclick="loadProposals()">Refresh</button>
+    </div>
+    <div class="stack" id="proposals-list" style="display:flex; flex-direction:column; gap:14px;">
+      <div class="card top-hairline"><div class="empty">Loading…</div></div>
+    </div>
+  </section>
+
+  <!-- ============ INVESTIGATE ============ -->
+  <section class="view" id="view-investigate">
+    <div class="section-label">Investigation — read-only, runs immediately</div>
+    <div class="card top-hairline" style="margin-bottom:14px;">
+      <div class="row" style="align-items:flex-end;">
+        <div class="field" style="min-width:200px;">
+          <label for="inv-ip">Source IP</label>
+          <input id="inv-ip" placeholder="e.g. 45.75.196.15">
+        </div>
+        <div class="field" style="min-width:140px; max-width:170px;">
+          <label for="inv-range">Time range</label>
+          <input id="inv-range" value="-48h">
+        </div>
+        <div class="actions">
+          <button class="btn" onclick="runInvestigation()">Investigate IP</button>
+          <button class="btn primary" onclick="runTopAttackers()">Top attacking IPs</button>
+        </div>
+      </div>
+    </div>
+    <div id="investigation-out"><div class="card top-hairline"><div class="empty">Run an investigation to see evidence here.</div></div></div>
+  </section>
+
+  <!-- ============ RULE BUILDER (detection engineering) ============ -->
+  <section class="view" id="view-rule-builder">
+    <div class="section-label">Detection rule builder — draft rule + sample logs → evidence-backed proposal</div>
+    <div class="card top-hairline" style="margin-bottom:14px;">
+      <div class="row" style="align-items:flex-start;">
+        <div class="field" style="flex:2; min-width:280px;">
+          <label for="rb-xml">Candidate rule XML</label>
+          <textarea id="rb-xml" rows="9" spellcheck="false" style="font-family:var(--mono); font-size:12px;"></textarea>
+        </div>
+        <div class="field" style="flex:1; min-width:220px;">
+          <label for="rb-pos">Positive samples (one per line — must fire)</label>
+          <textarea id="rb-pos" rows="4" spellcheck="false" style="font-family:var(--mono); font-size:12px;"></textarea>
+          <label for="rb-neg" style="margin-top:8px;">Negative samples (one per line — must NOT fire)</label>
+          <textarea id="rb-neg" rows="3" spellcheck="false" style="font-family:var(--mono); font-size:12px;"></textarea>
+        </div>
+      </div>
+      <div class="row" style="align-items:flex-end;">
+        <div class="field" style="flex:1;">
+          <label for="rb-reason">Why this rule is needed (shown to the approver)</label>
+          <input id="rb-reason" placeholder="e.g. repeated SSH brute force against non-existent users">
+        </div>
+        <div class="actions">
+          <button class="btn primary" onclick="runRuleBuilder()">Validate &amp; propose</button>
+          <button class="btn" onclick="loadRulePreset()" title="Fill a sensible SSH-brute-force starter">Starter rule</button>
+        </div>
+      </div>
+    </div>
+    <div id="rule-builder-out"><div class="card top-hairline"><div class="empty">Proposal + logtest evidence land here.</div></div></div>
+  </section>
+
+  <!-- ============ DASHBOARD BUILDER ============ -->
+  <section class="view" id="view-dashboard-builder">
+    <div class="section-label">Dashboard builder — panels verified against the real indexer before they are proposed</div>
+    <div class="card top-hairline" style="margin-bottom:14px;">
+      <div class="row" style="align-items:flex-end;">
+        <div class="field" style="min-width:220px; flex:1;">
+          <label for="db-title">Dashboard title</label>
+          <input id="db-title" placeholder="e.g. Web Server Attacks">
+        </div>
+        <div class="field" style="min-width:150px; max-width:190px;">
+          <label for="db-focus">Focus</label>
+          <select id="db-focus">
+            <option value="web">web</option>
+            <option value="ssh">ssh</option>
+            <option value="network">network</option>
+            <option value="general">general</option>
+          </select>
+        </div>
+        <div class="actions">
+          <button class="btn primary" onclick="runDashboardBuilder()">Design &amp; propose</button>
+        </div>
+      </div>
+    </div>
+    <div id="dashboard-builder-out"><div class="card top-hairline"><div class="empty">Panel plan with verified query counts lands here.</div></div></div>
+  </section>
+
+  <!-- ============ AUDIT LOG ============ -->
+  <section class="view" id="view-audit">
+    <div class="section-label">Audit log — every tool call, approval gate and execution is recorded</div>
+    <div class="row" style="align-items:flex-end; margin-bottom:10px;">
+      <div class="field" style="min-width:140px; max-width:170px;">
+        <label for="audit-limit">Rows</label>
+        <input id="audit-limit" type="number" value="100">
+      </div>
+      <button class="btn" onclick="loadAudit()">Refresh</button>
+    </div>
+    <div class="card top-hairline" id="audit-card">
+      <div class="empty">Loading…</div>
+    </div>
   </section>
 
 </div><!-- /shell -->
@@ -1594,6 +1751,369 @@ async function agentStop() {
 function startAgentPolling() {
   if (AGENT_POLL_TIMER) clearInterval(AGENT_POLL_TIMER);
   AGENT_POLL_TIMER = setInterval(agentRefresh, 3000);
+}
+
+/* ================= AI SOC Engineer + Approval Center (PHASE 12) ================= */
+let ENGINEER_HISTORY = [];
+
+/* ---------------- view hooks ---------------- */
+const _existingShowView = showView;
+function showView(name) {
+  _existingShowView(name);
+  if (name === "engineer") renderEngineerChips();
+  if (name === "approvals") loadProposals();
+  if (name === "audit") loadAudit();
+}
+
+function pv(v, fallback) { return (v === undefined || v === null || v === "") ? fallback : v; }
+
+/* ---------------- engineer chat ---------------- */
+const ENGINEER_CHIP_PROMPTS = [
+  "Investigate the top attacking IPs against my web servers in the last 24 hours",
+  "Create a Wazuh rule detecting repeated SSH failures",
+  "Create a dashboard for web server attacks",
+  "Find detection gaps in my web server telemetry",
+  "Why did my most recent alert trigger?",
+];
+
+function renderEngineerChips() {
+  const c = $("engineer-chips");
+  c.innerHTML = "";
+  for (const p of ENGINEER_CHIP_PROMPTS) {
+    const b = document.createElement("button");
+    b.className = "chip";
+    b.textContent = p;
+    b.onclick = () => { $("engineer-input").value = p; sendEngineer(); };
+    c.appendChild(b);
+  }
+}
+
+function engineerMsg(role, html) {
+  const wrap = $("engineer-wrap");
+  const div = document.createElement("div");
+  div.className = "chat-msg " + role;
+  const who = role === "user" ? "you" : "engineer";
+  div.innerHTML = '<div class="who">' + who + '</div>' + html;
+  wrap.appendChild(div);
+  wrap.scrollTop = wrap.scrollHeight;
+}
+
+function renderEngineerProposals(proposals) {
+  const box = $("engineer-proposals");
+  box.innerHTML = "";
+  if (!proposals || !proposals.length) return;
+  const h = document.createElement("div");
+  h.className = "section-label";
+  h.textContent = "Proposals awaiting approval — approve in the Approval Center";
+  box.appendChild(h);
+  for (const p of proposals) box.appendChild(proposalCard(p));
+}
+
+async function sendEngineer() {
+  const input = $("engineer-input");
+  const msg = input.value.trim();
+  if (!msg) return;
+  input.value = "";
+  engineerMsg("user", esc(msg));
+  const boot = document.createElement("div");
+  boot.className = "chat-msg agent";
+  boot.innerHTML = '<div class="who">engineer</div><div class="skeleton row" style="max-width:380px;"></div>';
+  $("engineer-wrap").appendChild(boot);
+  try {
+    const res = await api("/api/engineer/chat", { method: "POST", body: JSON.stringify({ message: msg, history: ENGINEER_HISTORY }) });
+    ENGINEER_HISTORY.push({ role: "user", content: msg });
+    ENGINEER_HISTORY.push({ role: "assistant", content: res.reply });
+    boot.remove();
+    engineerMsg("agent", mdish(res.reply));
+    const details = [];
+    if (res.transcript) {
+      for (const t of res.transcript) {
+        if (t && t.type === "tool") details.push("🔧 " + t.tool + (t.summary ? " · " + String(t.summary).slice(0, 90) : ""));
+      }
+    }
+    if (details.length) {
+      const d = document.createElement("div");
+      d.className = "chat-msg agent";
+      d.innerHTML = '<div class="who">tool activity</div><div style="font-size:11px; color:var(--muted); font-family:var(--mono); white-space:pre-wrap;">' + details.join("\n").replace(/</g, "&lt;") + '</div>';
+      $("engineer-wrap").appendChild(d);
+    }
+    renderEngineerProposals(res.proposals);
+    $("engineer-wrap").scrollTop = $("engineer-wrap").scrollHeight;
+  } catch (e) {
+    boot.remove();
+    engineerMsg("agent", "⚠️ " + esc(e.message));
+  }
+}
+
+function clearEngineer() {
+  ENGINEER_HISTORY = [];
+  $("engineer-wrap").innerHTML = "";
+  $("engineer-proposals").innerHTML = "";
+  engineerMsg("agent", "Thread cleared. Ask me anything about your Wazuh environment.");
+}
+
+function esc(s) { return String(s === undefined || s === null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+function mdish(text) {
+  return esc(text).replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/\n/g, "<br>");
+}
+
+/* ---------------- approval center ---------------- */
+function statusBadge(s) {
+  const cls = { pending: "badge", approved: "badge", rejected: "badge", expired: "badge" }[s] || "badge";
+  const col = { pending: "", approved: "✓ approved", rejected: "✕ rejected", expired: "expired" }[s] || s;
+  return '<span class="' + cls + '">' + col + "</span>";
+}
+
+function proposalCard(p) {
+  const card = document.createElement("div");
+  card.className = "card top-hairline";
+  card.id = "proposal-" + p.id;
+  const perm = p.permission === "execute" ? '<span class="badge" style="color:#ff8b7a;">EXECUTE</span>' : '<span class="badge">PROPOSE</span>';
+  const gc = p.generated_config;
+  let cfgHtml = "";
+  if (gc && typeof gc === "object") {
+    cfgHtml = '<pre style="background:var(--panel2); padding:8px; border-radius:6px; font-size:11px; max-height:160px; overflow:auto; margin:6px 0 0;">' + esc(JSON.stringify(gc, null, 1).slice(0, 1400)) + "</pre>";
+  }
+  const val = p.validation || {};
+  const ev = val.evidence;
+  let evHtml = "";
+  if (ev && ev.baseline_summary) evHtml = '<div style="font-size:12px; margin-top:6px;">🧪 <b>Baseline:</b> ' + esc(ev.baseline_summary) + "</div>";
+  if (ev && Array.isArray(ev.panels)) {
+    evHtml = evHtml + '<div style="font-size:11px; margin-top:6px; color:var(--muted); font-family:var(--mono);">' +
+      ev.panels.map(x => x.slug + ": " + x.matched + " matched").join(" · ") + "</div>";
+  }
+  let acts = "";
+  if (p.status === "pending") {
+    acts = '<div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">' +
+      '<button class="btn primary" onclick="approveProposal(\'' + p.id + '\')">Approve</button>' +
+      '<button class="btn danger" onclick="rejectProposal(\'' + p.id + '\')">Reject</button>' +
+      "</div>";
+  }
+  if (p.status === "approved") {
+    acts = '<div style="margin-top:10px;" id="exec-' + p.id + '">' +
+      '<button class="btn primary" onclick="executeProposal(\'' + p.id + '\')">Execute now</button>' +
+      '<span style="font-size:11px; color:var(--muted); margin-left:8px;">' + (p.permission === "execute" ? "management restart / delete / disable require a confirmation dialog" : "writes the file / creates the object") + "</span>" +
+      "</div>";
+  }
+  card.innerHTML =
+    '<div class="top"><div class="title">' + perm + ' <b>' + esc(p.action) + "</b> <span style=\"color:var(--muted); font-size:11px;\">" + p.id + "</span></div>" +
+    statusBadge(p.status) + "</div>" +
+    '<div style="font-size:13px; margin-top:4px;">' + esc(p.reason || "(no reason given)") + "</div>" +
+    (val.valid !== undefined ? '<div style="font-size:11px; margin-top:4px; color:' + (val.valid ? "#68d391" : "#ff8b7a") + ';">validation: ' + (val.valid ? "pass" : "fail") + (val.errors && val.errors.length ? " — " + esc(String(val.errors).slice(0, 200)) : "") + "</div>" : "") +
+    (val.note ? '<div style="font-size:11px; color:var(--muted); margin-top:2px;">' + esc(val.note) + "</div>" : "") +
+    evHtml +
+    cfgHtml + acts;
+  return card;
+}
+
+async function loadProposals() {
+  const status = pv($("appr-status").value, "");
+  try {
+    const res = await api("/api/proposals" + (status ? "?status=" + status : ""));
+    const box = $("proposals-list");
+    box.innerHTML = "";
+    const items = res.proposals || [];
+    if (!items.length) { box.innerHTML = '<div class="card top-hairline"><div class="empty">No proposals' + (status ? " with status '" + status + "'" : "") + ".</div></div>"; return; }
+    for (const p of items) box.appendChild(proposalCard(p));
+  } catch (e) { toast("Failed to load proposals: " + e.message); }
+}
+
+async function approveProposal(id) {
+  try {
+    await api("/api/proposals/" + id + "/approve", { method: "POST", body: JSON.stringify({ by: "dashboard-user" }) });
+    toast("Proposal approved — now execute it", true);
+    loadProposals();
+  } catch (e) { toast("Approve failed: " + e.message); }
+}
+
+async function rejectProposal(id) {
+  const reason = prompt("Reject reason (optional):") || "";
+  try {
+    await api("/api/proposals/" + id + "/reject", { method: "POST", body: JSON.stringify({ by: "dashboard-user", reason }) });
+    toast("Proposal rejected", true);
+    loadProposals();
+  } catch (e) { toast("Reject failed: " + e.message); }
+}
+
+async function executeProposal(id) {
+  const card = $("proposal-" + id);
+  const isExecute = card && card.innerHTML.indexOf("EXECUTE") !== -1;
+  let confirm_flag = false;
+  if (isExecute) {
+    if (!confirm("This is a HIGH-RISK EXECUTE action (restart / delete / disable). Approve the execution now? This affects the live Wazuh manager.")) return;
+    if (!confirm("Final confirmation: execute anyway?")) return;
+    confirm_flag = true;
+  } else {
+    if (!confirm("Execute this approved proposal now? It writes to Wazuh / the dashboard server.")) return;
+  }
+  const btn = document.createElement("button");
+  btn.className = "btn";
+  btn.textContent = "Executing…";
+  const slot = $("exec-" + id);
+  if (slot) slot.prepend(btn);
+  try {
+    const res = await api("/api/proposals/" + id + "/execute", { method: "POST", body: JSON.stringify({ by: "dashboard-user", confirm: confirm_flag }) });
+    toast(res.ok ? "Executed — see result below" : "Execution failed: " + (res.error || ""), res.ok);
+    const out = document.createElement("pre");
+    out.style.cssText = "background:var(--panel2); padding:8px; border-radius:6px; font-size:11px; max-height:220px; overflow:auto; margin-top:8px;";
+    out.textContent = JSON.stringify(res.result || res, null, 2);
+    if (slot) slot.appendChild(out);
+    if (btn) btn.remove();
+    setTimeout(loadProposals, 1200);
+  } catch (e) {
+    toast("Execute failed: " + e.message);
+    if (btn) btn.remove();
+  }
+}
+
+/* ---------------- investigate ---------------- */
+async function runInvestigation() {
+  const ip = $("inv-ip").value.trim();
+  if (!ip) { toast("Enter a source IP first"); return; }
+  const range = pv($("inv-range").value, "-48h");
+  $("investigation-out").innerHTML = '<div class="card top-hairline"><div class="skeleton row"></div></div>';
+  try {
+    const out = await api("/api/engineer/tool", { method: "POST", body: JSON.stringify({ tool: "investigate_ip", params: { ip, time_range: range } }) });
+    renderInvestigation(out);
+  } catch (e) { $("investigation-out").innerHTML = '<div class="card top-hairline"><div class="empty">⚠️ ' + esc(e.message) + "</div></div>"; }
+}
+
+async function runTopAttackers() {
+  const range = pv($("inv-range").value, "-48h");
+  $("investigation-out").innerHTML = '<div class="card top-hairline"><div class="skeleton row"></div></div>';
+  try {
+    const out = await api("/api/engineer/tool", { method: "POST", body: JSON.stringify({ tool: "top_attacking_ips", params: { time_range: range, size: 8 } }) });
+    renderInvestigation(out);
+  } catch (e) { $("investigation-out").innerHTML = '<div class="card top-hairline"><div class="empty">⚠️ ' + esc(e.message) + "</div></div>"; }
+}
+
+function renderInvestigation(out) {
+  const box = $("investigation-out");
+  box.innerHTML = "";
+  if (out.status === "error") { box.innerHTML = '<div class="card top-hairline"><div class="empty">⚠️ ' + esc(out.error) + "</div></div>"; return; }
+  const r = out.result || {};
+  const card = document.createElement("div");
+  card.className = "card top-hairline";
+  const ips = r.ips || [];
+  let rows = '<div class="empty">No data.</div>';
+  if (ips.length) {
+    rows = ips.map(ip =>
+      '<div style="display:flex; justify-content:space-between; gap:10px; padding:6px 0; border-bottom:1px solid var(--border); font-size:13px;">' +
+      "<span><b>" + esc(ip.src_ip) + "</b> <small style=\"color:var(--muted);\">max level " + ip.max_level + "</small></span>" +
+      "<span style=\"color:var(--muted);\">" + ip.alert_count + " alerts</span></div>").join("");
+  }
+  const rules = (r.top_rules || []).slice(0, 5).map(x => " " + x.id + " (" + x.level + ")").join("");
+  const mitre = (r.mitre_techniques || []).join(", ");
+  card.innerHTML =
+    '<div class="top"><div class="title">' + (r.src_ip ? "Investigation: " + esc(r.src_ip) : "Top attacking IPs") + '</div><span class="badge env">' + pv(r.group, "") + '</span></div>' +
+    (r.total_alerts !== undefined ? '<div style="font-size:12px; margin:6px 0;">total alerts: <b>' + r.total_alerts + "</b> · first " + esc(pv(r.first_seen, "–")) + " → last " + esc(pv(r.last_seen, "–")) + "</div>" : "") +
+    (rules ? '<div style="font-size:12px; margin:4px 0;">top rules:' + esc(rules) + "</div>" : "") +
+    (mitre ? '<div style="font-size:12px; margin:4px 0;">MITRE: ' + esc(mitre) + "</div>" : "") +
+    rows;
+  box.appendChild(card);
+}
+
+/* ---------------- rule builder ---------------- */
+const RULE_PRESET = '<rule id="105557" level="10" frequency="5" timeframe="120">\n  <if_matched_sid>5760</if_matched_sid>\n  <match type="pcre2">Failed password|authentication failure</match>\n  <description>Repeated SSH authentication failures from a single source</description>\n  <group>authentication_failures,</group>\n</rule>';
+const RULE_POS_PRESET = "Nov 21 09:41:01 host sshd[2710]: Failed password for invalid user root from 203.0.113.9 port 44555 ssh2";
+const RULE_NEG_PRESET = "Nov 21 09:41:02 host sshd[2710]: Accepted password for admin from 198.51.100.9 port 44555 ssh2";
+
+function loadRulePreset() {
+  $("rb-xml").value = RULE_PRESET;
+  $("rb-pos").value = RULE_POS_PRESET;
+  $("rb-neg").value = RULE_NEG_PRESET;
+  $("rb-reason").value = "Golden prompt: detect repeated SSH failures from a single source.";
+  toast("Starter rule loaded — adjust the samples to your logs", true);
+}
+
+async function runRuleBuilder() {
+  const xml = $("rb-xml").value.trim();
+  const pos = $("rb-pos").value.split("\n").map(s => s.trim()).filter(Boolean);
+  const neg = $("rb-neg").value.split("\n").map(s => s.trim()).filter(Boolean);
+  if (!xml || !pos.length) { toast("Rule XML and at least one positive sample are required"); return; }
+  $("rule-builder-out").innerHTML = '<div class="card top-hairline"><div class="skeleton row"></div></div>';
+  try {
+    const out = await api("/api/engineer/tool", { method: "POST", body: JSON.stringify({
+      tool: "develop_wazuh_rule",
+      params: { rule_xml: xml, positive_samples: pos, negative_samples: neg, reason: pv($("rb-reason").value, "rule builder") }
+    }) });
+    renderRuleBuilder(out);
+  } catch (e) { $("rule-builder-out").innerHTML = '<div class="card top-hairline"><div class="empty">⚠️ ' + esc(e.message) + "</div></div>"; }
+}
+
+function renderRuleBuilder(out) {
+  const box = $("rule-builder-out");
+  box.innerHTML = "";
+  if (out.status === "error") { box.innerHTML = '<div class="card top-hairline"><div class="empty">⚠️ ' + esc(out.error) + "</div></div>"; return; }
+  if (out.status === "approval_required") {
+    const card = proposalCard(out.proposal);
+    box.appendChild(card);
+    const ev = (out.proposal.validation || {}).evidence || {};
+    const sg = ev.sample_groups || {};
+    const pre = document.createElement("pre");
+    pre.style.cssText = "background:var(--panel2); padding:8px; border-radius:6px; font-size:11px; max-height:220px; overflow:auto; margin-top:8px;";
+    pre.textContent = JSON.stringify({ checks: ev.manager_checks, positives: sg.positives, negatives: sg.negatives, overlap: (ev.overlap || {}).rules }, null, 1).slice(0, 1800);
+    box.appendChild(pre);
+    return;
+  }
+  const r = out.result || {};
+  const card = document.createElement("div");
+  card.className = "card top-hairline";
+  card.innerHTML = '<div class="top"><div class="title">Rule verification</div><span class="badge">' + esc((r.positive_pass || "") + " · " + (r.negative_pass || "")) + "</span></div>" +
+    '<pre style="background:var(--panel2); padding:8px; border-radius:6px; font-size:11px; max-height:260px; overflow:auto;">' + esc(JSON.stringify(r, null, 2).slice(0, 1800)) + "</pre>";
+  box.appendChild(card);
+}
+
+/* ---------------- dashboard builder ---------------- */
+async function runDashboardBuilder() {
+  const title = $("db-title").value.trim();
+  if (!title) { toast("Dashboard title is required"); return; }
+  const focus = $("db-focus").value;
+  $("dashboard-builder-out").innerHTML = '<div class="card top-hairline"><div class="skeleton row"></div></div>';
+  try {
+    const out = await api("/api/engineer/tool", { method: "POST", body: JSON.stringify({
+      tool: "design_detection_dashboard",
+      params: { title, focus, reason: "Dashboard builder (" + focus + ")", time_range: "-7d" }
+    }) });
+    const box = $("dashboard-builder-out");
+    box.innerHTML = "";
+    if (out.status === "error") { box.innerHTML = '<div class="card top-hairline"><div class="empty">⚠️ ' + esc(out.error) + "</div></div>"; return; }
+    const card = proposalCard(out.proposal);
+    box.appendChild(card);
+    const ev = (out.proposal.validation || {}).evidence || {};
+    const pre = document.createElement("pre");
+    pre.style.cssText = "background:var(--panel2); padding:8px; border-radius:6px; font-size:11px; max-height:220px; overflow:auto; margin-top:8px;";
+    pre.textContent = JSON.stringify(ev, null, 1).slice(0, 1600);
+    box.appendChild(pre);
+  } catch (e) { $("dashboard-builder-out").innerHTML = '<div class="card top-hairline"><div class="empty">⚠️ ' + esc(e.message) + "</div></div>"; }
+}
+
+/* ---------------- audit log ---------------- */
+async function loadAudit() {
+  const limit = parseInt($("audit-limit").value || "100", 10);
+  const card = $("audit-card");
+  try {
+    const res = await api("/api/audit?limit=" + limit);
+    const entries = res.entries || [];
+    card.innerHTML = "";
+    if (!entries.length) { card.innerHTML = '<div class="empty">No audit entries yet.</div>'; return; }
+    const tbl = document.createElement("div");
+    tbl.style.cssText = "font-family:var(--mono); font-size:11px;";
+    for (const e of entries) {
+      const time = e.timestamp || e.ts || e.at || "";
+      const status = e.execution_status || e.approval_status || "";
+      const color = status === "success" ? "#68d391" : status === "failed" || status === "rejected" ? "#ff8b7a" : "var(--muted)";
+      const row = document.createElement("div");
+      row.style.cssText = "padding:5px 0; border-bottom:1px solid var(--border); display:flex; gap:10px; flex-wrap:wrap;";
+      row.innerHTML = "<span style=\"color:var(--muted);\">" + esc(time) + "</span>" +
+        "<b>" + esc(e.tool || e.action || "") + "</b>" +
+        ' <span style="color:' + color + ';">' + esc(status) + "</span>" +
+        (e.permission ? ' <span style="color:var(--muted);">[' + esc(e.permission) + "]</span>" : "") +
+        (e.error ? "<span style=\"color:#ff8b7a;\">" + esc(String(e.error).slice(0, 140)) + "</span>" : "");
+      tbl.appendChild(row);
+    }
+    card.appendChild(tbl);
+  } catch (e) { card.innerHTML = '<div class="empty">⚠️ ' + esc(e.message) + "</div>"; }
 }
 
 /* ---------------- init ---------------- */

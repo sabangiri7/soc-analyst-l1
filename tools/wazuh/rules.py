@@ -153,8 +153,8 @@ class CreateWazuhRule(BaseWazuhTool):
         proposed = {
             "action": "create_wazuh_rule",
             "reason": p.get("reason", ""),
-            "payload": {"filename": LOCAL_RULES_FILE, "content": new_content,
-                        "rule_id": rule_id, "overwrite": bool(p.get("overwrite"))},
+            "payload": {"rule_xml": xml, "overwrite": bool(p.get("overwrite")),
+                        "reason": p.get("reason", "")},
             "permission": self.permission.value,
         }
         proposed["generated_config"] = new_content
@@ -172,7 +172,7 @@ class CreateWazuhRule(BaseWazuhTool):
         return {
             "status": "executed",
             "rule_id": rule_id,
-            "file": data.get("affected_items", [LOCAL_RULES_FILE])[0],
+            "file": (data.get("affected_items") or [LOCAL_RULES_FILE])[0],
             "restart_required": True,
             "detail": resp.get("message"),
         }
@@ -209,8 +209,8 @@ class UpdateWazuhRule(BaseWazuhTool):
         proposed = {
             "action": "update_wazuh_rule",
             "reason": p.get("reason", ""),
-            "payload": {"filename": LOCAL_RULES_FILE, "content": new_content,
-                        "rule_id": p["rule_id"]},
+            "payload": {"rule_id": p["rule_id"], "rule_xml": xml,
+                        "reason": p.get("reason", "")},
             "permission": self.permission.value,
         }
         proposed["generated_config"] = new_content
@@ -249,8 +249,7 @@ class DeleteWazuhRule(BaseWazuhTool):
         proposed = {
             "action": "delete_wazuh_rule",
             "reason": p.get("reason", ""),
-            "payload": {"filename": LOCAL_RULES_FILE, "content": new_content,
-                        "rule_id": p["rule_id"]},
+            "payload": {"rule_id": p["rule_id"], "reason": p.get("reason", "")},
             "permission": self.permission.value,
         }
         proposed["validation"] = {"valid": True, "diff": diff,

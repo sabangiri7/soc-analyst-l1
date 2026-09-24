@@ -128,7 +128,7 @@ class RestartWazuhManager(BaseWazuhTool):
         proposed = {
             "action": "restart_wazuh_manager",
             "reason": p.get("reason", ""),
-            "payload": {},
+            "payload": {"reason": p.get("reason", "")},
             "permission": self.permission.value,
         }
         proposed["validation"] = {"valid": True, "note": "Manager restart - expects brief outage."}
@@ -156,7 +156,7 @@ class DisableWazuhAgent(BaseWazuhTool):
         proposed = {
             "action": "disable_wazuh_agent",
             "reason": p.get("reason", ""),
-            "payload": {"agent_id": p["agent_id"]},
+            "payload": {"agent_id": p["agent_id"], "reason": p.get("reason", "")},
             "permission": self.permission.value,
         }
         proposed["validation"] = {"valid": True, "note": "Agent removal from the manager."}

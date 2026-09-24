@@ -271,16 +271,14 @@ class DesignDetectionDashboard(BaseWazuhTool):
         panels_json = json.dumps(grid)
 
         proposed = {
-            "action": "create_wazuh_dashboard",
+            # Re-running this same workflow with an approved context executes
+            # deterministically: it re-verifies each panel query against the
+            # indexer, creates the visualizations and the dashboard, and reports
+            # only the server-confirmed ids. The payload is the tool's own input.
+            "action": "design_detection_dashboard",
             "reason": p.get("reason", ""),
-            "payload": {
-                "title": p["title"],
-                "description": p.get("description", ""),
-                "visualizations": visualizations,
-                "panels": grid,
-                "index_pattern": index_pattern,
-                "focus": focus,
-            },
+            "payload": {k: p[k] for k in ("title", "focus", "description",
+                                          "time_range", "reason") if k in p},
             "permission": self.permission.value,
         }
         proposed["generated_config"] = {

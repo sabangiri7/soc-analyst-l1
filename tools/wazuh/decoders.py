@@ -106,8 +106,8 @@ class CreateWazuhDecoder(BaseWazuhTool):
         proposed = {
             "action": "create_wazuh_decoder",
             "reason": p.get("reason", ""),
-            "payload": {"filename": LOCAL_DECODER_FILE, "content": new_content,
-                        "decoder_name": name, "overwrite": bool(p.get("overwrite"))},
+            "payload": {"decoder_xml": xml, "overwrite": bool(p.get("overwrite")),
+                        "reason": p.get("reason", "")},
             "permission": self.permission.value,
         }
         proposed["generated_config"] = new_content
@@ -149,8 +149,8 @@ class ModifyWazuhDecoder(BaseWazuhTool):
         proposed = {
             "action": "modify_wazuh_decoder",
             "reason": p.get("reason", ""),
-            "payload": {"filename": LOCAL_DECODER_FILE, "content": new_content,
-                        "decoder_name": p["decoder_name"]},
+            "payload": {"decoder_name": p["decoder_name"], "decoder_xml": xml,
+                        "reason": p.get("reason", "")},
             "permission": self.permission.value,
         }
         proposed["generated_config"] = new_content
@@ -186,8 +186,7 @@ class DeleteWazuhDecoder(BaseWazuhTool):
         proposed = {
             "action": "delete_wazuh_decoder",
             "reason": p.get("reason", ""),
-            "payload": {"filename": LOCAL_DECODER_FILE, "content": new_content,
-                        "decoder_name": p["decoder_name"]},
+            "payload": {"decoder_name": p["decoder_name"], "reason": p.get("reason", "")},
             "permission": self.permission.value,
         }
         proposed["validation"] = {"valid": True, "diff": diff,

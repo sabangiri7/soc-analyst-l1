@@ -72,7 +72,8 @@ class CreateWazuhVisualization(BaseWazuhTool):
         proposed = {
             "action": "create_wazuh_visualization",
             "reason": p.get("reason", ""),
-            "payload": {"title": p["title"], "vis_type": p["vis_type"], "vis_state": p["vis_state"]},
+            "payload": {"title": p["title"], "vis_type": p["vis_type"],
+                        "vis_state": p["vis_state"], "reason": p.get("reason", "")},
             "permission": self.permission.value,
         }
         proposed["generated_config"] = p["vis_state"]

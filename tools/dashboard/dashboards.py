@@ -68,7 +68,7 @@ class UpdateWazuhDashboard(BaseWazuhTool):
             "action": "update_wazuh_dashboard",
             "reason": p.get("reason", ""),
             "payload": {"dashboard_id": p["dashboard_id"], "title": p.get("title"),
-                        "panels": p["panels"]},
+                        "panels": p["panels"], "reason": p.get("reason", "")},
             "permission": self.permission.value,
         }
         proposed["generated_config"] = {"panelsJSON": panels_json}
@@ -113,7 +113,7 @@ class CreateWazuhDashboard(BaseWazuhTool):
             "action": "create_wazuh_dashboard",
             "reason": p.get("reason", ""),
             "payload": {"title": p["title"], "description": p.get("description", ""),
-                        "panels": panels},
+                        "panels": panels, "reason": p.get("reason", "")},
             "permission": self.permission.value,
         }
         proposed["generated_config"] = {"title": p["title"], "description": p.get("description", ""),
@@ -162,7 +162,7 @@ class DeleteWazuhDashboard(BaseWazuhTool):
         proposed = {
             "action": "delete_wazuh_dashboard",
             "reason": p.get("reason", ""),
-            "payload": {"dashboard_id": p["dashboard_id"]},
+            "payload": {"dashboard_id": p["dashboard_id"], "reason": p.get("reason", "")},
             "permission": self.permission.value,
         }
         proposed["validation"] = {"valid": True, "note": "Deletion requires approval + confirmation."}

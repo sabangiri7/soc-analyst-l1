@@ -94,10 +94,39 @@ def validate_wazuh_rule_xml(xml_text: str) -> dict[str, Any]:
     else:
         errors.append("Rule has no description (set the description attribute or add a <description> element).")
 
+    # frequency/timeframe/divide must be rule ATTRIBUTES (e.g.
+    # <rule id=... level=... frequency="3" timeframe="60">), NEVER child
+    # elements. The manager's ruleset loader rejects the child-element form
+    # ("Invalid option 'frequency' for rule") and the API reports it as a
+    # generic "XML syntax error" at upload time - catch it here instead.
+    _ATTR_ONLY_TAGS = ("frequency", "timeframe", "divide")
+    for tag in _ATTR_ONLY_TAGS:
+        el = root.find(tag)
+        if el is not None:
+            errors.append(
+                f"<{tag}> must be a rule ATTRIBUTE in this Wazuh version "
+                f'(e.g. <rule id="105000" level="10" {tag}="3" timeframe="60">), '
+                f"not a child element - the manager's ruleset loader rejects "
+                f"child-element <{tag}>."
+            )
+
+    # frequency/divide counting rules must reference their parent via
+    # if_matched_sid: this Wazuh build rejects if_sid on frequency rules
+    # ("Invalid use of frequency/context options. Missing if_matched on
+    # rule '...'"). Check the child element and the attribute forms.
+    if ("frequency" in root.attrib or "divide" in root.attrib) and not (
+        root.find("if_matched_sid") is not None or "if_matched_sid" in root.attrib
+    ):
+        errors.append(
+            "frequency/divide rules must count a parent rule reached via "
+            "<if_matched_sid> (e.g. <if_matched_sid>5760</if_matched_sid>) - "
+            "if_sid is rejected by the manager for frequency rules."
+        )
+
     # Top-level element whitelist (typo protection).
     _KNOWN_TAGS = {
-        "match", "regex", "if_sid", "if_group", "if_level", "decoded_as",
-        "field", "same_rule", "frequency", "timeframe", "timeout",
+        "match", "regex", "if_sid", "if_matched_sid", "if_group", "if_level",
+        "decoded_as", "field", "same_rule", "timeout",
         "syscheck", "ar", "group", "mitre", "options", "var", "list",
         "check_all", "check_any", "check_diff", "info", "alert_opts",
         "id", "level", "description", "accumulate", "relative_dirname",
@@ -106,12 +135,6 @@ def validate_wazuh_rule_xml(xml_text: str) -> dict[str, Any]:
     for child in root:
         if child.tag not in _KNOWN_TAGS:
             errors.append(f"Unknown rule element <{child.tag}>.")
-
-    # frequency/timeframe sanity: timeframe without frequency is meaningless.
-    freq = root.find("frequency")
-    tf = root.find("timeframe")
-    if tf is not None and freq is None:
-        errors.append("<timeframe> requires <frequency>.")
 
     return {
         "valid": not errors,

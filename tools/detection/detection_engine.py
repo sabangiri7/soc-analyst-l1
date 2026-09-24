@@ -29,6 +29,7 @@ engine never claims a rule works until that verification confirms it.
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from config import cfg
@@ -70,6 +71,44 @@ def _baseline_for(ctx: ToolContext, sample: str, log_format: str) -> dict[str, A
         "messages": info["messages"][:3],
         "location": info["location"],
     }
+
+
+def _baseline_in_session(ctx: ToolContext, sample: str, log_format: str,
+                         token: str | None) -> tuple[dict[str, Any], str | None]:
+    """Logtest one sample reusing an open logtest session (token) so
+    frequency/divide counters accumulate across samples. The session is NOT
+    closed here - the caller owns it. Returns (row, next_token)."""
+    try:
+        data = (ctx.wazuh.run_logtest(sample, log_format=log_format, token=token) or {}).get("data") or {}
+        info = _parse_logtest(data)
+        error = None
+    except Exception as e:  # noqa: BLE001 - surface cleanly
+        info, error = {}, str(e)[:200]
+    next_token = data.get("token") if not error else token
+    return ({
+        "sample": sample[:200],
+        "status": "matched" if (error is None and info.get("matched")) else "no_alert",
+        "rule_id": info.get("rule_id"),
+        "rule_level": info.get("rule_level"),
+        "rule_description": info.get("rule_description"),
+        "decoder_name": (info.get("decoder") or {}).get("name"),
+        "messages": (info.get("messages") or [])[:3],
+        "location": info.get("location"),
+        **({"error": error} if error else {}),
+    }), next_token
+
+
+def _rule_uses_frequency(ctx: ToolContext, rule_id: int) -> bool:
+    """True if the deployed local rule uses a frequency/divide attribute.
+    logtest evaluates samples in one session for such rules, because the
+    counter must reach the threshold before the rule fires."""
+    try:
+        content = ctx.wazuh.get_rules_file("local_rules.xml", raw=True) or ""
+    except Exception:  # noqa: BLE001 - treat as plain rule, verification still runs
+        return False
+    m = re.search(r"<rule\b(?=[^>]*\bid=\"%d\")(?:[^>]*)>.*?</rule>" % int(rule_id),
+                  content, re.S)
+    return bool(m and re.search(r"\b(?:frequency|divide)=\"[0-9]+\"", m.group(0)))
 
 
 def _classify_baseline(candidate_rule_id: int | None, row: dict[str, Any],
@@ -217,8 +256,10 @@ class DevelopWazuhRule(BaseWazuhTool):
         proposed = {
             "action": "create_wazuh_rule",
             "reason": p.get("reason", ""),
-            "payload": {"filename": LOCAL_RULES_FILE, "content": new_content,
-                        "rule_id": rid, "overwrite": False},
+            # The executed action re-merges the candidate rule into the CURRENT
+            # file at execution time (deterministic, never a stale snapshot).
+            "payload": {"rule_xml": xml, "overwrite": False,
+                        "reason": p.get("reason", "")},
             "permission": self.permission.value,
         }
         proposed["generated_config"] = new_content
@@ -267,19 +308,57 @@ class VerifyRuleDeployment(BaseWazuhTool):
         p = self.validate(params)
         rid = int(p["rule_id"])
         log_format = p.get("log_format") or "syslog"
-        results = []
-        for sample in [str(s)[:2000] for s in (p.get("positive_samples") or [])[:_SAMPLE_LIMIT]]:
-            row = _baseline_for(ctx, sample, log_format)
-            results.append({
-                "expected": "positive",
-                "pass": str(row.get("rule_id")) == str(rid),
-                "fired_rule": row.get("rule_id"),
-                "fired_description": row.get("rule_description"),
-                "decoder": row.get("decoder_name"),
-                "status": row.get("status"),
-                "sample": str(sample)[:160],
-            })
-        for sample in [str(s)[:2000] for s in (p.get("negative_samples") or [])[:_SAMPLE_LIMIT]]:
+        positives = [str(s)[:2000] for s in (p.get("positive_samples") or [])[:_SAMPLE_LIMIT]]
+        negatives = [str(s)[:2000] for s in (p.get("negative_samples") or [])[:_SAMPLE_LIMIT]]
+        freq = _rule_uses_frequency(ctx, rid)
+        results: list[dict[str, Any]] = []
+        token: str | None = None
+        session_note = ""
+        # frequency/divide rules need N matching events in ONE logtest session
+        # before they fire - send all positives through the same session so the
+        # counter accumulates. Plain rules are checked per-sample (fresh session).
+        if freq:
+            for sample in positives:
+                row, token = _baseline_in_session(ctx, sample, log_format, token)
+                results.append({
+                    "expected": "positive",
+                    "pass": str(row.get("rule_id")) == str(rid),
+                    "fired_rule": row.get("rule_id"),
+                    "fired_description": row.get("rule_description"),
+                    "decoder": row.get("decoder_name"),
+                    "status": row.get("status"),
+                    "sample": str(sample)[:160],
+                    **({"error": row["error"]} if row.get("error") else {}),
+                })
+            fired_pos = [i + 1 for i, r in enumerate(results)
+                         if r["expected"] == "positive" and str(r.get("fired_rule")) == str(rid)]
+            session_note = (
+                f"frequency/divide rule: positives were evaluated in a single logtest "
+                f"session (threshold accumulation). Fired on sample(s): {fired_pos}."
+                if fired_pos else
+                "frequency/divide rule: positives did NOT trip the counter in one "
+                "session - check the rule's frequency/timeframe vs. how many events "
+                "the sample set provides."
+            )
+        else:
+            for sample in positives:
+                row = _baseline_for(ctx, sample, log_format)
+                results.append({
+                    "expected": "positive",
+                    "pass": str(row.get("rule_id")) == str(rid),
+                    "fired_rule": row.get("rule_id"),
+                    "fired_description": row.get("rule_description"),
+                    "decoder": row.get("decoder_name"),
+                    "status": row.get("status"),
+                    "sample": str(sample)[:160],
+                    **({"error": row["error"]} if row.get("error") else {}),
+                })
+        if token:
+            try:
+                ctx.wazuh.end_logtest_session(token)
+            except Exception:  # noqa: BLE001 - best effort
+                pass
+        for sample in negatives:
             row = _baseline_for(ctx, sample, log_format)
             results.append({
                 "expected": "negative",
@@ -289,18 +368,28 @@ class VerifyRuleDeployment(BaseWazuhTool):
                 "decoder": row.get("decoder_name"),
                 "status": row.get("status"),
                 "sample": str(sample)[:160],
+                **({"error": row["error"]} if row.get("error") else {}),
             })
         pos_pass = sum(1 for r in results if r["expected"] == "positive" and r["pass"])
         neg_pass = sum(1 for r in results if r["expected"] == "negative" and r["pass"])
         pos_total = sum(1 for r in results if r["expected"] == "positive")
         neg_total = sum(1 for r in results if r["expected"] == "negative")
+        clean = not any(r.get("error") for r in results)
+        verified = (
+            pos_total > 0 and neg_pass == neg_total and clean and
+            ((not freq and pos_pass == pos_total) or
+             (freq and any(str(r.get("fired_rule")) == str(rid)
+                           for r in results if r["expected"] == "positive")))
+        )
         return {
             "rule_id": rid,
+            "frequency_rule": freq,
             "positive_pass": f"{pos_pass}/{pos_total}",
             "negative_pass": f"{neg_pass}/{neg_total}",
-            "verified": pos_total > 0 and pos_pass == pos_total and neg_pass == neg_total,
+            "verified": verified,
             "samples": results,
-            "note": "verified=True means the manager confirmed the rule fires on all positives and no negatives.",
+            "note": ("verified=True means the manager confirmed the rule fires on all "
+                     "positives and no negatives. " + session_note).strip(),
         }
 
 

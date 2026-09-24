@@ -41,6 +41,7 @@ import rules
 import notify
 import metrics
 import cases
+import audit
 
 app = Flask(__name__)
 
@@ -567,6 +568,167 @@ def api_agent_stop():
             pass
     stop_path.touch()
     return jsonify({"ok": True})
+
+
+# --------------------------------------------------------------------------- #
+# AI SOC Engineer - chat, focused builders, Approval Center, audit (PHASE 12).
+# --------------------------------------------------------------------------- #
+ENGINEER_LOG = Path("data/engineer_log.jsonl")
+AUDIT_LOG = Path("data/audit_log.jsonl")
+
+
+def _engineer_context(user: str = "dashboard-user", agent: str = "engineer_ui"):
+    from tools.api_client import WazuhManagerAPI
+    from tools.base import ToolContext
+    from tools.indexer_client import IndexerClient
+    return ToolContext(wazuh=WazuhManagerAPI(), indexer=IndexerClient(),
+                       user=user, agent=agent)
+
+
+@app.post("/api/engineer/chat")
+def api_engineer_chat():
+    """Run the conversational AI SOC engineer. Tool activity and proposals are
+    returned in the transcript; proposals are already persisted in the
+    Approval Center (approvals.json)."""
+    body = request.get_json(force=True, silent=True) or {}
+    message = (body.get("message") or "").strip()
+    history = body.get("history") or []
+    if not message:
+        return jsonify({"error": "message is required."}), 400
+    try:
+        from agent.soc_engineer import SOCEngineer
+        engineer = SOCEngineer(user="dashboard-user")
+        result = engineer.chat(user_message=message, history=list(history)[-20:])
+    except Exception as e:  # noqa: BLE001 - surface provider/config errors to the UI
+        return jsonify({"error": f"Engineer failed: {e}"}), 400
+
+    ENGINEER_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(ENGINEER_LOG, "a") as f:
+        f.write(json.dumps({
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "message": message,
+            "reply": result.reply,
+            "proposal_ids": [p.get("id") for p in result.proposals],
+            "tool_calls": [t.get("tool") for t in result.transcript if t.get("type") == "tool"],
+        }, default=str) + "\n")
+    return jsonify({
+        "reply": result.reply,
+        "data": result.data,
+        "proposals": result.proposals,
+        "transcript": result.transcript,
+    })
+
+
+@app.get("/api/engineer/tools")
+def api_engineer_tools():
+    """Canonical tool metadata (name/description/permission) for the builder
+    UIs - never arbitrary tool execution on its own."""
+    from tools.registry import build_tools_meta
+    return jsonify({"tools": build_tools_meta()})
+
+
+@app.post("/api/engineer/tool")
+def api_engineer_tool():
+    """Run one tool with the standard safety model: READ tools execute
+    immediately; PROPOSE/EXECUTE tools without an approved proposal produce an
+    approval_required outcome that lands in the Approval Center (no write
+    happens). The execute endpoint below is the only path that writes."""
+    body = request.get_json(force=True, silent=True) or {}
+    name = (body.get("tool") or "").strip()
+    params = body.get("params") or {}
+    if not name:
+        return jsonify({"error": "tool is required."}), 400
+    from tools.registry import execute as run_tool
+    ctx = _engineer_context(user=body.get("by") or "dashboard-user", agent="engineer_ui")
+    outcome = run_tool(ctx, name, params)
+    return jsonify(outcome)
+
+
+# ------------------------- Approval Center ------------------------- #
+@app.get("/api/proposals")
+def api_proposals():
+    import approvals
+    status = request.args.get("status") or None
+    return jsonify({"proposals": [approvals.public_view(p)
+                                  for p in approvals.list_proposals(status)]})
+
+
+@app.post("/api/proposals/<pid>/approve")
+def api_proposal_approve(pid: str):
+    import approvals
+    body = request.get_json(force=True, silent=True) or {}
+    by = body.get("by") or "dashboard-user"
+    try:
+        proposal = approvals.approve(pid, by)
+    except (ValueError, KeyError) as e:
+        return jsonify({"error": str(e)}), 400
+    audit.audit_log(tool="approval_center", action="proposal_approved",
+                    permission="human", approval_status="approved", params={},
+                    result={"proposal_id": pid, "by": by})
+    return jsonify({"proposal": approvals.public_view(proposal)})
+
+
+@app.post("/api/proposals/<pid>/reject")
+def api_proposal_reject(pid: str):
+    import approvals
+    body = request.get_json(force=True, silent=True) or {}
+    by = body.get("by") or "dashboard-user"
+    reason = body.get("reason") or ""
+    try:
+        proposal = approvals.reject(pid, by, reason)
+    except (ValueError, KeyError) as e:
+        return jsonify({"error": str(e)}), 400
+    audit.audit_log(tool="approval_center", action="proposal_rejected",
+                    permission="human", approval_status="rejected", params={},
+                    result={"proposal_id": pid, "by": by, "reason": reason})
+    return jsonify({"proposal": approvals.public_view(proposal)})
+
+
+@app.post("/api/proposals/<pid>/execute")
+def api_proposal_execute(pid: str):
+    """Execute an approved proposal deterministically with its stored payload.
+    EXECUTE-level actions (delete/restart/disable) require an explicit
+    'confirm' flag on top of the approval."""
+    import approvals
+    from tools.registry import execute as run_tool
+    body = request.get_json(force=True, silent=True) or {}
+    by = body.get("by") or "dashboard-user"
+    proposal = approvals.get_proposal(pid)
+    if not proposal:
+        return jsonify({"error": f"Proposal {pid} not found."}), 404
+    if proposal.get("status") != "approved":
+        return jsonify({"error": f"Proposal {pid} is not approved (status: "
+                                f"{proposal.get('status')})."}), 400
+    if proposal.get("permission") == "execute" and not body.get("confirm"):
+        return jsonify({"error": "EXECUTE-level action: this requires an "
+                                "explicit confirmation on top of the approval."}), 400
+
+    ctx = _engineer_context(user=by, agent="approval_executor")
+    ctx.approval = proposal  # the approved record gates the tool's approve_or_raise
+    try:
+        result = run_tool(ctx, proposal.get("action"), proposal.get("payload") or {},
+                          silent=True)
+    except Exception as e:  # noqa: BLE001 - tool failure surfaces with its audit row
+        return jsonify({"ok": False, "error": str(e)}), 200
+    # silent=True returns the raw result; param-validation failures arrive as
+    # {"status": "error", ...} instead of raising - treat them as failures too.
+    if isinstance(result, dict) and result.get("status") == "error":
+        return jsonify({"ok": False, "error": result.get("error", "execution failed"),
+                        "result": result}), 200
+
+    audit.audit_log(tool="approval_center", action="proposal_executed",
+                    permission="human", approval_status="approved",
+                    execution_status="success", params={},
+                    result={"proposal_id": pid, "by": by,
+                            "tool": proposal.get("action")})
+    return jsonify({"ok": True, "result": result})
+
+
+# ------------------------------ Audit log ------------------------------- #
+@app.get("/api/audit")
+def api_audit():
+    limit = int(request.args.get("limit", 100))
+    return jsonify({"entries": audit.read_audit_log(limit=limit)})
 
 
 if __name__ == "__main__":
