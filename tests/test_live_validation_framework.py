@@ -507,6 +507,33 @@ class DashboardWorkflowTests(unittest.TestCase):
         self.assertTrue(rows["dashboard exists with panels"].passed)
         self.assertTrue(rows["audit trail for create"].passed)
         self.assertIn("dash-1", env.created_dashboards)
+
+
+class DetectionGapsTests(unittest.TestCase):
+    def test_taxonomy_honesty(self):
+        env = make_env()
+        rows = [
+            {"category": "ssh metrics", "key": "SSH unknown-user abuse",
+             "state": "gap", "rules": 0, "alerts_seen": 0, "raw_events_seen": 12},
+            {"category": "ssh oddports", "key": "SSH odd ports",
+             "state": "covered_no_events", "rules": 2, "alerts_seen": 0, "raw_events_seen": 0},
+            {"category": "ssh olympics", "key": "SSH olympics",
+             "state": "unknown", "rules": 0, "alerts_seen": 0, "raw_events_seen": 0},
+        ]
+
+        def fake_exec(ctx, tool, params, **kw):
+            return {"target": "ssh", "time_range": "-7d", "coverage": rows,
+                    "gap_candidates": [r for r in rows if r["state"] in ("gap", "partial")],
+                    "summary": "1 category needs attention"}
+
+        with mock.patch("tools.registry.execute", side_effect=fake_exec):
+            log = scen.run_scenario(env, "detection_gaps", {"gaps_target": "ssh"})
+        st = log.scenario_status("detection_gaps")
+        self.assertEqual(st["status"], "PASS", st["failures"])
+        items = log.scenario_items("detection_gaps")
+        notes = {i.step: i.detail for i in items}
+        self.assertIn("clear detection-gap candidate", notes["gap row: SSH unknown-user abuse"])
+        self.assertIn("NOT proof of detection", notes["gap row: SSH odd ports"])
 class CliTests(unittest.TestCase):
     def test_refuses_without_live_flag(self):
         from live_validation.cli import main

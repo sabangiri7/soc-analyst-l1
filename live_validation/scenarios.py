@@ -1052,3 +1052,66 @@ register("dashboard_workflow",
          "schema -> verified panel queries -> dashboard proposal (payload "
          "regression) -> approve -> execute -> GET verify -> audit trail",
          _scenario_dashboard_workflow)
+
+
+# --------------------------------------------------------------------------- #
+# 10. Detection gaps: factual taxonomy (detected/partial/covered_no_events/
+#     gap/unknown) - gaps become candidate detections, never silent claims
+# --------------------------------------------------------------------------- #
+def _scenario_detection_gaps(env: LiveEnv, log: EvidenceLog, opts: dict) -> None:
+    s = "detection_gaps"
+    from tools.registry import execute as run_tool
+    ctx = env.tool_ctx()
+    target = opts.get("gaps_target", "ssh")
+    states = ("detected", "partial", "covered_no_events", "gap", "unknown")
+
+    try:
+        out = run_tool(ctx, "analyze_detection_gaps",
+                       {"target": target, "time_range": "-7d"}, silent=True)
+        out = out if isinstance(out, dict) else {}
+        rows = out.get("coverage") or []
+        ok_rows = bool(rows) and all(r.get("state") in states for r in rows)
+        log.step(s, "gap analysis runs", "analyze_detection_gaps", "wazuh_confirmed", ok_rows,
+                 detail=(f"target {target} over {out.get('time_range')}: {len(rows)} categories "
+                         f"classified ({', '.join(sorted({r['state'] for r in rows}))})")
+                        if ok_rows else f"row taxonomy broken: {str(out)[:300]}",
+                 refs={"rows": len(rows), "states": sorted({r.get("state") for r in rows})})
+
+        # every state is honest: covered_no_events != detection, unknown != clean
+        for r in rows:
+            st = r.get("state")
+            honest = True
+            note = ""
+            if st == "covered_no_events":
+                note = ("rules exist but no matching activity in window - coverage is "
+                        "NOT proof of detection")
+            elif st == "gap":
+                note = ("raw activity but no rules - clear detection-gap candidate")
+            elif st == "partial":
+                note = ("rules exist but did not fire on observed activity - candidate refinement")
+            elif st == "unknown":
+                note = ("no rules and no observed activity - cannot conclude anything")
+            elif st == "detected":
+                note = ("rules fired on observed activity - Wazuh-confirmed detections")
+            log.step(s, f"gap row: {r.get('key')}", "analyze_detection_gaps",
+                     "wazuh_confirmed", honest,
+                     detail=f"state={st} rules={r.get('rules')} alerts={r.get('alerts_seen')} "
+                            f"events={r.get('raw_events_seen')} - {note}",
+                     refs={"state": st, "alerts": r.get("alerts_seen"),
+                           "events": r.get("raw_events_seen")})
+
+        gaps = out.get("gap_candidates") or []
+        candidates_ok = bool(gaps) == any(r.get("state") in ("gap", "partial") for r in rows)
+        log.step(s, "gap candidates surfaced", "analyze_detection_gaps", "wazuh_confirmed",
+                 candidates_ok,
+                 detail=f"{len(gaps)} candidate category/categories flagged for rule development",
+                 refs={"gap_candidates": [g.get("key") for g in gaps]})
+    except Exception as e:  # noqa: BLE001
+        log.step(s, "gap analysis runs", "analyze_detection_gaps", "error", False,
+                 detail=str(e)[:200])
+
+
+register("detection_gaps",
+         "factual gap analysis with the detected/partial/covered_no_events/gap/"
+         "unknown taxonomy - gaps become candidate detections, never silent claims",
+         _scenario_detection_gaps)

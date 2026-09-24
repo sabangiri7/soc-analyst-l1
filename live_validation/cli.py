@@ -26,6 +26,7 @@ SCENARIO_ORDER = [
     "security_approval_bypass",
     "security_prompt_injection",
     "dashboard_workflow",
+    "detection_gaps",
 ]
 
 
