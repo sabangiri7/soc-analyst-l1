@@ -117,6 +117,7 @@ class QRadarConnector(SIEMConnector):
         alert_id = row.get("eventID") or row.get("startTime") or row.get("endTime") or ""
         return {
             "alert_id": str(alert_id),
+            "rule_id": None,
             "rule_name": row.get("name") or row.get("category") or "QRadar event",
             "severity": str(row.get("severity", "unknown")),
             "description": row.get("description") or row.get("message", ""),

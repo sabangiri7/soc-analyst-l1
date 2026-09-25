@@ -51,7 +51,7 @@ class TestMockSiemConnector(unittest.TestCase):
         alerts = self.conn.get_new_alerts()
         self.assertTrue(alerts)
         for a in alerts:
-            for key in ("alert_id", "rule_name", "severity", "description", "raw_fields"):
+            for key in ("alert_id", "rule_id", "rule_name", "severity", "description", "raw_fields"):
                 self.assertIn(key, a)
 
     def test_ids_are_namespaced_per_provider(self):

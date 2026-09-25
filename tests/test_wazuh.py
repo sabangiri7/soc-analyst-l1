@@ -129,6 +129,7 @@ class TestWazuhConnector(unittest.TestCase):
 
         a = alerts[0]
         self.assertEqual(a["alert_id"], "1810012345")
+        self.assertEqual(a["rule_id"], "5712")
         self.assertEqual(a["rule_name"], "Multiple failed logins")
         self.assertEqual(a["severity"], "high")  # rule.level 10
         self.assertEqual(a["host"], "wks-fin-0231")
@@ -140,6 +141,7 @@ class TestWazuhConnector(unittest.TestCase):
         self.assertEqual(b["severity"], "medium")
         self.assertEqual(b["user"], "jsmith")
         self.assertEqual(b["alert_id"], "alert124")  # falls back to doc _id
+        self.assertEqual(b["rule_id"], "x")
 
         # query was sent to the alerts index
         self.assertIn("wazuh-alerts-*/_search", post.call_args.args[0])

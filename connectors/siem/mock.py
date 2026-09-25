@@ -21,6 +21,7 @@ from connectors.siem.base import SIEMConnector, resolve_cfg
 BASE_ALERTS = [
     {
         "alert_id": "SPLK-10231",
+        "rule_id": "R-10231",
         "rule_name": "Brute Force - Multiple Auth Failures Then Success",
         "severity": "high",
         "description": "12 failed logins followed by 1 successful login for user jsmith@corp.local from IP 185.220.101.7",
@@ -36,6 +37,7 @@ BASE_ALERTS = [
     },
     {
         "alert_id": "SPLK-10245",
+        "rule_id": "R-10245",
         "rule_name": "EDR Malware Detection - Suspicious Process",
         "severity": "critical",
         "description": "CrowdStrike flagged powershell.exe spawned by WINWORD.EXE with base64-encoded command line on host WKS-FIN-0231",
@@ -51,6 +53,7 @@ BASE_ALERTS = [
     },
     {
         "alert_id": "SPLK-10250",
+        "rule_id": "R-10250",
         "rule_name": "Phishing - User Reported Suspicious Email",
         "severity": "medium",
         "description": "User reported an email claiming to be from IT support asking to verify credentials via a link",
@@ -95,6 +98,7 @@ class MockSiemConnector(SIEMConnector):
             copy = dict(a)
             copy["raw_fields"] = dict(a.get("raw_fields", {}))
             copy["alert_id"] = f"{prefix}-{a.get('alert_id', 'MOCK-1')}"
+            copy["rule_id"] = a.get("rule_id")  # None when a custom seed file omits it
             out.append(copy)
         return out
 

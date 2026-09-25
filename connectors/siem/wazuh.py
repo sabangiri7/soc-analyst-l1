@@ -207,6 +207,7 @@ class WazuhConnector(SIEMConnector):
         )
         return {
             "alert_id": src.get("id") or doc_id,
+            "rule_id": rule.get("id") if isinstance(rule, dict) else None,
             "rule_name": (rule.get("description") if isinstance(rule, dict) else None)
                 or (rule.get("groups", [None])[0] if isinstance(rule, dict) else None)
                 or "Wazuh alert",

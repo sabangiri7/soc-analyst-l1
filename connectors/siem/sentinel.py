@@ -121,6 +121,7 @@ class SentinelConnector(SIEMConnector):
     def _normalize(row: dict[str, Any]) -> dict[str, Any]:
         return {
             "alert_id": str(row.get("SystemAlertId") or row.get("AlertName") or ""),
+            "rule_id": None,
             "rule_name": row.get("AlertName") or "Sentinel alert",
             "severity": str(row.get("Severity", "unknown")),
             "description": row.get("Description") or row.get("AlertType", ""),

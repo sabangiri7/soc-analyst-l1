@@ -113,6 +113,7 @@ class ElasticConnector(SIEMConnector):
         source = src.get("source") or {}
         return {
             "alert_id": src.get("kibana.alert.uuid") or doc_id,
+            "rule_id": src.get("kibana.alert.rule.uuid"),
             "rule_name": src.get("kibana.alert.rule.name") or "Elastic alert",
             "severity": str(src.get("kibana.alert.severity", "unknown")),
             "description": src.get("message") or src.get("kibana.alert.rule.description", ""),

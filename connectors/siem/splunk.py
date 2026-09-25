@@ -115,6 +115,7 @@ class SplunkConnector(SIEMConnector):
         alert_id = row.get("event_id") or row.get("rule_id") or row.get("_key") or row.get("_cd") or ""
         return {
             "alert_id": str(alert_id),
+            "rule_id": row.get("rule_id"),
             "rule_name": row.get("rule_name") or row.get("name") or "Splunk notable",
             "severity": row.get("severity") or row.get("urgency") or "unknown",
             "description": row.get("description") or row.get("_raw", ""),
