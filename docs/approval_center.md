@@ -38,7 +38,31 @@ exceptions and `result.status == "error"` are failures.
 ## Audit
 
 Approval Center human actions write audit rows with `permission="human"`
-(`data/audit_log.jsonl`); registry execution rows carry the proposal id.
+(`data/audit_log.jsonl`); registry execution rows carry the proposal id. That
+includes `proposal_rejected` (rejections record the reason) and the CLI's
+`/approve` `/reject` `/execute` — same rows, same store.
+
+## Terminal (CLI) operator face
+
+The terminal agent (`scripts_engineer_cli.py`) is a second face on **this
+same** lifecycle — the CLI calls the same `approvals.py` functions the
+dashboard endpoints call:
+
+- `/proposals [status]` lists the store; `/proposals <id>` prints the full
+  `public_view` (generated config diff, validation evidence, approvals,
+  status) for review before signing.
+- `/approve <id>`, `/reject <id> [reason]`, and `/execute <id> --confirm`
+  resolve through `approvals.approve` / `approvals.reject` and
+  `approval_executor.execute_proposal` — EXECUTE-level tools still require the
+  explicit `--confirm`, and execution is still the deterministic stored-payload
+  re-run. Nothing is written on the agent's say-so.
+- The operator's identity is `--user` (default engine user) with
+  `identity_verified=False` — no dashboard token involved, so this face is
+  only appropriate on a trusted local machine. The web center remains the
+  path for token-verified remote approvers.
+- After every REPL turn the CLI prints `N approval(s) pending - /proposals
+  pending to review`, reading the same live store; stale `pending` proposals
+  are expired on read by `list_proposals`.
 
 ## Why payload round-tripping matters
 

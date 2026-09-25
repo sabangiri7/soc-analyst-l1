@@ -7,7 +7,7 @@ deploying the AI SOC Engineer anywhere with write access.
 
 | Level | Meaning | Executes when |
 |---|---|---|
-| `READ` | Query-only: search alerts/events, list rules/decoders/agents, status, schema, logtest analysis, RAG retrieval | Immediately, every call |
+| `READ` | Query-only: search alerts/events, list rules/decoders/agents, status, schema, logtest analysis, RAG retrieval **and rule-snapshot ingest** (`ingest_wazuh_rules` — pulls manager rules READ-only into the local RAG, never modifies the manager) | Immediately, every call |
 | `PROPOSE` | The tool *plans* and validates a concrete change (rule XML, decoder, dashboard bundle) but performs no write | Only after a human approves the plan in the Approval Center |
 | `EXECUTE` | High-risk: delete rule/decoder, restart manager, disable agent, active response | Only after approval **and** an explicit `confirm` flag |
 
@@ -61,6 +61,13 @@ Every registry call writes a row to `data/audit_log.jsonl`: tool, redacted
 params, permission level, approval status, execution status, and a small
 result summary (never the full blob). Human actions in the Approval Center
 (approve / reject / execute) are audited too, with `permission="human"`.
+
+Both operator faces go through this same gate. The terminal agent
+(`scripts_engineer_cli.py`) makes the same registry calls, and its human
+actions (`/approve` `/reject` `/execute`) resolve through the same
+`approvals.py` + `approval_executor.py` code with identical audit rows. Its
+operator identity is `--user` with `identity_verified=False` (trusted local
+machine only); the dashboard center uses token-verified identities.
 
 See also: `docs/approval_center.md` (the lifecycle + UI), `docs/architecture.md`
 (the full surface), `docs/prompt_injection_defense.md` (why tool results are

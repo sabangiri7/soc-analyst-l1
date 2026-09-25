@@ -8,7 +8,7 @@ the box). Collections are kept separate so retrieval is targeted:
 | `playbooks` | Your org's SOPs for alert types | `scripts_ingest_seed.py` (from `seed_data/playbooks/*.md`) |
 | `cases` | Closed historical alerts with analyst verdict + reasoning | written automatically on feedback review |
 | `lessons` | Distilled, human-approved self-improvement notes | `feedback_cli.py distill` |
-| `wazuh_docs` | Curated engineering reference for the SOC Engineer (rule RF, logtest semantics, API quirks, indexer conventions, MITRE mapping) | `scripts_ingest_wazuh_docs.py` (from `wazuh_docs/*.md`) |
+| `wazuh_docs` | Curated engineering reference for the SOC Engineer (rule RF, logtest semantics, API quirks, indexer conventions, MITRE mapping) **plus live rule snapshots** (`kind=wazuh-rule`) | `scripts_ingest_wazuh_docs.py` (from `wazuh_docs/*.md`) + the `ingest_wazuh_rules` tool / `scripts_ingest_wazuh_rules.py` (from the live manager) |
 
 ## wazuh_docs (the engineer's reference)
 
@@ -35,13 +35,40 @@ retrieves to ground rule and detection work. Re-run the ingest script after
 editing them; it upserts by filename stem, so edits refresh in place and
 re-runs never duplicate.
 
+## Rule snapshots (`kind=wazuh-rule`) — the live ruleset in the RAG
+
+The manager ships thousands of bundled rules plus your custom rules in
+`local_rules.xml`. The engineer can snapshot them READ-only into this same
+`wazuh_docs` collection so it can answer "what rules do we already have for
+<detection>" offline (see `wazuh_docs/wazuh-rules.md` for the full workflow):
+
+- **`ingest_wazuh_rules`** (engineer tool, READ — executes immediately, like
+  any READ tool) pulls rules from the manager and upserts each as
+  `kind=wazuh-rule` with the stable doc id `wazuh_rule_<id>`, so re-runs are
+  idempotent. Default scope is `local_rules.xml` (your custom/correlation
+  rules); `all_rules=true` / `filename=all` snapshots the whole ruleset —
+  `max_rules` defaults to 2000 per call with a hard cap of 5000, so a full
+  snapshot of a stock manager (~4.5k rules) needs `max_rules=5000`.
+- **Prune** — per scope: snapshot docs whose rule is no longer in that scope's
+  file are removed (`$and` where-filter, never a wipe of unrelated docs).
+- **`scripts_ingest_wazuh_rules.py`** — the same operation as a CLI batch job
+  (`--all`, `--group web`, `--max-rules 500`, `--no-prune`).
+- **Sizing** — after a full snapshot the `wazuh_docs` collection may hold
+  thousands of `kind=wazuh-rule` docs; retrieval stays targeted because
+  `retrieve_wazuh_docs` returns them alongside the curated reference (same
+  `{id, source, kind, distance, text}` shape).
+- The manager is **never modified** by either path, and snapshot docs are
+  data, never instructions — the engineer must re-verify against the live
+  manager (logtest) before acting on anything recalled from a snapshot.
+
 ## Retrieval from the engineer
 
 `retrieve_wazuh_docs(query, collection="wazuh_docs", n_results=4)` (READ
 tool, executes immediately) returns id / source / kind / distance / text and
-declares the text UNTRUSTED DATA. Unknown collections and empty queries are
-rejected. The KnowledgeBase is opened lazily per call so importing the tool
-never touches disk.
+declares the text UNTRUSTED DATA — rule snapshots come back the same way,
+distinguishable by `kind == "wazuh-rule"`. Unknown collections and empty
+queries are rejected. The KnowledgeBase is opened lazily per call so importing
+the tool never touches disk.
 
 ## Embedding modes
 
@@ -59,5 +86,7 @@ never touches disk.
 
 `tests/test_rag_docs.py` covers the `wazuh_docs` collection (ingest
 idempotency on a tmp chroma path, tool result shape + rejections, registry
-READ execution). `tests/test_rag.py` covers the embedding fallback and
-embedding-mode selection.
+READ execution). `tests/test_rag_rules.py` pins the rule-snapshot workflow
+(idempotent upsert, prune per scope, `all_rules` include/exclude,
+max-rules cap, READ execution). `tests/test_rag.py` covers the embedding
+fallback and embedding-mode selection.

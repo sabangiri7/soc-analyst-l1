@@ -76,4 +76,7 @@ directly) plus a registry-layer test (approvals/audit patched so `data/*` is
 never written from tests). Live verification against a dev Wazuh stack:
 propose → approve → execute → restart → verify → delete → restart → verify
 gone → confirm the audit trail has every step and `local_rules.xml` is
-pristine again.
+pristine again. The approve/execute steps run from the **dashboard Approval
+Center or the terminal agent** (`scripts_engineer_cli.py` `/approve`
+`/execute <id> --confirm`) — both resolve through the same
+`approval_executor`.
