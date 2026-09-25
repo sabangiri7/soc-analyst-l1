@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import guard
 from config import cfg
@@ -160,16 +160,27 @@ class SOCEngineer:
 
     # ------------------------------------------------------------------ #
     def chat(self, *, user_message: str,
-             history: list[dict[str, Any]] | None = None) -> EngineerResult:
+             history: list[dict[str, Any]] | None = None,
+             system: str | None = None,
+             on_step: Callable[[dict[str, Any]], None] | None = None) -> EngineerResult:
+        """Run one agentic turn.
+
+        `system` overrides/augments the default SYSTEM_PROMPT (used by the CLI
+        to inject active skill packs). `on_step`, when given, is called with
+        each transcript step dict {"assistant", "tool_calls"} just before that
+        round of tools is executed - the dashboard passes neither and is
+        unaffected.
+        """
         messages: list[dict[str, Any]] = list(history or [])
         messages.append({"role": "user", "content": user_message})
         transcript: list[dict[str, Any]] = []
         proposals: list[dict[str, Any]] = []
+        system_prompt = system or SYSTEM_PROMPT
 
         for _ in range(MAX_TOOL_TURNS):
             try:
                 resp = self.llm.chat(
-                    system=SYSTEM_PROMPT,
+                    system=system_prompt,
                     messages=messages,
                     tools=self.tools,
                     max_tokens=4096,
@@ -187,6 +198,8 @@ class SOCEngineer:
                 "assistant": resp.content or "",
                 "tool_calls": [{"name": tc.name, "input": _tool_input(tc)} for tc in resp.tool_calls],
             })
+            if on_step is not None:
+                on_step(transcript[-1])
             messages.append({
                 "role": "assistant",
                 "content": resp.content,
