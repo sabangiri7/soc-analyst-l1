@@ -241,6 +241,38 @@ class TestIngestWazuhRulesTool(KbTestCase):
             self.assertTrue(out["selected"]["all_rules"])
             self.assertEqual(out["rules_stored"], 2)
 
+    def test_all_rules_param_collects_full_ruleset(self):
+        from tools.rag.ingest import IngestWazuhRules
+        ctx = self._ctx([_rule(i) for i in (100001, 100002)])
+        out = IngestWazuhRules().run(ctx, all_rules=True)
+        self.assertIsNone(out["selected"]["filename"])
+        self.assertTrue(out["selected"]["all_rules"])
+        self.assertEqual(out["rules_stored"], 2)
+        self.assertTrue(all(c["filename"] is None for c in ctx.wazuh.calls))
+
+    def test_all_rules_param_accepts_string_true_like_llm_wire(self):
+        # The agent sends JSON {all_rules: "True"}; validate() must coerce the
+        # string to a real boolean, NOT drop it and fall back to local_rules.xml.
+        from tools.rag.ingest import IngestWazuhRules
+        for raw in ("True", "true", 1):
+            ctx = self._ctx([_rule(i) for i in (100001, 100002)])
+            out = IngestWazuhRules().run(ctx, all_rules=raw)
+            self.assertTrue(out["selected"]["all_rules"], f"raw={raw!r}")
+            self.assertIsNone(out["selected"]["filename"], f"raw={raw!r}")
+            self.assertEqual(out["rules_stored"], 2, f"raw={raw!r}")
+            self.assertTrue(
+                all(c["filename"] is None for c in ctx.wazuh.calls),
+                f"raw={raw!r} must not filter by local_rules.xml",
+            )
+
+    def test_all_rules_false_defaults_to_local_rules(self):
+        from tools.rag.ingest import IngestWazuhRules
+        ctx = self._ctx([_rule(100001), _rule(100002)])
+        out = IngestWazuhRules().run(ctx, all_rules=False)
+        self.assertFalse(out["selected"]["all_rules"])
+        self.assertEqual(out["selected"]["filename"], "local_rules.xml")
+        self.assertEqual(ctx.wazuh.calls[0]["filename"], "local_rules.xml")
+
     def test_max_rules_clamped(self):
         from tools.rag.ingest import IngestWazuhRules
         rules = [_rule(i) for i in range(1000, 1200)]

@@ -37,6 +37,12 @@ class IngestWazuhRules(BaseWazuhTool):
                                "(default). Use 'all' / 'all-rules' to snapshot "
                                "the entire ruleset.",
             },
+            "all_rules": {
+                "type": "boolean",
+                "description": "Snapshot the ENTIRE ruleset from the manager "
+                               "(equivalent to filename='all'). Default false = "
+                               "only the custom local_rules.xml.",
+            },
             "group": {
                 "type": "string",
                 "description": "Only snapshot rules in this group (e.g. 'syslog').",
@@ -64,7 +70,9 @@ class IngestWazuhRules(BaseWazuhTool):
     def run(self, ctx: ToolContext, **params: Any) -> Any:
         p = self.validate(params)
         filename = (p.get("filename") or "").strip() or None
-        all_rules = bool(filename and filename.lower() in ("all", "all-rules"))
+        all_rules = bool(p.get("all_rules")) or bool(
+            filename and filename.lower() in ("all", "all-rules")
+        )
         if all_rules:
             filename = None
         max_rules = int(p.get("max_rules") or 2000)
