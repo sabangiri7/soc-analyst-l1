@@ -13,9 +13,14 @@ python scripts_engineer_cli.py --session web -m "…"   # persisted turn
 python scripts_engineer_cli.py --session web --resume # continue the REPL
 python scripts_engineer_cli.py --list-sessions
 python scripts_engineer_cli.py --with-skill wazuh-rule-authoring -m "…"
+python scripts_engineer_cli.py --auto-skills -m "detect sshd brute force"
+python scripts_engineer_cli.py --add-skill /path/to/skill-dir   # install a pack
+python scripts_engineer_cli.py --new-skill my-skill            # scaffold a template
 python scripts_engineer_cli.py --list-skills
 python scripts_engineer_cli.py --list-proposals pending
+python scripts_engineer_cli.py --proposal appr-abc123          # full diff/detail
 python scripts_engineer_cli.py --approve appr-abc123
+python scripts_engineer_cli.py --reject appr-abc123 --reason "duplicate of appr-7"
 python scripts_engineer_cli.py --execute appr-abc123 --confirm
 ```
 
@@ -60,6 +65,17 @@ skills/
 
 - `--with-skill <name>` (repeatable) or `/use <name>` / `/unuse <name>` in the
   REPL activate packs for the session.
+- **Install a pack** the coding-agent way: `--add-skill /path/to/dir` or
+  `/add-skill <path>` copies a validated pack (SKILL.md + resources, capped at
+  512 KB) into `skills/` and activates it for the session. Refuses to clobber an
+  existing pack unless you delete it first.
+- **Scaffold a new pack**: `--new-skill <name>` or `/new-skill <name>` writes a
+  starter `SKILL.md` template you can edit; it is not auto-activated.
+- **Contextual auto-activation**: `--auto-skills` (or `/auto-skills on|off`)
+  picks up to 3 installed skills per turn by keyword overlap with your message
+  (deterministic, no guesses - a skill must share real terms with the ask).
+  Auto-activated skills are merged into the turn's system prompt, printed after
+  the reply, and recorded separately in the audit/session as `auto_skills`.
 - Active skills are injected into the model's **system prompt** inside
   explicit `<SKILL name='…' role='instruction'>` markers, so the model can
   always tell trusted operator instructions from retrieved Wazuh content.
@@ -67,7 +83,7 @@ skills/
   skill loader sanitizes bodies and neutralizes marker-shaped text, and never
   reads skill content from Wazuh.
 - The active set is audited with every turn.
-- To add your own skill: copy the pack pattern, keep the name lowercase
+- To add your own skill by hand: copy the pack pattern, keep the name lowercase
   (`[a-z0-9-]`), match the directory name to the frontmatter `name`, and
   re-run `--list-skills` to confirm it loads. A malformed pack is skipped when
   listing but rejected loudly when explicitly requested.
@@ -79,13 +95,25 @@ skills/
 /skills              list installed skill packs (+ which are active)
 /use <name>          activate a skill pack for this session
 /unuse <name>        deactivate a skill pack
+/add-skill <path>    install a skill pack directory into skills/
+/new-skill <name>    scaffold a starter SKILL.md template
+/auto-skills on|off  toggle contextual skill auto-activation
 /new                 reset conversation history
 /proposals [status]  list proposals (default: pending)
+/proposals <id>      full detail of one proposal (diff, validation, approvals)
 /approve <id>        approve a pending proposal
-/execute <id> [--confirm]   execute an approved proposal (--confirm for EXECUTE-level)
+/reject <id> [reason...]     reject a pending proposal (reason audited)
+/execute <id> [--confirm]    execute an approved proposal (--confirm for EXECUTE-level)
+/status              manager daemon status (running / stopped daemons)
 /audit [limit]       tail the audit log (default 10)
 /exit, /quit         leave the REPL
 ```
+
+The whole Approval Center runs in-terminal: after every REPL turn a banner
+reports how many proposals are pending (`N approval(s) pending -
+/proposals pending to review`), and `/proposals <id>`, `/reject <id>`,
+`/status` give you the same picture as the dashboard without leaving the CLI.
+One-shot equivalents: `--proposal <id>`, `--reject <id> --reason "…"`.
 
 ## Sessions
 

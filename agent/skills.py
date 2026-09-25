@@ -24,6 +24,7 @@ the active skill set with every run.
 from __future__ import annotations
 
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,17 @@ DEFAULT_SKILLS_ROOT = Path(__file__).resolve().parent.parent / "skills"
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _FRONTMATTER_RE = re.compile(r"^\ufeff?---[ \t]*\n(.*?)\n---[ \t]*\n", re.DOTALL)
 _DESCRIPTION_CAP = 300
+_INSTALL_SIZE_CAP = 512 * 1024  # refuse skill packs that copy > 512KB
+_STOPWORDS = frozenset(
+    (
+        "the a an and or but for with you your its our their this that these those "
+        "from have has had will would could should can may might must shall is are "
+        "was were be been being do does did not no so to of in on at by as it he "
+        "she they we i me my what which who whom when where why how about into over "
+        "under only just then than there here also other more most some any all "
+        "each few both once new need needs help please list show me us give"
+    ).split()
+)
 
 
 class SkillError(ValueError):
@@ -167,12 +179,100 @@ def skill_names(root: str | Path | None = None) -> list[str]:
     return [s.name for s in discover_skills(root=root)]
 
 
+# --------------------------------------------------------------------------- #
+# install / scaffold / suggest - the "coding agent" affordances
+# --------------------------------------------------------------------------- #
+def install_skill(src: str | Path, root: str | Path | None = None,
+                  overwrite: bool = False) -> Skill:
+    """Install a skill pack directory into the skills root (like a marketplace
+    install): validates the pack, copies SKILL.md + resources, and returns the
+    loaded Skill. Refuses to overwrite an existing pack unless `overwrite`."""
+    src_dir = Path(src)
+    if not src_dir.is_dir() or not (src_dir / "SKILL.md").exists():
+        raise SkillError(f"source {src_dir} is not a skill pack (missing SKILL.md)")
+    skill = _load_one(src_dir)
+    base = Path(root or DEFAULT_SKILLS_ROOT)
+    dest = base / skill.name
+    if dest.exists() and not overwrite:
+        raise SkillError(
+            f"skill {skill.name!r} already exists at {dest} "
+            f"(use overwrite=True to replace it)"
+        )
+    total = 0
+    files = [src_dir / "SKILL.md", *sorted(p for p in src_dir.iterdir()
+                                           if p.is_file() and p.name != "SKILL.md")]
+    for src_file in files:
+        total += src_file.stat().st_size
+        if total > _INSTALL_SIZE_CAP:
+            raise SkillError(
+                f"skill pack {skill.name!r} is larger than {_INSTALL_SIZE_CAP} bytes; "
+                f"refusing to install"
+            )
+    dest.mkdir(parents=True, exist_ok=True)
+    for src_file in files:
+        shutil.copy2(src_file, dest / src_file.name)
+    return load_skill(skill.name, root=base)
+
+
+def scaffold_skill(name: str, description: str = "", root: str | Path | None = None) -> Path:
+    """Create a starter SKILL.md for a new skill pack (the pack is *not*
+    auto-activated - the operator edits it and activates with /use)."""
+    name = str(name).strip().lower()
+    if not _NAME_RE.match(name):
+        raise SkillError(
+            f"skill name {name!r} is invalid (use lowercase letters, digits, hyphens)"
+        )
+    base = Path(root or DEFAULT_SKILLS_ROOT)
+    dest = base / name / "SKILL.md"
+    if dest.exists():
+        raise SkillError(f"skill {name!r} already exists at {dest}")
+    desc = sanitize_text(description).strip() or "TODO - what this skill teaches"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(
+        f"---\nname: {name}\ndescription: {desc}\nversion: 0.1.0\n---\n"
+        f"# {name}\n\nWrite focused instructions for the SOC engineer here - "
+        f"workflow steps, hard constraints, tool names, gotchas.\n",
+        encoding="utf-8",
+    )
+    return dest
+
+
+def _tokens(text: str) -> set[str]:
+    words = set(re.findall(r"[a-z0-9]{3,}", text.lower()))
+    return {w for w in words if w not in _STOPWORDS}
+
+
+def suggest_skills(message: str, top_k: int = 3, root: str | Path | None = None) -> list[str]:
+    """Rank installed skills by keyword overlap with a user message (contextual
+    auto-activation, like a coding agent that pulls in the right skill for the
+    task). Deterministic; never guesses - a skill matches only on real term
+    overlap. Returns names, best first, at most `top_k`."""
+    if not message or not message.strip():
+        return []
+    msg_tokens = _tokens(message)
+    if not msg_tokens:
+        return []
+    scored: list[tuple[int, str]] = []
+    for skill in discover_skills(root=root):
+        haystack = _tokens(f"{skill.description} {skill.body}")
+        if not haystack:
+            continue
+        pick = len(msg_tokens & haystack)
+        if pick:
+            scored.append((pick, skill.name))
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    return [name for _, name in scored[:top_k]]
+
+
 __all__ = [
     "DEFAULT_SKILLS_ROOT",
     "Skill",
     "SkillError",
     "active_skill_blocks",
     "discover_skills",
+    "install_skill",
     "load_skill",
+    "scaffold_skill",
     "skill_names",
+    "suggest_skills",
 ]

@@ -16,8 +16,11 @@ from agent.skills import (
     SkillError,
     active_skill_blocks,
     discover_skills,
+    install_skill,
     load_skill,
+    scaffold_skill,
     skill_names,
+    suggest_skills,
 )
 
 GOOD_PACK = """---
@@ -162,6 +165,130 @@ class TestSkillsRendering(unittest.TestCase):
     def test_active_skill_blocks_unknown_raises(self):
         with self.assertRaises(SkillError):
             active_skill_blocks(["wazuh-rule-authoring", "not-a-skill"])
+
+
+class TestSkillsInstallScaffold(unittest.TestCase):
+    def test_install_copies_pack_and_resources(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as root:
+            src = Path(td)
+            _write_pack(src, "demo", GOOD_PACK)
+            (src / "demo" / "example.txt").write_text("sample", encoding="utf-8")
+            skill = install_skill(src / "demo", root=root)
+            self.assertEqual(skill.name, "demo")
+            self.assertEqual(skill.resources, ("example.txt",))
+            installed = Path(root) / "demo"
+            self.assertTrue((installed / "SKILL.md").exists())
+            self.assertTrue((installed / "example.txt").exists())
+            self.assertEqual(load_skill("demo", root=root).description, "A demo skill for tests.")
+
+    def test_install_refuses_existing_without_overwrite(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as root:
+            src = Path(td)
+            _write_pack(src, "demo", GOOD_PACK)
+            install_skill(src / "demo", root=root)
+            with self.assertRaises(SkillError) as cm:
+                install_skill(src / "demo", root=root)
+            self.assertIn("already exists", str(cm.exception))
+
+    def test_install_overwrite_replaces(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as root:
+            src = Path(td)
+            _write_pack(src, "demo", GOOD_PACK)
+            install_skill(src / "demo", root=root)
+            v2 = GOOD_PACK.replace("version: 2.1.0", "version: 9.9.9")
+            (src / "demo" / "SKILL.md").write_text(v2, encoding="utf-8")
+            skill = install_skill(src / "demo", root=root, overwrite=True)
+            self.assertEqual(skill.version, "9.9.9")
+
+    def test_install_rejects_non_pack_source(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "empty"
+            src.mkdir()
+            with self.assertRaises(SkillError):
+                install_skill(src)
+
+    def test_install_rejects_oversized_pack(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as root:
+            src = Path(td)
+            _write_pack(src, "demo", GOOD_PACK)
+            (src / "demo" / "big.bin").write_bytes(b"x" * (512 * 1024 + 1))
+            with self.assertRaises(SkillError):
+                install_skill(src / "demo", root=root)
+
+    def test_scaffold_creates_editable_template(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            md = scaffold_skill("my-rule-pack", description="does things", root=root)
+            self.assertTrue(md.exists())
+            text = md.read_text(encoding="utf-8")
+            self.assertIn("name: my-rule-pack", text)
+            self.assertIn("description: does things", text)
+            self.assertIn("version: 0.1.0", text)
+            self.assertIn("# my-rule-pack", text)
+
+    def test_scaffold_refuses_existing(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            scaffold_skill("dup", root=root)
+            with self.assertRaises(SkillError):
+                scaffold_skill("dup", root=root)
+
+    def test_scaffold_rejects_bad_name(self):
+        with self.assertRaises(SkillError):
+            scaffold_skill("Bad_Name!")
+
+
+class TestSkillsSuggestion(unittest.TestCase):
+    def _root_with(self):
+        td = tempfile.TemporaryDirectory()
+        root = Path(td.name)
+        _write_pack(root, "sshd", GOOD_PACK.replace("name: demo", "name: sshd").replace(
+            "# Demo", "# Sshd brute force - failed auth, sshd, authentication failures"))
+        _write_pack(root, "web", GOOD_PACK.replace("name: demo", "name: web").replace(
+            "# Demo", "# Web attacks - sql injection, webshell, xss"))
+        return td, root
+
+    def test_suggest_ranks_relevant_skill_first(self):
+        td, root = self._root_with()
+        try:
+            names = suggest_skills("detect brute force on sshd", root=root)
+            self.assertEqual(names[0], "sshd")
+            web = suggest_skills("find sql injection attacks", root=root)
+            self.assertEqual(web[0], "web")
+        finally:
+            td.cleanup()
+
+    def test_suggest_empty_message(self):
+        td, root = self._root_with()
+        try:
+            self.assertEqual(suggest_skills("", root=root), [])
+            self.assertEqual(suggest_skills("   ", root=root), [])
+        finally:
+            td.cleanup()
+
+    def test_suggest_no_guess_without_overlap(self):
+        td, root = self._root_with()
+        try:
+            names = suggest_skills("how is the weather today", root=root)
+            self.assertEqual(names, [])
+        finally:
+            td.cleanup()
+
+    def test_suggest_top_k_respected(self):
+        td, root = self._root_with()
+        try:
+            names = suggest_skills("sshd web brute force sql", root=root, top_k=1)
+            self.assertEqual(len(names), 1)
+        finally:
+            td.cleanup()
+
+    def test_suggest_ignores_stopwords_only(self):
+        td, root = self._root_with()
+        try:
+            names = suggest_skills("the and for with", root=root)
+            self.assertEqual(names, [])
+        finally:
+            td.cleanup()
 
 
 if __name__ == "__main__":

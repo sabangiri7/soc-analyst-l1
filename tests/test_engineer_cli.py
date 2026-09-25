@@ -50,10 +50,10 @@ class ScriptedModel:
 
 
 @contextmanager
-def _engineer(model: ScriptedModel):
+def _engineer(model: ScriptedModel, wazuh: mock.MagicMock | None = None):
     """Patch the LLM provider + SIEM clients + audit so nothing touches the
     real manager, chroma, or data/* audit files. Yields (wazuh, audit_mock)."""
-    wazuh = mock.MagicMock()
+    wazuh = wazuh or mock.MagicMock()
     wazuh.get_rules.return_value = {
         "data": {"affected_items": [], "total_affected_items": 0}}
     with mock.patch("agent.soc_engineer.get_provider", return_value=model), \
@@ -261,6 +261,128 @@ class TestCliLiveToolStep(unittest.TestCase):
         self.assertIn("\u2192 get_wazuh_rules", out)
         self.assertIn("rules listed", out)
         wazuh.get_rules.assert_called_once()
+
+
+class TestCliSkillOps(unittest.TestCase):
+    def test_add_skill_flag_installs_into_skills_root(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as root:
+            src = Path(td) / "stealth-rule"
+            src.mkdir()
+            (src / "SKILL.md").write_text(
+                "---\nname: stealth-rule\ndescription: stealthy detection\nversion: 1.0.0\n---\n# Stealth\nDetect stealthy stuff.\n",
+                encoding="utf-8")
+            with mock.patch("agent.skills.DEFAULT_SKILLS_ROOT", Path(root)):
+                code, out = _run(["--add-skill", str(src)])
+            self.assertEqual(code, 0)
+            self.assertIn("installed skill stealth-rule", out)
+            self.assertTrue((Path(root) / "stealth-rule" / "SKILL.md").exists())
+
+    def test_add_skill_flag_rejects_bad_source(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as root:
+            with mock.patch("agent.skills.DEFAULT_SKILLS_ROOT", Path(root)):
+                code, out = _run(["--add-skill", td])
+            self.assertEqual(code, 1)
+            self.assertIn("not a skill pack", out)
+
+    def test_new_skill_flag_scaffolds_template(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch("agent.skills.DEFAULT_SKILLS_ROOT", Path(td)):
+                code, out = _run(["--new-skill", "dns-triage"])
+            self.assertEqual(code, 0)
+            self.assertIn("scaffolded", out)
+            md = Path(td) / "dns-triage" / "SKILL.md"
+            self.assertTrue(md.exists())
+            self.assertIn("name: dns-triage", md.read_text(encoding="utf-8"))
+
+    def test_add_skill_conflicts_with_message(self):
+        with self.assertRaises(SystemExit):
+            cli_mod.parse(["--add-skill", "/tmp/x", "-m", "hi"])
+
+
+class TestCliRejectDetail(unittest.TestCase):
+    def test_reject_flag_wires_and_audits(self):
+        with mock.patch("approvals.reject", return_value={"id": "appr-1", "status": "rejected"}) as rj, \
+             mock.patch("approvals.public_view", side_effect=lambda r: r), \
+             mock.patch("audit.audit_log") as am:
+            code, _ = _run(["--reject", "appr-1", "--reason", "too noisy"])
+        self.assertEqual(code, 0)
+        rj.assert_called_once_with("appr-1", by=cfg.ENGINE_USER,
+                                   reason="too noisy", path=cfg.APPROVALS_PATH)
+        rej = [c for c in am.call_args_list if c.kwargs.get("action") == "proposal_rejected"]
+        self.assertEqual(len(rej), 1)
+        self.assertEqual(rej[0].kwargs["result"]["reason"], "too noisy")
+        self.assertEqual(rej[0].kwargs["permission"], "human")
+
+    def test_proposal_detail_flag(self):
+        with mock.patch("approvals.get_proposal",
+                        return_value={"id": "appr-1", "action": "create_wazuh_rule",
+                                      "generated_config": "<rule/>",
+                                      "validation": {"valid": True}}):
+            code, out = _run(["--proposal", "appr-1"])
+        self.assertEqual(code, 0)
+        self.assertIn("appr-1", out)
+        self.assertIn("<rule/>", out)
+
+    def test_proposal_detail_not_found(self):
+        with mock.patch("approvals.get_proposal", return_value=None):
+            code, out = _run(["--proposal", "missing"])
+        self.assertEqual(code, 1)
+        self.assertIn("not found", out)
+
+
+class TestCliAutoSkills(unittest.TestCase):
+    def test_auto_skills_inject_suggestion_and_audit(self):
+        model = ScriptedModel([_answer("done")])
+        with _engineer(model) as (_, am):
+            code, out = _run(["-m", "detect sshd brute force", "--auto-skills"])
+        self.assertEqual(code, 0)
+        self.assertIn("<SKILL name='mitre-mapping'", model.calls[0]["system"])
+        self.assertIn("auto-activated skills: mitre-mapping", out)
+        rows = [c for c in am.call_args_list if c.kwargs.get("tool") == "cli"]
+        self.assertEqual(rows[0].kwargs["params"]["auto_skills"], ["mitre-mapping"])
+
+    def test_auto_skills_off_by_default(self):
+        model = ScriptedModel([_answer("done")])
+        with _engineer(model) as (_, am):
+            code, _ = _run(["-m", "detect sshd brute force"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("<SKILL", model.calls[0]["system"])
+        rows = [c for c in am.call_args_list if c.kwargs.get("tool") == "cli"]
+        self.assertEqual(rows[0].kwargs["params"]["auto_skills"], [])
+
+
+class TestCliTerminalOps(unittest.TestCase):
+    def _cli(self):
+        return cli_mod.EngineerCLI(mock.MagicMock(
+            user="analyst", with_skill=[], session=None, resume=False,
+            json=False, auto_skills=False,
+        ))
+
+    def test_pending_count_reads_approvals_store(self):
+        cli = self._cli()
+        with mock.patch("approvals.list_proposals", return_value=[{"id": "x"}]):
+            self.assertEqual(cli._pending_count(), 1)
+        with mock.patch("approvals.list_proposals", return_value=[]):
+            self.assertEqual(cli._pending_count(), 0)
+
+    def test_manager_status_runs_read_tool(self):
+        wazuh = mock.MagicMock()
+        wazuh.get_manager_status.return_value = {
+            "data": {"affected_items": [{"wazuh-analysisd": "running",
+                                         "wazuh-db": "running",
+                                         "wazuh-csyslogd": "stopped"}]}}
+        wazuh.base_url = "https://mock:55000"
+        model = ScriptedModel([])  # never called - /status does not chat
+        with _engineer(model, wazuh=wazuh) as (_ctx_wazuh, _):
+            cli = self._cli()
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                cli._manager_status()
+            out = buf.getvalue()
+        self.assertIn("manager: https://mock:55000", out)
+        self.assertIn("running: wazuh-analysisd, wazuh-db", out)
+        self.assertIn("stopped: wazuh-csyslogd", out)
+        wazuh.get_manager_status.assert_called_once()
 
 
 if __name__ == "__main__":

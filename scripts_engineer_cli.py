@@ -21,9 +21,14 @@ Usage::
     python scripts_engineer_cli.py --session web --resume   # continue REPL
     python scripts_engineer_cli.py --list-sessions
     python scripts_engineer_cli.py --with-skill wazuh-rule-authoring -m "…"
+    python scripts_engineer_cli.py --auto-skills            # contextual skill activation
+    python scripts_engineer_cli.py --add-skill /path/to/skill-dir   # install a pack
+    python scripts_engineer_cli.py --new-skill my-skill    # scaffold a template
     python scripts_engineer_cli.py --list-skills
     python scripts_engineer_cli.py --list-proposals pending
+    python scripts_engineer_cli.py --proposal appr-abc123  # full diff/validation detail
     python scripts_engineer_cli.py --approve appr-abc123
+    python scripts_engineer_cli.py --reject appr-abc123 --reason "duplicate"
     python scripts_engineer_cli.py --execute appr-abc123 --confirm
 
 Exit codes: 0 ok, 1 usage/data error, 2 LLM outage or tool-budget exhaustion.
@@ -37,7 +42,14 @@ import time
 from pathlib import Path
 from typing import Any
 
-from agent.skills import SkillError, active_skill_blocks, discover_skills
+from agent.skills import (
+    SkillError,
+    active_skill_blocks,
+    discover_skills,
+    install_skill,
+    scaffold_skill,
+    suggest_skills,
+)
 from agent.soc_engineer import SYSTEM_PROMPT, EngineerResult, SOCEngineer
 from config import cfg
 
@@ -57,10 +69,16 @@ Slash commands:
   /skills                          list installed skill packs (+ active markers)
   /use <name>                      activate a skill pack for this session
   /unuse <name>                    deactivate a skill pack
+  /add-skill <path>                install a skill pack directory into skills/
+  /new-skill <name>                scaffold a new SKILL.md template
+  /auto-skills on|off              toggle contextual skill auto-activation
   /new                             reset conversation history
   /proposals [status]              list proposals (default: pending)
+  /proposals <id>                  full detail of one proposal (diff, validation)
   /approve <id>                    approve a pending proposal
+  /reject <id> [reason...]         reject a pending proposal
   /execute <id> [--confirm]        execute an approved proposal (--confirm for EXECUTE-level)
+  /status                          manager daemon status
   /audit [limit]                   tail the audit log (default 10)
   /exit, /quit                     leave the REPL
 Anything else is sent to the engineer as a question or task."""
@@ -134,6 +152,41 @@ def _execute(proposal_id: str, user: str, *, confirm: bool) -> int:
     return 2 if out.get("http_status") == 400 else 1
 
 
+def _reject(proposal_id: str, user: str, reason: str = "") -> int:
+    import approvals
+
+    try:
+        rec = approvals.reject(proposal_id, by=user, reason=reason,
+                               path=cfg.APPROVALS_PATH)
+    except KeyError as e:
+        print(f"error: {e}")
+        return 1
+    except ValueError as e:
+        print(f"error: {e}")
+        return 1
+    import audit
+
+    audit.audit_log(
+        tool="approval_center", action="proposal_rejected",
+        permission="human", approval_status="rejected", params={},
+        result={"proposal_id": proposal_id, "by": user, "reason": reason},
+        user=user, agent="soc_engineer_cli",
+    )
+    print(json.dumps(approvals.public_view(rec), indent=2, default=str))
+    return 0
+
+
+def _proposal_detail(proposal_id: str) -> int:
+    import approvals
+
+    p = approvals.get_proposal(proposal_id, path=cfg.APPROVALS_PATH)
+    if not p:
+        print(f"error: proposal {proposal_id} not found")
+        return 1
+    print(json.dumps(approvals.public_view(p), indent=2, default=str))
+    return 0
+
+
 def _print_proposals(status: str | None) -> int:
     import approvals
 
@@ -202,6 +255,7 @@ class EngineerCLI:
             _resume_history(args.session) if args.resume and args.session else []
         )
         self.json_mode = bool(args.json)
+        self.auto = bool(getattr(args, "auto_skills", False))
         # validate the requested skill set up front: fail fast, never silently
         # drop an operator's skill
         if self.skills:
@@ -211,8 +265,8 @@ class EngineerCLI:
         if self.engineer is None:
             self.engineer = SOCEngineer(user=self.user)
 
-    def system_prompt(self) -> str:
-        blocks = active_skill_blocks(self.skills)
+    def system_prompt(self, skills: list[str] | None = None) -> str:
+        blocks = active_skill_blocks(skills if skills is not None else self.skills)
         if not blocks:
             return SYSTEM_PROMPT
         return SYSTEM_PROMPT + "\n\n" + SKILLS_NOTICE + "\n" + blocks
@@ -228,12 +282,20 @@ class EngineerCLI:
 
     def run_turn(self, message: str) -> EngineerResult:
         self._ensure_engineer()
+        skills = list(self.skills)
+        auto: list[str] = []
+        if self.auto:
+            auto = [name for name in suggest_skills(message, top_k=3)
+                    if name not in skills]
+            skills += auto
         result = self.engineer.chat(
             user_message=message,
             history=self.history[-40:],
-            system=self.system_prompt(),
+            system=self.system_prompt(skills),
             on_step=self._on_step,
         )
+        if auto and not self.json_mode:
+            print(f"  (auto-activated skills: {', '.join(auto)})")
         self.history = list(result.messages)
         if self.session:
             _save_turn(self.session, {
@@ -242,11 +304,13 @@ class EngineerCLI:
                 "reply": result.reply,
                 "data": result.data,
                 "proposals": result.proposals,
-                "skills": list(self.skills),
+                "skills": skills,
+                "auto_skills": auto,
                 "messages": self.history,
             })
         _audit(action="engineer_turn", params={"session": self.session,
-                                               "skills": list(self.skills)},
+                                               "skills": skills,
+                                               "auto_skills": auto},
                user=self.user)
         return result
 
@@ -284,6 +348,8 @@ class EngineerCLI:
             for s in discover_skills():
                 marker = "*" if s.name in self.skills else " "
                 print(f"{marker} {s.name:<24} v{s.version:<6} {s.description}")
+            if self.auto:
+                print("contextual auto-activation: ON (0-3 skills suggested per turn)")
             return True
         if cmd == "/use":
             if not rest:
@@ -305,12 +371,49 @@ class EngineerCLI:
             self.skills = [s for s in self.skills if s != rest[0]]
             print(f"skill {rest[0]!r} deactivated")
             return True
+        if cmd == "/add-skill":
+            if not rest:
+                print("usage: /add-skill <path-to-skill-dir>")
+                return True
+            try:
+                s = install_skill(rest[0])
+            except SkillError as e:
+                print(f"error: {e}")
+                return True
+            print(f"installed skill {s.name} (v{s.version}) -> {s.path}")
+            if s.name not in self.skills:
+                self.skills.append(s.name)
+            return True
+        if cmd == "/new-skill":
+            if not rest:
+                print("usage: /new-skill <name>")
+                return True
+            try:
+                path = scaffold_skill(rest[0])
+            except SkillError as e:
+                print(f"error: {e}")
+                return True
+            print(f"scaffolded {path} - edit SKILL.md, then /skills to confirm")
+            return True
+        if cmd == "/auto-skills":
+            state = rest[0].lower() if rest else ""
+            if state in ("on", "off"):
+                self.auto = state == "on"
+                print(f"contextual skill auto-activation: {'ON' if self.auto else 'OFF'}")
+            else:
+                print(f"contextual skill auto-activation: {'ON' if self.auto else 'OFF'}"
+                      " (toggle: /auto-skills on|off)")
+            return True
         if cmd == "/new":
             self.history = []
             print("conversation history cleared")
             return True
         if cmd == "/proposals":
-            _print_proposals(rest[0] if rest else "pending")
+            if rest and rest[0] not in ("pending", "approved", "executed",
+                                        "failed", "rejected", "expired", "all"):
+                _proposal_detail(rest[0])
+            else:
+                _print_proposals(rest[0] if rest else "pending")
             return True
         if cmd == "/approve":
             if not rest:
@@ -318,11 +421,20 @@ class EngineerCLI:
                 return True
             _approve(rest[0], self.user)
             return True
+        if cmd == "/reject":
+            if not rest:
+                print("usage: /reject <proposal-id> [reason...]")
+                return True
+            _reject(rest[0], self.user, reason=" ".join(rest[1:]))
+            return True
         if cmd == "/execute":
             if not rest:
                 print("usage: /execute <proposal-id> [--confirm]")
                 return True
             _execute(rest[0], self.user, confirm="--confirm" in rest)
+            return True
+        if cmd == "/status":
+            self._manager_status()
             return True
         if cmd == "/audit":
             limit = int(rest[0]) if rest and rest[0].isdigit() else 10
@@ -335,6 +447,27 @@ class EngineerCLI:
             return True
         print(f"unknown command {cmd!r} - /help for the list")
         return True
+
+    def _pending_count(self) -> int:
+        import approvals
+
+        return len(approvals.list_proposals(status="pending"))
+
+    def _manager_status(self) -> None:
+        self._ensure_engineer()
+        from tools.base import ToolContext
+        from tools.registry import execute as run_tool
+
+        ctx = ToolContext(wazuh=self.engineer.wazuh, indexer=self.engineer.indexer,
+                          user=self.user, agent="soc_engineer_cli")
+        out = run_tool(ctx, "get_wazuh_manager_status", {})
+        if out.get("status") != "ok":
+            print(f"error: {out.get('error', 'manager status unavailable')}")
+            return
+        r = out.get("result") or {}
+        print(f"manager: {r.get('manager')}")
+        print(f"running: {', '.join(r.get('running') or []) or 'none'}")
+        print(f"stopped: {', '.join(r.get('stopped') or []) or 'none'}")
 
     def repl(self) -> int:
         print("AI SOC engineer \u00b7 terminal agent")
@@ -355,6 +488,9 @@ class EngineerCLI:
                 continue
             result = self.run_turn(line)
             self.print_result(result)
+            pending = self._pending_count()
+            if pending:
+                print(f"{pending} approval(s) pending - /proposals pending to review")
 
 
 # --------------------------------------------------------------------------- #
@@ -376,11 +512,22 @@ def parse(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--list-sessions", action="store_true")
     ap.add_argument("--with-skill", action="append", default=[], metavar="NAME",
                     help="activate a skill pack (repeatable)")
+    ap.add_argument("--auto-skills", action="store_true",
+                    help="contextually suggest and auto-activate relevant skills per turn")
+    ap.add_argument("--add-skill", metavar="PATH",
+                    help="install a skill pack directory into skills/")
+    ap.add_argument("--new-skill", metavar="NAME",
+                    help="scaffold a new SKILL.md template")
     ap.add_argument("--list-skills", action="store_true")
     ap.add_argument("--list-proposals", nargs="?", const="pending", default=None,
                     metavar="STATUS", choices=["pending", "approved", "executed",
                                                "failed", "rejected", "expired", "all"])
+    ap.add_argument("--proposal", metavar="ID",
+                    help="full detail of one proposal (diff, validation)")
     ap.add_argument("--approve", metavar="ID", help="approve a pending proposal")
+    ap.add_argument("--reject", metavar="ID", help="reject a pending proposal")
+    ap.add_argument("--reason", default="",
+                    help="reason attached to --reject (and audit)")
     ap.add_argument("--execute", metavar="ID",
                     help="execute an approved proposal (single-use)")
     ap.add_argument("--confirm", action="store_true",
@@ -393,8 +540,10 @@ def parse(argv: list[str] | None = None) -> argparse.Namespace:
         ap.error("--resume requires --session NAME")
     if args.json and not args.message:
         ap.error("--json requires -m/--message")
-    if (args.approve or args.execute) and args.message:
-        ap.error("--approve/--execute cannot be combined with -m")
+    if (args.approve or args.execute or args.reject or args.proposal) and args.message:
+        ap.error("--approve/--execute/--reject/--proposal cannot be combined with -m")
+    if (args.add_skill or args.new_skill) and args.message:
+        ap.error("--add-skill/--new-skill cannot be combined with -m")
     return args
 
 
@@ -409,11 +558,32 @@ def main(argv: list[str] | None = None) -> int:
         return _list_sessions()
     if args.list_proposals:
         return _print_proposals(args.list_proposals)
+    if args.proposal:
+        return _proposal_detail(args.proposal)
     if args.approve:
         return _approve(args.approve, args.user or getattr(cfg, "ENGINE_USER", "analyst"))
+    if args.reject:
+        return _reject(args.reject, args.user or getattr(cfg, "ENGINE_USER", "analyst"),
+                       reason=args.reason)
     if args.execute:
         return _execute(args.execute, args.user or getattr(cfg, "ENGINE_USER", "analyst"),
                         confirm=args.confirm)
+    if args.add_skill:
+        try:
+            s = install_skill(args.add_skill)
+        except SkillError as e:
+            print(f"error: {e}")
+            return 1
+        print(f"installed skill {s.name} (v{s.version}) -> {s.path}")
+        return 0
+    if args.new_skill:
+        try:
+            path = scaffold_skill(args.new_skill)
+        except SkillError as e:
+            print(f"error: {e}")
+            return 1
+        print(f"scaffolded {path} - edit SKILL.md, then --list-skills to confirm")
+        return 0
 
     try:
         cli = EngineerCLI(args)
