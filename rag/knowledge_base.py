@@ -88,5 +88,30 @@ class KnowledgeBase:
             out.append({"id": _id, "text": doc, "metadata": meta, "distance": dist})
         return out
 
+    def get(self, collection: str, where: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        """Fetch documents by metadata filter without embedding the query
+        (cheap listing - used to enumerate synced snapshots for pruning)."""
+        assert collection in COLLECTIONS, f"unknown collection {collection}"
+        res = self._collections[collection].get(
+            where=where, include=["documents", "metadatas"]
+        )
+        ids = res.get("ids", []) or []
+        docs = res.get("documents", []) or []
+        metas = res.get("metadatas", []) or []
+        return [
+            {"id": i, "text": d, "metadata": m}
+            for i, d, m in zip(ids, docs, metas)
+        ]
+
+    def delete(self, collection: str, ids: list[str]) -> int:
+        """Remove documents by id (idempotent - missing ids are no-ops).
+        Used to prune stale snapshots, e.g. rules deleted on the manager."""
+        assert collection in COLLECTIONS, f"unknown collection {collection}"
+        ids = [i for i in ids if i]
+        if not ids:
+            return 0
+        self._collections[collection].delete(ids=ids)
+        return len(ids)
+
     def counts(self) -> dict[str, int]:
         return {name: c.count() for name, c in self._collections.items()}
