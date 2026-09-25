@@ -91,9 +91,22 @@ def _approve(proposal_id: str, user: str) -> int:
     try:
         rec = approvals.approve(proposal_id, by=user, identity_verified=False,
                                 path=cfg.APPROVALS_PATH)
+    except approvals.ApprovalPolicyError as e:
+        print(f"error: policy: {e}")
+        return 1
     except ValueError as e:
         print(f"error: {e}")
         return 1
+    # parity with the dashboard's approve endpoint: the human approval act is
+    # itself part of the audit trail
+    import audit
+
+    audit.audit_log(
+        tool="approval_center", action="proposal_approved",
+        permission="human", approval_status="approved", params={},
+        result={"proposal_id": proposal_id, "by": user, "identity_verified": False},
+        user=user, agent="soc_engineer_cli",
+    )
     print(json.dumps(approvals.public_view(rec), indent=2, default=str))
     return 0
 

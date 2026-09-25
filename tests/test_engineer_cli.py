@@ -52,15 +52,15 @@ class ScriptedModel:
 @contextmanager
 def _engineer(model: ScriptedModel):
     """Patch the LLM provider + SIEM clients + audit so nothing touches the
-    real manager, chroma, or data/* audit files."""
+    real manager, chroma, or data/* audit files. Yields (wazuh, audit_mock)."""
     wazuh = mock.MagicMock()
     wazuh.get_rules.return_value = {
         "data": {"affected_items": [], "total_affected_items": 0}}
     with mock.patch("agent.soc_engineer.get_provider", return_value=model), \
          mock.patch("agent.soc_engineer.WazuhManagerAPI", return_value=wazuh), \
          mock.patch("agent.soc_engineer.IndexerClient", return_value=mock.MagicMock()), \
-         mock.patch("audit.audit_log"):
-        yield wazuh
+         mock.patch("audit.audit_log") as am:
+        yield wazuh, am
 
 
 def _run(args: list[str]) -> tuple[int, str]:
@@ -77,6 +77,21 @@ class TestCliOneShot(unittest.TestCase):
             code, out = _run(["-m", "hi"])
         self.assertEqual(code, 0)
         self.assertIn("hello analyst", out)
+
+    def test_every_turn_is_audited_with_skills_and_session(self):
+        model = ScriptedModel([_answer("done")])
+        with _engineer(model) as (_, am):
+            code, _ = _run(["-m", "hi", "--with-skill", "mitre-mapping",
+                            "--session", "s1"])
+        self.assertEqual(code, 0)
+        cli_rows = [c for c in am.call_args_list
+                    if c.kwargs.get("tool") == "cli"]
+        self.assertEqual(len(cli_rows), 1)
+        row = cli_rows[0]
+        self.assertEqual(row.kwargs["action"], "engineer_turn")
+        self.assertEqual(row.kwargs["params"]["session"], "s1")
+        self.assertIn("mitre-mapping", row.kwargs["params"]["skills"])
+        self.assertEqual(row.kwargs["agent"], "soc_engineer_cli")
 
     def test_answer_user_step_is_rendered_live(self):
         model = ScriptedModel([_answer("done")])
@@ -180,11 +195,31 @@ class TestCliProposals(unittest.TestCase):
 
     def test_approve_flag_wires_approvals(self):
         with mock.patch("approvals.approve", return_value={"id": "appr-1", "status": "approved"}) as ap, \
-             mock.patch("approvals.public_view", side_effect=lambda r: r):
+             mock.patch("approvals.public_view", side_effect=lambda r: r), \
+             mock.patch("audit.audit_log") as am:
             code, _ = _run(["--approve", "appr-1"])
         self.assertEqual(code, 0)
         ap.assert_called_once_with("appr-1", by=cfg.ENGINE_USER, identity_verified=False,
                                    path=cfg.APPROVALS_PATH)
+        # the human approval act itself lands in the audit trail (UI parity)
+        approved = [c for c in am.call_args_list if c.kwargs.get("action") == "proposal_approved"]
+        self.assertEqual(len(approved), 1)
+        self.assertEqual(approved[0].kwargs["tool"], "approval_center")
+        self.assertEqual(approved[0].kwargs["permission"], "human")
+        self.assertEqual(approved[0].kwargs["result"]["proposal_id"], "appr-1")
+        self.assertEqual(approved[0].kwargs["result"]["by"], cfg.ENGINE_USER)
+
+    def test_approve_policy_denial_is_friendly(self):
+        import approvals as approvals_mod
+
+        def _deny(*a, **kw):
+            raise approvals_mod.ApprovalPolicyError("no self-approval")
+
+        with mock.patch("approvals.approve", side_effect=_deny), \
+             mock.patch("audit.audit_log"):
+            code, out = _run(["--approve", "appr-1"])
+        self.assertEqual(code, 1)
+        self.assertIn("policy", out)
 
     def test_execute_forwards_confirm_flag(self):
         with mock.patch("approval_executor.execute_proposal",
@@ -220,7 +255,7 @@ class TestCliLiveToolStep(unittest.TestCase):
             _answer("rules listed"),
         ]
         model = ScriptedModel(script)
-        with _engineer(model) as wazuh:
+        with _engineer(model) as (wazuh, _):
             code, out = _run(["-m", "list rules"])
         self.assertEqual(code, 0)
         self.assertIn("\u2192 get_wazuh_rules", out)
