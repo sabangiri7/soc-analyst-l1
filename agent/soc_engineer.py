@@ -25,7 +25,6 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-import approvals
 import guard
 from config import cfg
 from llm import get_provider
@@ -166,7 +165,6 @@ class SOCEngineer:
         messages.append({"role": "user", "content": user_message})
         transcript: list[dict[str, Any]] = []
         proposals: list[dict[str, Any]] = []
-        ctx = self._ctx()
 
         for _ in range(MAX_TOOL_TURNS):
             try:
@@ -220,7 +218,10 @@ class SOCEngineer:
                 tool_messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
-                    "content": json.dumps(result, default=str),
+                    # Results re-entering the conversation are wrapped as DATA
+                    # in nonce-matched markers - a poisoned log can't forge a
+                    # marker boundary or leak instructions into system space.
+                    "content": guard.wrap_tool_output(result),
                 })
             if done is not None:
                 return done

@@ -32,9 +32,14 @@ import uuid
 from pathlib import Path
 
 from agent.memory import MemoryStore
+from config import cfg
 
 TRIAGE_LOG = Path("data/triage_log.jsonl")
 REVIEWED_MARKER = Path("data/reviewed_case_ids.json")
+
+
+def _triage_log_path(path: str | Path | None = None) -> Path:
+    return Path(path) if path else Path(getattr(cfg, "TRIAGE_LOG_PATH", "") or "data/triage_log.jsonl")
 
 
 def _load_reviewed() -> set[str]:
@@ -60,13 +65,14 @@ def _resolve_analyst(cli_value: str | None) -> str:
 
 
 def review(analyst: str = ""):
-    if not TRIAGE_LOG.exists():
+    triage_log = _triage_log_path()
+    if not triage_log.exists():
         print("No triage log yet - run main.py first.")
         return
 
     store = MemoryStore()
     reviewed = _load_reviewed()
-    records = [json.loads(l) for l in TRIAGE_LOG.read_text().splitlines()]
+    records = [json.loads(l) for l in triage_log.read_text().splitlines()]
 
     pending = [r for r in records if r["needs_human_review"]]
     print(f"{len(pending)} case(s) flagged for review.")

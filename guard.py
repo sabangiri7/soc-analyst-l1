@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 from typing import Any
 
 from config import cfg
@@ -33,6 +34,11 @@ _TOOL_OUTPUT_OPEN = "\n<TOOL_OUTPUT role='data' source='wazuh'>\n"
 _TOOL_OUTPUT_CLOSE = "\n</TOOL_OUTPUT>\n"
 _LOG_DATA_OPEN = "\n<LOG_DATA>\n"
 _LOG_DATA_CLOSE = "\n</LOG_DATA>\n"
+
+# Nonce-matched markers used for results fed back to the LLM (wrap_tool_output).
+# A nonce-bound open/close pair means a forged </TOOL_OUTPUT> inside attacker
+# content can never close the section.
+_NONCE = "[0-9a-f]{8}"
 
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
@@ -71,6 +77,46 @@ def to_log_data_markers(payload: Any) -> str:
     return f"{_LOG_DATA_OPEN}{payload}{_LOG_DATA_CLOSE}"
 
 
+def _neutralize_marker_breaks(text: str) -> str:
+    """Escape marker-shaped strings that came from untrusted content, so a
+    forged </TOOL_OUTPUT> / <TOOL_OUTPUT> inside log data cannot look like a
+    real section boundary to the model."""
+    return (text.replace("</TOOL_OUTPUT", "&lt;/TOOL_OUTPUT")
+                .replace("<TOOL_OUTPUT", "&lt;TOOL_OUTPUT")
+                .replace("</LOG_DATA", "&lt;/LOG_DATA")
+                .replace("<LOG_DATA", "&lt;LOG_DATA"))
+
+
+def wrap_tool_output(payload: Any, nonce: str | None = None) -> str:
+    """Wrap a tool result in nonce-matched TOOL_OUTPUT markers.
+
+    Unlike to_data_markers (which keeps the legacy fixed markers for existing
+    callers), this is the format the engineer loop uses for results re-entering
+    the conversation: the open and close tags carry the same random nonce, so
+    a forged close tag inside attacker-controlled data cannot terminate the
+    section (it is neutralized to an HTML entity instead).
+    """
+    if isinstance(payload, (dict, list)):
+        payload = json.dumps(payload, default=str)
+    text = sanitize_text(str(payload))
+    text = _neutralize_marker_breaks(text)
+    nonce = nonce or secrets.token_hex(4)
+    return (f"\n<TOOL_OUTPUT id='{nonce}' role='data' source='wazuh'>\n"
+            f"{text}\n</TOOL_OUTPUT id='{nonce}'>\n")
+
+
+def is_wrapped(text: str, kind: str) -> bool:
+    """True when `text` is (or contains) a nonce-matched open+close pair for
+    `<kind>`, e.g. is_wrapped(msg, "TOOL_OUTPUT")."""
+    if not text:
+        return False
+    open_re = re.compile(r"\n<" + re.escape(kind) + r" id='(" + _NONCE + r")' role='data'")
+    close_re = re.compile(r"</" + re.escape(kind) + r" id='(" + _NONCE + r")'>\n")
+    opens = open_re.findall(text)
+    closes = close_re.findall(text)
+    return bool(opens) and len(opens) == len(closes) and opens[-1] == closes[-1]
+
+
 def assert_no_instruction_confusion(text: str) -> bool:
     """Cheap guard used by tests: instructions phrased inside log data markers
     must not surface outside them. Not a security boundary on its own."""
@@ -84,6 +130,11 @@ def _strip_marked_sections(text: str) -> str:
     for open_, close in ((_TOOL_OUTPUT_OPEN, _TOOL_OUTPUT_CLOSE),
                          (_LOG_DATA_OPEN, _LOG_DATA_CLOSE)):
         out = re.sub(re.escape(open_) + r".*?" + re.escape(close), "", out, flags=re.DOTALL)
+    # nonce-matched wrappers (wrap_tool_output) - strip both kinds
+    for kind in ("TOOL_OUTPUT", "LOG_DATA"):
+        out = re.sub(
+            r"\n<" + kind + r" id='" + _NONCE + r"'[^>]*>.*?</" + kind + r" id='" + _NONCE + r"'>\n",
+            "", out, flags=re.DOTALL)
     return out
 
 

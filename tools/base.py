@@ -85,9 +85,21 @@ class ToolContext:
     # convenience accessors
     def approve_or_raise(self, proposed_action: dict[str, Any]) -> None:
         """Write-tool gate: raises ApprovalRequired unless an approved proposal
-        matching this action is present."""
+        matching this action is present.
+
+        Only records with status 'approved' unlock a write - a forged record
+        carrying 'pending'/'rejected'/'expired'/'executed'/None status is
+        refused. 'executing' is also accepted: that is the claimed record
+        approval_executor hands to the tool while running it (the claim is the
+        single-use gate that already happened)."""
         if self.approval is None:
             raise ApprovalRequired(proposed_action)
+        status = self.approval.get("status")
+        if status not in ("approved", "executing"):
+            raise PermissionDenied(
+                f"Approval record for '{self.approval.get('action')}' is "
+                f"{status or 'missing'} - only an approved proposal unlocks a write."
+            )
         if self.approval.get("action") != proposed_action.get("action"):
             raise PermissionDenied(
                 "Approval mismatch: proposal is for "

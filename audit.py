@@ -15,6 +15,7 @@ logs; add AUDIT_LOG_PATH to the rotation list if it grows.
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,43 @@ from typing import Any
 from config import cfg
 
 DEFAULT_AUDIT_PATH = "data/audit_log.jsonl"
+
+REDACTED = "••••••••"
+
+# Keys whose values are masked wholesale (case-insensitive - 'Authorization',
+# 'client_secret', 'api_key', ...). Deliberately does NOT match bare
+# "token"/"tokens" so numeric telemetry like tokens_used/max_tokens survives.
+_SECRET_KEY_RE = re.compile(
+    r"(password|passwd|pwd|api[_-]?key|apikey|client[_-]?secret|authorization|"
+    r"auth[_-]?token|bearer[_-]?token|private[_-]?key|access[_-]?key|credential|secret)",
+    re.IGNORECASE,
+)
+
+# Secret-shaped strings inside free text: "Bearer <token>", "?token=xyz",
+# "?key=...", "password=...". The captured prefix stays, only the value is
+# masked, so the surrounding sentence is still readable.
+_SECRET_STRING_RES = (
+    re.compile(r"(Authorization:\s*Bearer\s+)\S+", re.IGNORECASE),
+    re.compile(r"(Bearer\s+)[A-Za-z0-9._~+/=\-]{8,}", re.IGNORECASE),
+    re.compile(r"([?&]token=)[^&\s\"'<>]+"),
+    re.compile(r"([?&](?:password|passwd|secret|api[_-]?key|key)=)[^&\s\"'<>]+", re.IGNORECASE),
+)
+
+
+def redact_secrets(value: Any) -> Any:
+    """Recursively mask secrets in params/results before they hit the audit
+    trail. Never mutates the input: returns a new structure."""
+    if isinstance(value, dict):
+        return {k: (REDACTED if _SECRET_KEY_RE.search(k) else redact_secrets(v))
+                for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact_secrets(v) for v in value]
+    if isinstance(value, str):
+        out = value
+        for rx in _SECRET_STRING_RES:
+            out = rx.sub(lambda m: m.group(1) + REDACTED, out)
+        return out
+    return value
 
 
 def audit_log(
@@ -46,8 +84,8 @@ def audit_log(
         "agent": agent,
         "action": action or tool,
         "tool": tool,
-        "params": _safe(params),
-        "result": _safe(result),
+        "params": _safe(redact_secrets(params)),
+        "result": _safe(redact_secrets(result)),
         "permission": permission,
         "approval_status": approval_status,
         "execution_status": execution_status,
@@ -63,14 +101,22 @@ def audit_log(
 
 
 def _safe(obj: Any) -> Any:
-    """Serialize anything into a JSON-safe, size-capped form (large API
-    responses truncated; secrets are redacted by the tool before this)."""
+    """Serialize anything into a JSON-safe, size-capped form. Oversized values
+    become {"truncated": True, ...} wrapping the cap prefix (still valid
+    JSON). Secrets are already redacted before _safe is called."""
     try:
         text = json.dumps(obj, default=str)
     except TypeError:
         return {"unserializable": str(obj)[:200]}
     if len(text) > 4000:
-        text = text[:4000] + '…(truncated)'
+        cap = text[:4000]
+        try:
+            partial = json.loads(cap)
+        except json.JSONDecodeError:
+            partial = None
+        if partial is not None:
+            return {"truncated": True, "data": partial}
+        return {"truncated": True, "repr": cap}
     try:
         return json.loads(text)
     except json.JSONDecodeError:

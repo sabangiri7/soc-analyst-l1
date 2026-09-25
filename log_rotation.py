@@ -152,8 +152,10 @@ def prune_archives(archive_dir: str | Path, *, keep_days: float = 365) -> list[s
 LOG_PATHS_TO_MANAGE = (
     "TRIAGE_LOG_PATH",
     "CHAT_LOG_PATH",
+    "ENGINEER_LOG_PATH",
     "NOTIFICATIONS_LOG_PATH",
     "FEEDBACK_LOG_PATH",
+    "AUDIT_LOG_PATH",
 )
 
 

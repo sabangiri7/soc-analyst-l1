@@ -98,6 +98,8 @@ class Config:
     TRIAGE_LOG_PATH = os.getenv("TRIAGE_LOG_PATH", "data/triage_log.jsonl")
     # Chat agent transcripts (separate from triage - conversational, not verdicts).
     CHAT_LOG_PATH = os.getenv("CHAT_LOG_PATH", "data/chat_log.jsonl")
+    # AI SOC Engineer conversation transcripts (dashboard /api/engineer/chat).
+    ENGINEER_LOG_PATH = os.getenv("ENGINEER_LOG_PATH", "data/engineer_log.jsonl")
 
     # Lookup tables - small named threat-intel stores for the chat agent and
     # dashboard (see lookup_tables.py). Single atomic JSON file.
@@ -129,6 +131,11 @@ class Config:
     # `?token=<token>`. Empty = no auth (fine for strictly local use on
     # 127.0.0.1; set this before binding --host to anything else).
     DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "")
+    # Optional per-user tokens: "user:token,user:token,...". When set (with or
+    # without DASHBOARD_TOKEN), a Bearer token maps to a VERIFIED identity -
+    # the Approval Center uses it for separation of duties (a proposer cannot
+    # approve their own proposal) and ignores any client-supplied "by" field.
+    DASHBOARD_USERS = os.getenv("DASHBOARD_USERS", "")
 
     # Splunk (also configurable per-provider via the dashboard)
     SPLUNK_HOST = os.getenv("SPLUNK_HOST", "")
@@ -223,6 +230,14 @@ class Config:
     LOGTEST_MAX_ATTEMPTS = int(os.getenv("LOGTEST_MAX_ATTEMPTS", "3"))
     # Pending proposals older than this are expired and cannot be approved.
     APPROVAL_EXPIRY_SECONDS = int(os.getenv("APPROVAL_EXPIRY_SECONDS", "86400"))
+    # An approved proposal must be claimed within this window; 0 = no limit.
+    APPROVAL_EXECUTION_WINDOW_SECONDS = int(os.getenv("APPROVAL_EXECUTION_WINDOW_SECONDS", "0"))
+    # Separation of duties: a verified approver may not approve their own proposal.
+    APPROVAL_BLOCK_SELF_APPROVAL = _bool("APPROVAL_BLOCK_SELF_APPROVAL", True)
+    # Quorum before a proposal flips to approved (per band). Consulted at
+    # approve time, so tightening the policy applies to existing proposals.
+    APPROVAL_PROPOSE_MIN_APPROVERS = int(os.getenv("APPROVAL_PROPOSE_MIN_APPROVERS", "1"))
+    APPROVAL_EXECUTE_MIN_APPROVERS = int(os.getenv("APPROVAL_EXECUTE_MIN_APPROVERS", "1"))
     # Tool-use budget per engineer conversation (investigations can need more
     # turns than the triage agent's default).
     ENGINE_MAX_TOOL_TURNS = int(os.getenv("ENGINE_MAX_TOOL_TURNS", "10"))

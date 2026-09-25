@@ -28,10 +28,10 @@ import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
 
 from flask import Flask, jsonify, render_template, request
 
+from config import cfg
 import siem_providers as store
 import agent_control as ac
 from connectors.siem import PLATFORM_FIELDS
@@ -51,36 +51,75 @@ TRIAGE_LOG = Path("data/triage_log.jsonl")
 TRIAGE_LIMIT_DEFAULT = 5
 
 
+def _triage_log_path(path: str | Path | None = None) -> Path:
+    return Path(path) if path else Path(getattr(cfg, "TRIAGE_LOG_PATH", "") or "data/triage_log.jsonl")
+
+
+def _chat_log_path(path: str | Path | None = None) -> Path:
+    return Path(path) if path else Path(getattr(cfg, "CHAT_LOG_PATH", "") or "data/chat_log.jsonl")
+
+
+def _engineer_log_path(path: str | Path | None = None) -> Path:
+    return Path(path) if path else Path(getattr(cfg, "ENGINEER_LOG_PATH", "") or "data/engineer_log.jsonl")
+
+
 # --------------------------------------------------------------------------- #
-# Auth - optional single-shared-secret token (DASHBOARD_TOKEN). Empty (the
-# default) means no auth, which is fine for strictly local use bound to
-# 127.0.0.1; set it before pointing --host at anything else, since every
-# route here (including ones that write to the SIEM, start/stop the
-# overnight watcher, and CRUD lookup tables/rules) is otherwise wide open.
-# The token is accepted as `Authorization: Bearer <token>` or `?token=...`;
-# the page shell (`/`) always loads so the JS can read `?token=` off the URL
-# and attach it to every subsequent /api/* call - see api() in index.html.
+# Auth - optional single-shared-secret token (DASHBOARD_TOKEN) and/or per-user
+# tokens (DASHBOARD_USERS="user:token,user:token,..."). When neither is set
+# (the default) there is no auth, which is fine for strictly local use bound to
+# 127.0.0.1; set one before pointing --host at anything else, since every
+# route here (including ones that write to the SIEM, start/stop the overnight
+# watcher, and CRUD lookup tables/rules) is otherwise wide open. The token is
+# accepted as `Authorization: Bearer <token>` or `?token=...`; the page shell
+# (`/`) always loads so the JS can read `?token=` off the URL and attach it to
+# every subsequent /api/* call - see api() in index.html.
+# With DASHBOARD_USERS, a valid Bearer token maps to a VERIFIED identity: the
+# Approval Center uses it for separation of duties and ignores any
+# client-supplied "by" field.
 # --------------------------------------------------------------------------- #
-def _token_ok() -> bool:
-    from config import cfg
+def _supplied_token() -> str:
     supplied = request.headers.get("Authorization", "")
     if supplied.startswith("Bearer "):
-        supplied = supplied[len("Bearer "):]
-    else:
-        supplied = request.args.get("token", "")
-    return supplied == cfg.DASHBOARD_TOKEN
+        return supplied[len("Bearer "):]
+    return request.args.get("token", "")
+
+
+def _token_ok() -> bool:
+    from config import cfg
+    if not getattr(cfg, "DASHBOARD_TOKEN", ""):
+        return False
+    return _supplied_token() == cfg.DASHBOARD_TOKEN
+
+
+def _token_user() -> str | None:
+    """Map a Bearer token to a verified per-user identity from DASHBOARD_USERS.
+    None when per-user auth isn't configured or the token is unknown."""
+    from config import cfg
+    users_cfg = getattr(cfg, "DASHBOARD_USERS", "") or ""
+    if not users_cfg:
+        return None
+    supplied = _supplied_token()
+    if not supplied:
+        return None
+    for entry in users_cfg.split(","):
+        if ":" not in entry:
+            continue
+        user, tok = entry.split(":", 1)
+        if tok.strip() == supplied:
+            return user.strip()
+    return None
 
 
 @app.before_request
 def _require_dashboard_token():
     from config import cfg
-    if not cfg.DASHBOARD_TOKEN:
+    if not (getattr(cfg, "DASHBOARD_TOKEN", "") or getattr(cfg, "DASHBOARD_USERS", "")):
         return None  # auth disabled (default) - purely local use
     if request.path == "/":
         return None  # let the page shell load; every /api/* call below is still gated
-    if not _token_ok():
-        return jsonify({"error": "Unauthorized - set Authorization: Bearer <token> or ?token=<token>."}), 401
-    return None
+    if _token_ok() or _token_user():
+        return None
+    return jsonify({"error": "Unauthorized - set Authorization: Bearer <token> or ?token=<token>."}), 401
 
 
 # --------------------------------------------------------------------------- #
@@ -210,7 +249,7 @@ def api_triage(provider_id: str):
     except Exception as e:  # noqa: BLE001 - e.g. missing LLM key
         return jsonify({"error": f"Could not start the triage agent: {e}"}), 400
 
-    TRIAGE_LOG.parent.mkdir(parents=True, exist_ok=True)
+    _triage_log_path().parent.mkdir(parents=True, exist_ok=True)
     results = []
     for alert in alerts[:limit]:
         try:
@@ -227,10 +266,10 @@ def api_triage(provider_id: str):
         try:
             result = agent.triage(alert)
         except Exception as e:  # noqa: BLE001
-            results.append({"alert_id": alert.get("alert_id", "?"), "error": str(e)})
+            results.append({"alert_id": alert.get("alert_id", "?"), "rule_id": alert.get("rule_id"), "error": str(e)})
             continue
         needs_human = needs_human_review(result, rule_matches)
-        with open(TRIAGE_LOG, "a") as f:
+        with open(_triage_log_path(), "a") as f:
             f.write(json.dumps({
                 "alert": alert,
                 "result": asdict(result),
@@ -240,6 +279,7 @@ def api_triage(provider_id: str):
             }, default=str) + "\n")
         results.append({
             "alert_id": alert.get("alert_id", "?"),
+            "rule_id": alert.get("rule_id"),
             "rule_name": alert.get("rule_name", alert.get("description", "")),
             "verdict": result.verdict,
             "confidence": result.confidence,
@@ -298,8 +338,8 @@ def api_chat():
             "request_id": e.request_id,
         }), 429
 
-    CHAT_LOG.parent.mkdir(parents=True, exist_ok=True)
-    with open(CHAT_LOG, "a") as f:
+    _chat_log_path().parent.mkdir(parents=True, exist_ok=True)
+    with open(_chat_log_path(), "a") as f:
         f.write(json.dumps({
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "message": message,
@@ -318,10 +358,10 @@ def api_chat():
 @app.get("/api/chat/history")
 def api_chat_history():
     limit = int(request.args.get("limit", CHAT_LIMIT_DEFAULT))
-    if not CHAT_LOG.exists():
+    if not _chat_log_path().exists():
         return jsonify({"entries": [], "count": 0})
     entries = []
-    for line in CHAT_LOG.read_text().splitlines():
+    for line in _chat_log_path().read_text().splitlines():
         if not line.strip():
             continue
         try:
@@ -674,8 +714,8 @@ def api_engineer_chat():
     except Exception as e:  # noqa: BLE001 - surface provider/config errors to the UI
         return jsonify({"error": f"Engineer failed: {e}"}), 400
 
-    ENGINEER_LOG.parent.mkdir(parents=True, exist_ok=True)
-    with open(ENGINEER_LOG, "a") as f:
+    _engineer_log_path().parent.mkdir(parents=True, exist_ok=True)
+    with open(_engineer_log_path(), "a") as f:
         f.write(json.dumps({
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "message": message,
@@ -725,31 +765,57 @@ def api_proposals():
                                   for p in approvals.list_proposals(status)]})
 
 
+def _verified_approver() -> tuple[str, bool] | None:
+    """(user, identity_verified) for the current request, or None when the
+    request has no valid credentials. Per-user tokens map to a VERIFIED
+    identity; a bare shared token is an unverified fallback."""
+    user = _token_user()
+    if user is not None:
+        return user, True
+    if _token_ok():
+        body = request.get_json(force=True, silent=True) or {}
+        return (body.get("by") or "dashboard-user"), False
+    return None
+
+
 @app.post("/api/proposals/<pid>/approve")
 def api_proposal_approve(pid: str):
     import approvals
-    body = request.get_json(force=True, silent=True) or {}
-    by = body.get("by") or "dashboard-user"
+    approver = _verified_approver()
+    if approver is None:
+        return jsonify({"error": "Unauthorized - a valid token is required to approve."}), 401
+    by, verified = approver
+    # A client-supplied "by" is ignored for verified identities: the token IS
+    # the identity, so a proposer can never approve as someone else.
     try:
-        proposal = approvals.approve(pid, by)
-    except (ValueError, KeyError) as e:
-        return jsonify({"error": str(e)}), 400
+        proposal = approvals.approve(pid, by, identity_verified=verified)
+    except approvals.ApprovalPolicyError as e:
+        return jsonify({"error": str(e)}), 403
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 409
+    except KeyError as e:
+        return jsonify({"error": str(e)}), 404
     audit.audit_log(tool="approval_center", action="proposal_approved",
                     permission="human", approval_status="approved", params={},
-                    result={"proposal_id": pid, "by": by})
+                    result={"proposal_id": pid, "by": by, "identity_verified": verified})
     return jsonify({"proposal": approvals.public_view(proposal)})
 
 
 @app.post("/api/proposals/<pid>/reject")
 def api_proposal_reject(pid: str):
     import approvals
+    approver = _verified_approver()
+    if approver is None:
+        return jsonify({"error": "Unauthorized - a valid token is required to reject."}), 401
+    by, _ = approver
     body = request.get_json(force=True, silent=True) or {}
-    by = body.get("by") or "dashboard-user"
     reason = body.get("reason") or ""
     try:
         proposal = approvals.reject(pid, by, reason)
-    except (ValueError, KeyError) as e:
-        return jsonify({"error": str(e)}), 400
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 409
+    except KeyError as e:
+        return jsonify({"error": str(e)}), 404
     audit.audit_log(tool="approval_center", action="proposal_rejected",
                     permission="human", approval_status="rejected", params={},
                     result={"proposal_id": pid, "by": by, "reason": reason})
@@ -759,41 +825,27 @@ def api_proposal_reject(pid: str):
 @app.post("/api/proposals/<pid>/execute")
 def api_proposal_execute(pid: str):
     """Execute an approved proposal deterministically with its stored payload.
-    EXECUTE-level actions (delete/restart/disable) require an explicit
-    'confirm' flag on top of the approval."""
-    import approvals
-    from tools.registry import execute as run_tool
+    This is the ONLY path that writes: the proposal is claimed atomically
+    (single-use - a replay is 409), EXECUTE-level actions need an explicit
+    'confirm' flag, and the real tool runs with the STORED payload via
+    approval_executor (no LLM involved)."""
+    import approval_executor
+    from config import cfg
     body = request.get_json(force=True, silent=True) or {}
-    by = body.get("by") or "dashboard-user"
-    proposal = approvals.get_proposal(pid)
-    if not proposal:
-        return jsonify({"error": f"Proposal {pid} not found."}), 404
-    if proposal.get("status") != "approved":
-        return jsonify({"error": f"Proposal {pid} is not approved (status: "
-                                f"{proposal.get('status')})."}), 400
-    if proposal.get("permission") == "execute" and not body.get("confirm"):
-        return jsonify({"error": "EXECUTE-level action: this requires an "
-                                "explicit confirmation on top of the approval."}), 400
-
-    ctx = _engineer_context(user=by, agent="approval_executor")
-    ctx.approval = proposal  # the approved record gates the tool's approve_or_raise
-    try:
-        result = run_tool(ctx, proposal.get("action"), proposal.get("payload") or {},
-                          silent=True)
-    except Exception as e:  # noqa: BLE001 - tool failure surfaces with its audit row
-        return jsonify({"ok": False, "error": str(e)}), 200
-    # silent=True returns the raw result; param-validation failures arrive as
-    # {"status": "error", ...} instead of raising - treat them as failures too.
-    if isinstance(result, dict) and result.get("status") == "error":
-        return jsonify({"ok": False, "error": result.get("error", "execution failed"),
-                        "result": result}), 200
-
-    audit.audit_log(tool="approval_center", action="proposal_executed",
-                    permission="human", approval_status="approved",
-                    execution_status="success", params={},
-                    result={"proposal_id": pid, "by": by,
-                            "tool": proposal.get("action")})
-    return jsonify({"ok": True, "result": result})
+    approver = _verified_approver()
+    if approver is None:
+        return jsonify({"error": "Unauthorized - a valid token is required to execute."}), 401
+    by, verified = approver
+    out = approval_executor.execute_proposal(
+        pid,
+        by=by,
+        confirm=bool(body.get("confirm")),
+        identity_verified=verified,
+        ctx_factory=lambda by: _engineer_context(user=by, agent="approval_executor"),
+        path=cfg.APPROVALS_PATH,
+    )
+    http_status = out.pop("http_status", 200)
+    return jsonify(out), http_status
 
 
 # ------------------------------ Audit log ------------------------------- #
@@ -811,14 +863,12 @@ if __name__ == "__main__":
     parser.add_argument("--port", default=5001, type=int, help="bind port (default 5001)")
     args = parser.parse_args()
 
-    from config import cfg
-
     print("=" * 60)
     print("SOC triage dashboard")
     print(f"  Open:      http://{args.host}:{args.port}")
     print(f"  Providers: {store.default_providers_path()}")
     if cfg.DASHBOARD_TOKEN:
-        print(f"  Auth:      ON - open with ?token=<your DASHBOARD_TOKEN>")
+        print("  Auth:      ON - open with ?token=<your DASHBOARD_TOKEN>")
     elif args.host not in ("127.0.0.1", "localhost"):
         print("  Auth:      OFF - WARNING: binding to a non-local host with no "
               "DASHBOARD_TOKEN set means every route here is open to anyone "
