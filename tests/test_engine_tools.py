@@ -9,6 +9,7 @@ audit.audit_log are patched wherever the registry is exercised).
 Run: cd soc-agent && MOCK_MODE=true python3 -m unittest tests.test_engine_tools -v
 """
 from __future__ import annotations
+import copy
 import json
 import os
 import unittest
@@ -225,7 +226,7 @@ class TestDetectionEngine(unittest.TestCase):
     def test_develop_executes_with_matching_approval(self):
         from tools.detection.detection_engine import DevelopWazuhRule
         ctx = self._manager_ctx()
-        ctx.approval = {"action": "create_wazuh_rule"}
+        ctx.approval = {"action": "create_wazuh_rule", "status": "approved"}
         out = DevelopWazuhRule().run(ctx, rule_xml=self.FREQ_RULE,
                                      positive_samples=["p1"],
                                      negative_samples=["n1"],
@@ -421,83 +422,204 @@ class TestDashboardEngine(unittest.TestCase):
 
     # -- proposal is a complete, resolvable, OSD-openable saved-object bundle --
 
-    def test_proposal_bundle_is_complete_and_resolvable(self):
+    def test_proposal_bundle_is_complete_and_renderable(self):
+        from tools.dashboard import osd_objects as osd
         from tools.dashboard.engine import DesignDetectionDashboard
         ctx = self._ctx_with_schema()
-        with mock.patch("tools.dashboard.engine._find_index_pattern", return_value="idx-abc"):
+        with mock.patch("tools.dashboard.engine._find_index_pattern", return_value="idx-abc"), \
+             mock.patch("tools.dashboard.engine._index_pattern_object",
+                        return_value={"id": "idx-abc", "attributes": {"title": "wazuh-alerts-*"}}):
             with self.assertRaises(ApprovalRequired) as cm:
                 DesignDetectionDashboard().run(ctx, title="Web Server Attacks", focus="web",
                                                description="web attack dashboard",
                                                time_range="-7d", reason="golden dashboard")
-        cfg = cm.exception.proposed_action["generated_config"]
+        proposed = cm.exception.proposed_action
+        cfg = proposed["generated_config"]
         self.assertEqual(cfg["index_pattern"], "idx-abc")
-        self.assertEqual(cfg["title"], "Web Server Attacks")
+        self.assertTrue(proposed["validation"]["valid"], proposed["validation"]["errors"])
         bundle = cfg["saved_objects"]
         self.assertEqual([o["type"] for o in bundle].count("visualization"), 7)
-        self.assertEqual([o["type"] for o in bundle].count("dashboard"), 1)
-        # panelsJSON ids must resolve exactly against the bundle's visualization ids.
         dash = next(o for o in bundle if o["type"] == "dashboard")
-        panel_ids = {p["id"] for p in json.loads(dash["attributes"]["panelsJSON"])}
-        vis_ids = {o["id"] for o in bundle if o["type"] == "visualization"}
-        self.assertEqual(panel_ids, vis_ids)
         self.assertEqual(dash["id"], "dashboard-web-server-attacks")
-        # every visualization is a full saved object: visState + searchSourceJSON
-        # (index + 7d window + web filter) + index-pattern reference.
+        # every panel resolves via panelRefName -> reference -> a bundle visualization
+        refs = {r["name"]: r["id"] for r in dash["references"]}
+        vis_ids = {o["id"] for o in bundle if o["type"] == "visualization"}
+        for panel in json.loads(dash["attributes"]["panelsJSON"]):
+            self.assertIn(panel["panelRefName"], refs)
+            self.assertIn(refs[panel["panelRefName"]], vis_ids)
+            self.assertEqual(set(panel["gridData"]), {"x", "y", "w", "h", "i"})
+        self.assertEqual(osd.validate_dashboard(dash), [])
         term_web_seen = False
         for vis in (o for o in bundle if o["type"] == "visualization"):
-            attrs = vis["attributes"]
-            self.assertIn("visState", attrs)
-            ss = json.loads(attrs["kibanaSavedObjectMeta"]["searchSourceJSON"])
-            self.assertEqual(ss["index"], "idx-abc")
-            filters = {list(f["term"])[0]: f["term"] for f in ss["filter"] if "term" in f}
-            if filters.get("rule.groups") == {"rule.groups": "web"}:
+            self.assertEqual(osd.validate_visualization(vis), [], vis["id"])
+            vs = json.loads(vis["attributes"]["visState"])
+            self.assertIn(vs["type"], osd.VALID_VIS_TYPES)
+            ss = json.loads(vis["attributes"]["kibanaSavedObjectMeta"]["searchSourceJSON"])
+            self.assertNotIn("aggs", ss)
+            self.assertEqual(ss["indexRefName"], osd.INDEX_REF_NAME)
+            self.assertEqual(vis["references"], [{"name": osd.INDEX_REF_NAME, "type": "index-pattern", "id": "idx-abc"}])
+            if any(f.get("query", {}).get("match_phrase", {}).get("rule.groups") == "web" for f in ss["filter"]):
                 term_web_seen = True
-            self.assertTrue(any("range" in f and "timestamp" in f["range"] for f in ss["filter"]),
-                            f"{vis['id']} missing 7d range filter")
-            self.assertEqual(vis["references"][0]["id"], "idx-abc")
+            self.assertTrue(any("range" in f and "timestamp" in f["range"] for f in ss["filter"]))
         self.assertTrue(term_web_seen, "no visualization carries the rule.groups: web filter")
 
-    # -- execution creates OSD-openable saved objects (searchSourceJSON attached) --
+    # -- execution against a fake OSD server that stores and returns objects --
 
-    def test_executed_saved_objects_include_search_source(self):
-        from tools.dashboard.engine import DesignDetectionDashboard
+    def _fake_osd(self, *, pattern_exists=True, fields=None, corrupt_on_read=False):
+        store: dict[tuple[str, str], dict] = {}
+        calls: list[tuple[str, str, dict | None]] = []
+        counter = {"n": 0}
+
+        def fake_request(method: str, path: str, body: dict | None = None, **kw) -> dict:
+            calls.append((method, path, body))
+            parts = path.strip("/").split("/")  # api/saved_objects/<type>[/<id>]
+            otype = parts[2] if len(parts) > 2 else ""
+            if method == "GET" and otype == "index-pattern":
+                if not pattern_exists:
+                    return {"statusCode": 404, "error": "Not Found"}
+                attrs = {"title": "wazuh-alerts-*"}
+                if fields is not None:
+                    attrs["fields"] = json.dumps([{"name": f, "aggregatable": True} for f in fields])
+                return {"id": parts[3], "type": "index-pattern", "attributes": attrs}
+            if method == "POST":
+                counter["n"] += 1
+                oid = f"{otype}-{counter['n']}"
+                store[(otype, oid)] = {"id": oid, "type": otype, **copy.deepcopy(body)}
+                return {"id": oid, "type": otype, "attributes": body["attributes"]}
+            if method == "GET":
+                obj = copy.deepcopy(store[(otype, parts[3])])
+                if corrupt_on_read and otype == "dashboard":
+                    obj["attributes"]["panelsJSON"] = json.dumps([{"id": "x", "type": "visualization"}])
+                return obj
+            raise AssertionError(f"unexpected call {method} {path}")
+
+        return fake_request, calls, store
+
+    def _approved_ctx(self):
         indexer = mock.MagicMock()
         indexer.field_caps.return_value = {"data.srcip": "keyword", "agent.name": "keyword",
                                            "rule.groups": "keyword", "rule.level": "long"}
         indexer.search.return_value = {"hits": {"total": {"value": 42}}, "took": 3}
-        ctx = make_ctx(indexer=indexer, approval={"action": "design_detection_dashboard"})
-        calls: list[tuple[str, dict]] = []
+        return make_ctx(indexer=indexer, approval={"action": "design_detection_dashboard", "status": "approved"})
 
-        def fake_request(method: str, path: str, body: dict | None = None, **kw) -> dict:
-            calls.append((path, body))
-            if path.endswith("/visualization"):
-                return {"saved_object": {"id": f"sv-{len(calls)}", "type": "visualization"}}
-            return {"saved_object": {"id": "dash-1", "type": "dashboard"}}
-
+    def _run_exec(self, fake):
+        from tools.dashboard.engine import DesignDetectionDashboard
         with mock.patch("tools.dashboard.engine._find_index_pattern", return_value="idx-abc"), \
-             mock.patch("tools.dashboard.engine.dashboards_request", side_effect=fake_request):
-            out = DesignDetectionDashboard().run(ctx, title="Web Server Attacks", focus="web",
-                                                 description="d", time_range="-7d", reason="r")
-        self.assertEqual(out["status"], "executed")
-        self.assertEqual(out["dashboard_id"], "dash-1")
-        vis_bodies = [b for path, b in calls if path.endswith("/visualization")]
-        self.assertEqual(len(vis_bodies), 7)
-        web_seen = False
-        for body in vis_bodies:
-            attrs = body["attributes"]
-            ss = json.loads(attrs["kibanaSavedObjectMeta"]["searchSourceJSON"])
-            self.assertEqual(ss["index"], "idx-abc")
-            self.assertTrue(any("range" in f for f in ss["filter"]))
-            if any("term" in f and f["term"].get("rule.groups") == "web" for f in ss["filter"]):
-                web_seen = True
-            self.assertEqual(body["references"][0]["id"], "idx-abc")
-        self.assertTrue(web_seen)
-        dash_path, dash_body = [c for c in calls if c[0].endswith("/dashboard")][0]
-        self.assertIn("kibanaSavedObjectMeta", dash_body["attributes"])
-        refs = dash_body["references"]
-        self.assertTrue(refs and all(r["type"] == "visualization" for r in refs))
-        panel_ids = {p["id"] for p in json.loads(dash_body["attributes"]["panelsJSON"])}
-        self.assertEqual(panel_ids, {r["id"] for r in refs})
+             mock.patch("tools.dashboard.engine.dashboards_request", side_effect=fake):
+            return DesignDetectionDashboard().run(self._approved_ctx(), title="Web Server Attacks", focus="web",
+                                                  description="d", time_range="-7d", reason="r")
+
+    def test_executed_dashboard_is_renderable_and_read_back(self):
+        from tools.dashboard import osd_objects as osd
+        fake, calls, store = self._fake_osd()
+        out = self._run_exec(fake)
+        self.assertEqual(out["status"], "executed", out["render_check"])
+        self.assertTrue(out["render_check"]["ok"])
+        self.assertEqual(len(out["visualizations"]), 7)
+        dash = next(v for (t, _), v in store.items() if t == "dashboard")
+        self.assertEqual(osd.validate_dashboard(dash), [])
+        # dashboard references point at the SERVER-assigned visualization ids
+        vis_ids = {oid for (t, oid) in store if t == "visualization"}
+        self.assertEqual({r["id"] for r in dash["references"]}, vis_ids)
+        # it read the objects back after creating them
+        self.assertTrue(any(m == "GET" and "/dashboard/" in p for m, p, _ in calls))
+        self.assertTrue(out["open_url_path"].endswith(dash["id"]))
+
+    def test_missing_index_pattern_blocks_execution_and_creates_nothing(self):
+        fake, calls, store = self._fake_osd(pattern_exists=False)
+        with self.assertRaises(ToolError) as cm:
+            self._run_exec(fake)
+        self.assertIn("Could not locate that index-pattern", str(cm.exception))
+        self.assertFalse(any(m == "POST" for m, _, _ in calls))
+
+    def test_field_missing_from_index_pattern_blocks_execution(self):
+        fake, calls, store = self._fake_osd(fields=["timestamp", "rule.groups", "rule.level", "rule.id"])
+        with self.assertRaises(ToolError) as cm:
+            self._run_exec(fake)
+        self.assertIn("refresh the index pattern fields", str(cm.exception))
+        self.assertFalse(any(m == "POST" for m, _, _ in calls))
+
+    def test_bad_read_back_is_reported_not_claimed_as_success(self):
+        fake, calls, store = self._fake_osd(corrupt_on_read=True)
+        out = self._run_exec(fake)
+        self.assertEqual(out["status"], "executed_with_issues")
+        self.assertFalse(out["render_check"]["ok"])
+        self.assertTrue(any("gridData" in i for i in out["render_check"]["issues"]))
+
+
+class TestOsdObjectValidators(unittest.TestCase):
+    """Each original bug, in the exact shape the old engine produced, must be caught."""
+
+    def test_bar_is_normalized_and_invalid_types_rejected(self):
+        from tools.dashboard import osd_objects as osd
+        self.assertEqual(osd.normalize_vis_type("bar"), "histogram")
+        with self.assertRaises(ValueError):
+            osd.normalize_vis_type("sparkle")
+
+    def test_old_vis_shape_is_rejected(self):
+        from tools.dashboard import osd_objects as osd
+        old = {"id": "v", "attributes": {
+            "visState": json.dumps({"title": "t", "type": "bar", "aggs": [
+                {"id": "1", "type": "count", "schema": "metric", "params": {}}],
+                "params": {"type": "histogram", "categoryAxes": [{"id": "CategoryAxis-1"}],
+                           "valueAxes": [{"id": "ValueAxis-1"}], "seriesParams": [{}]}}),
+            "kibanaSavedObjectMeta": {"searchSourceJSON": json.dumps(
+                {"index": "wazuh-alerts-*", "filter": [], "aggs": [{"id": "1"}]})}},
+            "references": []}
+        issues = " | ".join(osd.validate_visualization(old))
+        self.assertIn("'bar' is not registered", issues)
+        self.assertIn("has no 'labels'", issues)
+        self.assertIn("contains 'aggs'", issues)
+
+    def test_old_dashboard_shape_is_rejected(self):
+        from tools.dashboard import osd_objects as osd
+        old = {"id": "d", "attributes": {"panelsJSON": json.dumps(
+            [{"id": "v1", "x": 0, "y": 0, "w": 24, "h": 15, "type": "visualization"}])},
+            "references": [{"name": "panel_v1", "type": "visualization", "id": "v1"}]}
+        issues = " | ".join(osd.validate_dashboard(old))
+        self.assertIn("gridData", issues)
+        self.assertIn("panelIndex", issues)
+        self.assertIn("optionsJSON missing", issues)
+
+    def test_every_built_vis_type_validates(self):
+        from tools.dashboard import osd_objects as osd
+        aggs = [{"id": "1", "type": "count", "schema": "metric", "params": {}},
+                {"id": "2", "type": "terms", "schema": "segment", "params": {"field": "rule.id", "size": 5}}]
+        for t in osd.VALID_VIS_TYPES:
+            attrs, refs = osd.build_visualization_attributes("t", t, aggs, "idx")
+            self.assertEqual(osd.validate_visualization({"attributes": attrs, "references": refs}), [], t)
+
+    def test_date_histogram_params_are_completed(self):
+        from tools.dashboard import osd_objects as osd
+        [agg] = osd.normalize_aggs([{"id": 2, "type": "date_histogram", "schema": "segment",
+                                     "params": {"field": "timestamp", "includeEmptyRows": True}}])
+        self.assertEqual(agg["id"], "2")
+        self.assertIn("extended_bounds", agg["params"])
+        self.assertNotIn("includeEmptyRows", agg["params"])
+
+    def test_normalize_aggs_handles_missing_id_and_schema(self):
+        """Malformed aggs (missing id, missing schema, None id) are normalized
+        to valid unique ids + inferred schemas instead of producing 'None' duplicates."""
+        from tools.dashboard import osd_objects as osd
+        malformed = [
+            {"type": "terms", "params": {"field": "rule_id.keyword", "size": 15}},  # no id, no schema
+            {"type": "count", "params": {}},  # no id, no schema
+            {"id": None, "type": "terms", "params": {"field": "rule.groups"}},  # explicit None id
+            {"type": "avg", "params": {"field": "rule.level"}},  # metric type, no schema
+        ]
+        norm = osd.normalize_aggs(malformed)
+        # Unique ids (no "None" duplicates)
+        ids = [a["id"] for a in norm]
+        self.assertEqual(len(ids), len(set(ids)), f"duplicate ids: {ids}")
+        self.assertNotIn("None", ids, f"found 'None' string id: {ids}")
+        # Schemas inferred
+        schemas = [a.get("schema") for a in norm]
+        # terms -> segment, count -> metric, terms -> segment, avg -> metric
+        self.assertEqual(schemas, ["segment", "metric", "segment", "metric"])
+        # Resulting visState validates
+        attrs, refs = osd.build_visualization_attributes("Top Triggered Rules", "histogram", malformed, "idx")
+        issues = osd.validate_visualization({"attributes": attrs, "references": refs})
+        self.assertEqual(issues, [], f"should validate: {issues}")
 
 
 class TestGapsEngine(unittest.TestCase):
@@ -589,7 +711,7 @@ class TestRegistryPermissionGate(unittest.TestCase):
         self.wazuh.get_rules_file.return_value = LOCAL_RULES_TEMPLATE
         self.wazuh.put_rules_file.return_value = {"message": "Rule was successfully uploaded"}
         ctx = make_ctx(wazuh=self.wazuh, indexer=self.indexer,
-                       approval={"action": "create_wazuh_rule"})
+                       approval={"action": "create_wazuh_rule", "status": "approved"})
         with mock.patch("audit.audit_log"):
             out = registry.execute(ctx, "create_wazuh_rule",
                                    {"rule_xml": self.RULE, "reason": "approved run"})
@@ -601,7 +723,7 @@ class TestRegistryPermissionGate(unittest.TestCase):
         from tools import registry
         self.wazuh.get_rules_file.return_value = LOCAL_RULES_TEMPLATE
         ctx = make_ctx(wazuh=self.wazuh, indexer=self.indexer,
-                       approval={"action": "delete_wazuh_rule"})
+                       approval={"action": "delete_wazuh_rule", "status": "approved"})
         with mock.patch("audit.audit_log"):
             out = registry.execute(ctx, "create_wazuh_rule",
                                    {"rule_xml": self.RULE, "reason": "x"})
