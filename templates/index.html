@@ -994,14 +994,14 @@ async function fetchAlerts(id) {
 function alertTable(alerts) {
   const rows = alerts.map(a => `
     <tr>
-      <td class="mono">${esc(a.alert_id || "-")}</td>
+      <td class="mono">${esc(a.rule_id || a.alert_id || "-")}</td>
       <td class="sev ${String(a.severity || "").toLowerCase()}">${esc(a.severity || "-")}</td>
       <td>${esc(a.rule_name || "-")}</td>
       <td>${esc(a.host || "-")}</td>
       <td>${esc(a.user || "-")}</td>
       <td class="mono">${esc(a.src_ip || "-")}</td>
     </tr>`).join("");
-  return `<table><thead><tr><th>ID</th><th>Sev</th><th>Rule</th><th>Host</th><th>User</th><th>Src IP</th></tr></thead><tbody>${rows}</tbody></table>`;
+  return `<table><thead><tr><th>Rule ID</th><th>Sev</th><th>Rule</th><th>Host</th><th>User</th><th>Src IP</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 async function runTriage(id) {
@@ -1010,9 +1010,9 @@ async function runTriage(id) {
     const r = await api(`/api/providers/${id}/triage`, { method: "POST" });
     if (r.triaged === 0) return panel(id, `<h4 style="margin-bottom:6px;">Triage</h4><div class="empty">${esc(r.note || "No alerts.")}</div>`);
     const rows = r.results.map(x => x.error
-      ? `<tr><td class="mono">${esc(x.alert_id)}</td><td colspan="5" style="color:var(--red)">${esc(x.error)}</td></tr>`
+      ? `<tr><td class="mono">${esc(x.rule_id || x.alert_id)}</td><td colspan="5" style="color:var(--red)">${esc(x.error)}</td></tr>`
       : `<tr>
-          <td class="mono">${esc(x.alert_id)}</td>
+          <td class="mono">${esc(x.rule_id || x.alert_id)}</td>
           <td>${esc(x.verdict)}</td>
           <td class="mono">${Number(x.confidence).toFixed(2)}</td>
           <td>${esc(x.recommended_action)}</td>
@@ -1020,7 +1020,7 @@ async function runTriage(id) {
           <td>${esc(x.rationale)}</td>
         </tr>`).join("");
     panel(id, `<h4 style="margin-bottom:8px;">${esc(r.provider_name)} · triaged ${r.triaged} alert(s) → data/triage_log.jsonl</h4>` +
-      `<table><thead><tr><th>Alert ID</th><th>Verdict</th><th>Conf</th><th>Action</th><th>Routing</th><th>Rationale</th></tr></thead><tbody>${rows}</tbody></table>`);
+      `<table><thead><tr><th>Rule ID</th><th>Verdict</th><th>Conf</th><th>Action</th><th>Routing</th><th>Rationale</th></tr></thead><tbody>${rows}</tbody></table>`);
     toast(`Triaged ${r.triaged} alert(s) from ${r.provider_name}`, true);
   } catch (e) { panel(id, `<h4 style="margin-bottom:6px;">Triage</h4><pre class="detail">${esc(e.message)}</pre>`); toast(e.message); }
 }
