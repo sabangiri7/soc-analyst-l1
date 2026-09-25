@@ -643,7 +643,7 @@ if __name__ == "__main__":  # pragma: no cover - thin argparse wrapper
         print(f"Updated:  {len(result['updated'])}  {result['updated']}")
         print(f"Skipped:  {len(result['skipped'])}  {result['skipped']}")
         if result["errors"]:
-            print(f"Errors:")
+            print("Errors:")
             for e in result["errors"]:
                 print(f"  - {e['name']}: {e['error']}")
     elif args.cmd == "backtest":

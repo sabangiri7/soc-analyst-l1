@@ -130,12 +130,6 @@ class SOCEngineer:
                                             user=self.user, agent="soc_engineer")
         return self._ctx_pending
 
-    # ------------------------------------------------------------------ #
-    def _to_message(self, content: Any) -> str:
-        """Tool/trace content entering the conversation is wrapped as DATA so
-        the model can distinguish system text from retrieved content."""
-        return guard.to_data_markers(content)
-
     def _execute_tool(self, name: str, tool_input: dict[str, Any]) -> tuple[Any, dict[str, Any] | None]:
         """Run one tool via the registry. Returns (outcome, proposal or None)."""
         outcome = run_tool(self._ctx(), name, tool_input)

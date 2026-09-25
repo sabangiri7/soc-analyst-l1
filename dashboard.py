@@ -47,7 +47,6 @@ import audit
 
 app = Flask(__name__)
 
-TRIAGE_LOG = Path("data/triage_log.jsonl")
 TRIAGE_LIMIT_DEFAULT = 5
 
 
@@ -254,13 +253,13 @@ def api_triage(provider_id: str):
     for alert in alerts[:limit]:
         try:
             rule_matches = rules.evaluate_all(alert)
-        except Exception as e:  # noqa: BLE001 - a bad rule should never block triage
+        except Exception:  # noqa: BLE001 - a bad rule should never block triage
             rule_matches = []
         triggered = [m for m in rule_matches if m["triggered"]]
         if triggered:
             try:
                 notify.notify_rule_matches(alert, rule_matches)
-            except Exception as e:  # noqa: BLE001 - a bad webhook must never block triage
+            except Exception:  # noqa: BLE001 - a bad webhook must never block triage
                 pass
 
         try:

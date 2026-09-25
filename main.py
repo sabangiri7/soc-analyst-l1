@@ -28,8 +28,6 @@ from connectors.siem import SIEMConnector
 import rules
 import notify
 
-TRIAGE_LOG = Path("data/triage_log.jsonl")
-
 
 def _triage_log_path(path: str | Path | None = None) -> Path:
     return Path(path) if path else Path(getattr(cfg, "TRIAGE_LOG_PATH", "") or "data/triage_log.jsonl")

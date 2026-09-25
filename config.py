@@ -59,8 +59,6 @@ class Config:
     AGENT_DIR = os.getenv("AGENT_DIR", "data/agents")
     # Seconds between poll cycles (--interval default in run.py).
     AGENT_POLL_INTERVAL = float(os.getenv("AGENT_POLL_INTERVAL", "30"))
-    # Stop cleanly after N poll cycles (0 = run forever) - --exit-after default.
-    AGENT_EXIT_AFTER = int(os.getenv("AGENT_EXIT_AFTER", "0"))
 
     # --- LLM retry/backoff (openai_compat_provider._post) ---
     # Free gateways (FreeLLMAPI, OpenRouter free tier, ...) throw 429/5xx under

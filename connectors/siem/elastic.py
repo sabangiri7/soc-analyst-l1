@@ -71,7 +71,7 @@ class ElasticConnector(SIEMConnector):
             should.append({"term": {"source.ip": host}})
         if user:
             should.append({"term": {"user.name": user}})
-        query = {"bool": {"filter": [{"range": {"@timestamp": {"gte": f"now-1d"}}}]}}
+        query = {"bool": {"filter": [{"range": {"@timestamp": {"gte": "now-1d"}}}]}}
         if should:
             query["bool"]["should"] = should
             query["bool"]["minimum_should_match"] = 1

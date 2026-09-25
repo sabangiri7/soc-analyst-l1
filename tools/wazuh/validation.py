@@ -21,7 +21,7 @@ _REQUIRED_DECODER_ATTRS = ("name",)
 def parse_xml(xml_text: str) -> ET.Element | None:
     try:
         return ET.fromstring(xml_text)
-    except ET.ParseError as e:
+    except ET.ParseError:
         return None
 
 

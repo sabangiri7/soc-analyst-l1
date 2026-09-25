@@ -433,14 +433,6 @@ def _rule_exists(ctx: ToolContext, rule_id: int) -> bool:
         return True  # assume exists (fail safe: warn the approver, don't silently allow dupes)
 
 
-def _row(sample: str, i: int) -> dict[str, Any]:
-    return {"index": i}
-
-
-def zip_pos(pos: list[str], classes: list[str]):
-    return list(zip(pos, classes))
-
-
 def zip_neg(neg: list[str], classes: list[str]):
     return list(zip(neg, classes))
 

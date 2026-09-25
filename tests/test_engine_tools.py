@@ -406,7 +406,7 @@ class TestDashboardEngine(unittest.TestCase):
         with mock.patch("tools.dashboard.engine.dashboards_request", return_value=resp):
             self.assertIsNone(engine._find_index_pattern())
         # caller falls back to the conventional alerts id.
-        with mock.patch("tools.dashboard.engine._find_index_pattern", return_value=None) as m:
+        with mock.patch("tools.dashboard.engine._find_index_pattern", return_value=None):
             from tools.dashboard.engine import DesignDetectionDashboard
             ctx = self._ctx_with_schema()
             with self.assertRaises(ApprovalRequired) as cm:

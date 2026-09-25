@@ -26,7 +26,7 @@ from typing import Any
 from tools.base import BaseWazuhTool, Permission, ToolContext, ToolError
 from tools.dashboard import osd_objects as osd
 from tools.dashboard.client import dashboards_request
-from tools.indexer.queries import search_body, to_range_expr, verify_opensearch_query
+from tools.indexer.queries import search_body, verify_opensearch_query
 
 _INDEX = "wazuh-alerts-*"
 _PANEL_LIMIT = 8
@@ -265,7 +265,6 @@ class DesignDetectionDashboard(BaseWazuhTool):
         except Exception as e:  # noqa: BLE001
             raise ToolError(f"Cannot read indexer schema - dashboard design aborted: {e}") from e
         panels = _panel_plan(focus, schema)
-        panel_query_map = {panel["slug"]: panel["query"] for panel in panels}
 
         # 2) verify each panel's query matches data (evidence)
         verified: list[dict[str, Any]] = []

@@ -162,6 +162,6 @@ class DisableWazuhAgent(BaseWazuhTool):
         proposed["validation"] = {"valid": True, "note": "Agent removal from the manager."}
         ctx.approve_or_raise(proposed)
         resp = ctx.wazuh.request(
-            "DELETE", f"/agents", params={"agents_list": p["agent_id"], "purge": False}
+            "DELETE", "/agents", params={"agents_list": p["agent_id"], "purge": False}
         )
         return {"status": "executed", "agent_id": p["agent_id"], "detail": resp.get("message")}

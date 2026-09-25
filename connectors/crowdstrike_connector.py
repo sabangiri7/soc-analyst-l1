@@ -72,7 +72,7 @@ class CrowdStrikeConnector:
         resources = r.json().get("resources", [])
         return resources[0] if resources else {}
 
-    def get_host_alert_history(self, host_id: str, days: int = 7) -> list[dict[str, Any]]:
+    def get_host_alert_history(self, host_id: str) -> list[dict[str, Any]]:
         """Prior detections on this host - useful for 'is this box known-noisy'."""
         r = requests.get(
             f"{self.base}/detects/queries/detects/v1",

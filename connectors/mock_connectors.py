@@ -1,19 +1,12 @@
 """
 Drop-in replacements used when MOCK_MODE=true.
 
-- MockSiemConnector (aliased as MockSplunkConnector) is the multi-SIEM mock
-  provider - see connectors.siem.mock. It returns canned alerts and event
-  history instead of hitting a live SIEM.
+- MockSiemConnector is the multi-SIEM mock provider - see connectors.siem.mock.
+  It returns canned alerts and event history instead of hitting a live SIEM.
 - MockCrowdStrikeConnector stubs the EDR enrichment side.
 """
 from __future__ import annotations
 from typing import Any
-
-from connectors.siem.mock import MockSiemConnector
-
-# Old name kept for compat - the mock now speaks the unified SIEM interface
-# (get_new_alerts / search_related_events / close_notable).
-MockSplunkConnector = MockSiemConnector
 
 
 class MockCrowdStrikeConnector:
@@ -47,7 +40,7 @@ class MockCrowdStrikeConnector:
             "hash_reputation": "unknown - not previously seen in VT",
         }
 
-    def get_host_alert_history(self, host_id: str, days: int = 7) -> list[dict[str, Any]]:
+    def get_host_alert_history(self, host_id: str) -> list[dict[str, Any]]:
         return []  # first detection on this host in the window
 
     def isolate_host(self, host_id: str, reason: str) -> dict[str, Any]:

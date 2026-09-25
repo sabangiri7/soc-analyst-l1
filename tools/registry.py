@@ -25,7 +25,6 @@ from typing import Any
 import approvals
 import audit
 import guard
-from config import cfg
 from tools.base import (
     ApprovalRequired,
     BaseWazuhTool,

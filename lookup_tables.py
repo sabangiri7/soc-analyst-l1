@@ -139,15 +139,3 @@ def delete_lookup_table(name: str, path: str | Path | None = None) -> bool:
     del tables[name]
     _save(file, tables)
     return True
-
-
-def rename_lookup_table(name: str, new_name: str, path: str | Path | None = None) -> bool:
-    if not new_name or new_name == name:
-        return False
-    file = _current_path(path)
-    tables = _load(file)
-    if name not in tables or new_name in tables:
-        return False
-    tables[new_name] = tables.pop(name)
-    _save(file, tables)
-    return True

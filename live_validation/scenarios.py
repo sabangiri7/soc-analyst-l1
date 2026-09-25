@@ -952,7 +952,6 @@ def _scenario_dashboard_workflow(env: LiveEnv, log: EvidenceLog, opts: dict) -> 
         caps = run_tool(ctx, "get_index_schema", {"index": "wazuh-alerts-*"}, silent=True)
         caps = caps if isinstance(caps, dict) else {}
         fields = caps.get("fields") or []
-        ok = bool(fields) or "error" in str(caps.get("note", ""))[:0]
         log.step(s, "index schema", "get_index_schema", "wazuh_confirmed", bool(fields),
                  detail=f"fields exposed: {len(fields) if isinstance(fields, list) else 'n/a'} "
                         f"(note: {str(caps.get('note', ''))[:80]})",

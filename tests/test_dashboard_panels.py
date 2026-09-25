@@ -5,7 +5,6 @@ and the Flask route coverage. Runs with MOCK_MODE only — no API keys, no netwo
 Run: cd soc-agent && ./venv/bin/python -m unittest tests.test_dashboard_panels -v
 """
 from __future__ import annotations
-import json
 import os
 import tempfile
 import time

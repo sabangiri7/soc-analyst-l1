@@ -265,16 +265,9 @@ class WazuhManagerAPI:
             return str(resp.get("data", ""))
         return resp.get("data", {}).get("affected_items", [])
 
-    def list_rules_files(self) -> list[str]:
-        resp = self.get("/rules/files")
-        return [i.get("filename", "") for i in resp.get("data", {}).get("affected_items", [])]
-
     def put_rules_file(self, filename: str, content: str, overwrite: bool = True) -> dict[str, Any]:
         return self.put(f"/rules/files/{filename}", params={"overwrite": overwrite},
                         body=content, body_content_type="application/octet-stream")
-
-    def delete_rules_file(self, filename: str) -> dict[str, Any]:
-        return self.delete(f"/rules/files/{filename}")
 
     # ------------------------------------------------------------------ #
     # decoders
@@ -289,21 +282,6 @@ class WazuhManagerAPI:
                 params[key] = val
         return self.get("/decoders", params=params)
 
-    def get_decoder(self, name: str) -> dict[str, Any]:
-        return self.get(f"/decoders/{name}")
-
-    def create_decoder(self, decoder_xml: str, overwrite: bool = False) -> dict[str, Any]:
-        return self.post("/decoders", params={"overwrite": overwrite},
-                         body=decoder_xml, body_content_type="application/xml")
-
-    def update_decoder(self, name: str, decoder_xml: str,
-                       overwrite: bool = True, purge: bool = False) -> dict[str, Any]:
-        return self.put(f"/decoders/{name}", params={"overwrite": overwrite, "purge": purge},
-                        body=decoder_xml, body_content_type="application/xml")
-
-    def delete_decoder(self, name: str, purge: bool = False) -> dict[str, Any]:
-        return self.delete(f"/decoders/{name}", params={"purge": purge})
-
     # -- decoder file management (the 4.14 way to add/modify/remove decoders) --
     def get_decoders_file(self, filename: str = "local_decoder.xml", raw: bool = True) -> str:
         resp = self.get(f"/decoders/files/{filename}", params={"raw": raw}, raw_text=raw)
@@ -312,9 +290,6 @@ class WazuhManagerAPI:
     def put_decoders_file(self, filename: str, content: str, overwrite: bool = True) -> dict[str, Any]:
         return self.put(f"/decoders/files/{filename}", params={"overwrite": overwrite},
                         body=content, body_content_type="application/octet-stream")
-
-    def delete_decoders_file(self, filename: str) -> dict[str, Any]:
-        return self.delete(f"/decoders/files/{filename}")
 
     # ------------------------------------------------------------------ #
     # agents
@@ -335,12 +310,6 @@ class WazuhManagerAPI:
         """Agent detail - this API build has no /agents/{id} route, so detail
         comes back through /agents?agents_list=<id>&select=..."""
         return self.get("/agents", params={"agents_list": agent_id})
-
-    def restart_agent(self, agent_id: str) -> dict[str, Any]:
-        return self.put(f"/agents/{agent_id}/restart")
-
-    def add_agent_to_group(self, agent_id: str, group_id: str) -> dict[str, Any]:
-        return self.post(f"/agents/{agent_id}/group/{group_id}")
 
     # ------------------------------------------------------------------ #
     # manager / cluster / config
@@ -383,14 +352,3 @@ class WazuhManagerAPI:
 
     def end_logtest_session(self, token: str) -> dict[str, Any]:
         return self.delete(f"/logtest/sessions/{token}")
-
-    # ------------------------------------------------------------------ #
-    def api_info(self) -> dict[str, Any]:
-        return self.get("/")
-
-    # ------------------------------------------------------------------ #
-    def ping(self) -> str:
-        """Lightweight reachability/auth check for the dashboard."""
-        info = self.api_info()
-        return (f"Wazuh manager API {info.get('data', {}).get('api_version', '?')} "
-                f"auth OK ({self.base_url})")

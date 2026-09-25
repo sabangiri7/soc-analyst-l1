@@ -47,8 +47,6 @@ import permissions
 
 DEFAULT_APPROVALS_PATH = "data/approvals.json"
 
-STATUSES = ("pending", "approved", "rejected", "expired", "executing", "executed", "failed")
-
 
 class ApprovalPolicyError(RuntimeError):
     """A policy rule (self-approval, duplicate approver, quorum) refused the

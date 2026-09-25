@@ -67,14 +67,6 @@ class HashingEmbeddingFunction(chromadb.EmbeddingFunction):
     def name() -> str:
         return "hashing-fallback-v1"
 
-    def get_config(self) -> dict[str, Any]:
-        """No configurable state - this function's behavior is fixed."""
-        return {}
-
-    @staticmethod
-    def build_from_config(config: dict[str, Any]) -> "HashingEmbeddingFunction":
-        return HashingEmbeddingFunction()
-
 
 def _register() -> None:
     """Make this embedding function reconstructable by name when a

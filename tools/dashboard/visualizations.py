@@ -13,15 +13,6 @@ from tools.dashboard import osd_objects as osd
 from tools.dashboard import engine  # attribute access at call time (mockable)
 
 
-def vis_state_json(title: str, vis_type: str, aggs: list[dict[str, Any]],
-                   params: dict[str, Any] | None = None) -> str:
-    """Serialize the visState JSON string OpenSearch Dashboards needs in a
-    visualization's attributes. `aggs` are full agg JSON defs built by
-    dashboard_engine."""
-    return json.dumps({"title": title, "type": vis_type, "aggs": aggs,
-                       "params": params or {}})
-
-
 class GetWazuhVisualizations(BaseWazuhTool):
     name = "get_wazuh_visualizations"
     description = ("List saved visualizations on the Wazuh dashboard (saved-objects API) - "

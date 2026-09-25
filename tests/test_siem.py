@@ -5,7 +5,6 @@ provider store, and the dashboard API. No network / API keys required.
 Run: python -m unittest discover -s tests -v
 """
 from __future__ import annotations
-import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -37,7 +36,6 @@ class TestRegistry(unittest.TestCase):
             self.assertIsInstance(conn, SplunkConnector)
 
     def test_connector_config_override_wins(self):
-        from config import cfg
         conn = get_siem_connector("splunk", name="x", config={"host": "https://staging.splunk:8089"})
         self.assertEqual(conn.host, "https://staging.splunk:8089")
         self.assertEqual(conn.name, "x")

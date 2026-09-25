@@ -8,7 +8,6 @@ and what state the environment is left in.
 """
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from live_validation.env import LiveEnv

@@ -190,7 +190,7 @@ def run_watch(*, siem, interval: float, exit_after: int) -> int:
     stop = stop_file_path()
     stop.unlink(missing_ok=True)
 
-    def _on_signal(signum, frame):
+    def _on_signal(signum, _frame):
         print(f"  [run] signal {signum} received - shutting down cleanly.")
         mark_stopped()
         sys.exit(0)
