@@ -24,6 +24,7 @@ import re
 from typing import Any
 
 from tools.base import BaseWazuhTool, Permission, ToolContext, ToolError
+from tools.dashboard import osd_objects as osd
 from tools.dashboard.client import dashboards_request
 from tools.indexer.queries import search_body, to_range_expr, verify_opensearch_query
 
@@ -72,6 +73,44 @@ def _find_index_pattern() -> str | None:
         if "wazuh" in t or "filebeat" in t or "index-pattern" in t:
             fallback = fallback or item.get("id")
     return fallback
+
+
+def _index_pattern_object(index_pattern_id: str | None) -> dict[str, Any] | None:
+    """Fetch the index-pattern saved object itself, so panel fields can be
+    checked against what the pattern actually knows about (its cached
+    `fields` list) before anything is created.
+
+    Best-effort like `_find_index_pattern`: any failure (unreachable server,
+    404, malformed payload) returns None rather than raising, so the *design*
+    step degrades gracefully. The *execute* step (below) treats a None result
+    here as fatal, since writing panels against an index pattern that does
+    not exist on the target dashboards server would create an unresolvable
+    dashboard.
+    """
+    if not index_pattern_id:
+        return None
+    try:
+        obj = dashboards_request("GET", f"/api/saved_objects/index-pattern/{index_pattern_id}")
+    except Exception:  # noqa: BLE001 - best-effort discovery
+        return None
+    if not isinstance(obj, dict) or obj.get("error") or (obj.get("statusCode") or 200) >= 400:
+        return None
+    return obj
+
+
+def _agg_fields(vis_attrs: dict[str, Any]) -> set[str]:
+    """The set of field names a visualization's aggs actually query, pulled
+    back out of its visState - used to check those fields exist on the
+    target index pattern before execution."""
+    try:
+        vs = json.loads(vis_attrs["visState"])
+    except (KeyError, TypeError, ValueError):
+        return set()
+    return {
+        field
+        for agg in vs.get("aggs") or []
+        if (field := (agg.get("params") or {}).get("field"))
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -193,62 +232,6 @@ def _panel_plan(focus: str, schema: dict[str, str]) -> list[dict[str, Any]]:
     return panels[: _PANEL_LIMIT]
 
 
-def _vis_state(title: str, vis_type: str, aggs: list[dict[str, Any]]) -> str:
-    params: dict[str, Any] = {}
-    if vis_type == "pie":
-        params = {"type": "pie", "addTooltip": True, "legendPosition": "right", "isDonut": True}
-    elif vis_type == "metric":
-        params = {"metric": {"colorSchema": "Green to Red", "metricColorMode": "Labels",
-                             "useRanges": False, "percentageMode": False},
-                  "type": "metric"}
-    elif vis_type in ("bar", "line", "area"):
-        params = {"type": "histogram", "grid": {"categoryLines": False},
-                  "categoryAxes": [{"id": "CategoryAxis-1", "type": "category", "position": "bottom",
-                                    "show": True, "style": {}, "scale": {"type": "linear"}}],
-                  "valueAxes": [{"id": "ValueAxis-1", "name": "LeftAxis-1", "type": "value",
-                                 "position": "left", "show": True, "style": {}, "scale": {"type": "linear"}}],
-                  "seriesParams": [{"show": True, "type": vis_type, "mode": "stacked",
-                                    "data": {"label": "alerts", "id": "1"}, "valueAxis": "ValueAxis-1"}]}
-    state = {"title": title, "type": vis_type, "aggs": aggs, "params": params, "listeners": {}}
-    return json.dumps(state)
-
-
-def _osd_filters(query: dict[str, Any] | None, index: str) -> list[dict[str, Any]]:
-    """Turn the panel's verified query clauses into OSD filter objects.
-
-    OSD searchSourceJSON expects full Filter objects (with meta.index so the
-    filter resolves against the pattern) - bare DSL clauses are not reliably
-    applied. Term/range clauses coming from _panel_plan are mapped; anything
-    else is ignored."""
-    out: list[dict[str, Any]] = []
-    if query:
-        for clause in (query.get("bool") or {}).get("filter") or []:
-            if "term" in clause:
-                field = next(iter(clause["term"]))
-                out.append({"meta": {"index": index, "type": "term", "key": field,
-                                     "value": clause["term"][field], "negate": False,
-                                     "disabled": False}, **clause})
-            elif "range" in clause:
-                field = next(iter(clause["range"]))
-                out.append({"meta": {"index": index, "type": "range", "key": field,
-                                     "negate": False, "disabled": False}, **clause})
-    return out
-
-
-def _search_source(index_pattern: str, aggs: list[dict[str, Any]],
-                   query: dict[str, Any] | None = None) -> str:
-    """searchSourceJSON for the saved object - ties the visualization (and so
-    the panel) to the wazuh alert index pattern and carries the focus filter
-    (e.g. rule.groups: web) + verification window so the panel renders scoped
-    instead of showing every alert in the cluster."""
-    return json.dumps({
-        "query": {"query": "", "language": "kuery"},
-        "filter": _osd_filters(query, index_pattern),
-        "index": index_pattern,
-        "aggs": json.loads(json.dumps(aggs)),
-    })
-
-
 # --------------------------------------------------------------------------- #
 class DesignDetectionDashboard(BaseWazuhTool):
     name = "design_detection_dashboard"
@@ -295,61 +278,43 @@ class DesignDetectionDashboard(BaseWazuhTool):
             verified.append({"slug": panel["slug"], "title": panel["title"], "matched": check.get("matched", 0),
                              "note": check.get("error", "panel query verified")})
 
-        # 3) index pattern (best-effort discovery)
+        # 3) index pattern (best-effort discovery + best-effort metadata for
+        #    field validation - a missing/unreachable dashboards server here
+        #    just means field checks are skipped at design time; execution
+        #    below re-checks and blocks if the pattern truly can't be found).
         index_pattern = _find_index_pattern() or "wazuh-alerts-*"
+        design_known_fields = osd.index_pattern_fields(_index_pattern_object(index_pattern) or {})
 
-        # 4) build the full bundle (visualizations + dashboard panels)
-        visualizations = []
-        grid: list[dict[str, Any]] = []
-        x = 0
+        # 4) build the full bundle (visualizations + dashboard panels) using
+        # the validated osd_objects builders - correct vis types, complete
+        # params, reference-form searchSourceJSON, and a dashboard whose
+        # panels carry gridData/panelIndex/panelRefName + optionsJSON. See
+        # tools/dashboard/osd_objects.py for why each of those matters.
+        visualizations: list[dict[str, Any]] = []
+        vis_issues: list[str] = []
         for panel in panels:
-            vis_state = _vis_state(panel["title"], panel["vis_type"], panel["aggs"])
-            visualizations.append({
-                "slug": panel["slug"],
-                "title": panel["title"],
-                "vis_type": panel["vis_type"],
-                "vis_state": vis_state,
-                "search_source": _search_source(index_pattern, panel["aggs"], panel["query"]),
-            })
-            grid.append({"id": f"vis-{panel['slug']}", "x": x % 2 * 24, "y": (x // 2) * 15,
-                         "w": 24, "h": 15, "type": "visualization"})
-            x += 1
-        panels_json = json.dumps(grid)
+            attrs, refs = osd.build_visualization_attributes(
+                panel["title"], panel["vis_type"], panel["aggs"], index_pattern,
+                query=panel["query"],
+                description="Generated by the AI SOC engineer (verified against wazuh-alerts-*)",
+            )
+            vis_obj = {"id": f"vis-{panel['slug']}", "type": "visualization", "version": 1,
+                      "attributes": attrs, "references": refs}
+            vis_issues.extend(osd.validate_visualization(vis_obj, design_known_fields))
+            visualizations.append({"slug": panel["slug"], "id": vis_obj["id"], "title": panel["title"],
+                                   "vis_type": panel["vis_type"], "obj": vis_obj})
 
-        # 4b) the importable saved-object bundle: the proposal is a complete,
-        # valid, resolvable artifact - not just metadata. panelsJSON ids match
-        # the visualization object ids exactly, and every visualization carries
-        # its searchSourceJSON (index + focus filter + window) + the index-
-        # pattern reference, so the objects open and render in OSD.
-        vis_ref = [{"id": index_pattern, "name": "kibanaSavedObjectMeta.searchSourceJSON.index",
-                    "type": "index-pattern"}] if index_pattern else []
-        saved_objects: list[dict[str, Any]] = []
-        for v in visualizations:
-            saved_objects.append({
-                "id": f"vis-{v['slug']}", "type": "visualization", "version": 1,
-                "attributes": {
-                    "title": v["title"],
-                    "description": "Generated by the AI SOC engineer (verified against wazuh-alerts-*)",
-                    "visState": v["vis_state"],
-                    "version": 1,
-                    "kibanaSavedObjectMeta": {"searchSourceJSON": v["search_source"]},
-                },
-                "references": list(vis_ref),
-            })
+        panels_json, panel_refs = osd.build_panels([v["id"] for v in visualizations])
         dashboard_id = "dashboard-" + re.sub(r"[^a-z0-9]+", "-", p["title"].lower()).strip("-")
-        saved_objects.append({
+        dash_obj = {
             "id": dashboard_id, "type": "dashboard", "version": 1,
-            "attributes": {
-                "title": p["title"],
-                "description": p.get("description") or f"Wazuh {focus} alert dashboard over {index_pattern}",
-                "hits": 0, "version": 1, "timeRestore": False,
-                "panelsJSON": panels_json,
-                "kibanaSavedObjectMeta": {"searchSourceJSON": json.dumps(
-                    {"query": {"query": "", "language": "kuery"}, "filter": []})},
-            },
-            "references": [{"name": f"panel_vis-{v['slug']}", "type": "visualization",
-                            "id": f"vis-{v['slug']}"} for v in visualizations],
-        })
+            "attributes": osd.build_dashboard_attributes(
+                p["title"], p.get("description") or f"Wazuh {focus} alert dashboard over {index_pattern}",
+                panels_json),
+            "references": panel_refs,
+        }
+        dash_issues = osd.validate_dashboard(dash_obj)
+        saved_objects: list[dict[str, Any]] = [v["obj"] for v in visualizations] + [dash_obj]
 
         proposed = {
             # Re-running this same workflow with an approved context executes
@@ -373,11 +338,12 @@ class DesignDetectionDashboard(BaseWazuhTool):
             # vis-<slug> placeholders; execution remaps them to server ids).
             "saved_objects": saved_objects,
         }
-        validated = not degraded
+        errors = [f"panel '{d}' query failed: {next((v['note'] for v in verified if v['slug'] == d), '')}"
+                  for d in degraded] + vis_issues + dash_issues
+        validated = not errors
         proposed["validation"] = {
             "valid": validated,
-            "errors": [f"panel '{d}' query failed: {next((v['note'] for v in verified if v['slug'] == d), '')}"
-                       for d in degraded] or None,
+            "errors": errors or None,
             "note": ("Queries verified against the real indexer; creation is best-effort on the "
                      "dashboards server and will report the server-confirmed ids."),
             "evidence": {"focus": focus, "index": _INDEX, "index_pattern": index_pattern,
@@ -387,75 +353,82 @@ class DesignDetectionDashboard(BaseWazuhTool):
         }
         ctx.approve_or_raise(proposed)
 
-        # --- execution: create visualizations, then the dashboard, verifying each ---
+        # --- execution ---------------------------------------------------- #
+        # The index pattern must actually exist on *this* dashboards server -
+        # a design-time discovery miss silently falls back to the
+        # conventional id, but execution is not allowed to guess: writing
+        # panels against a pattern that isn't there produces a dashboard
+        # that can never resolve its own data source.
+        idx_obj = _index_pattern_object(index_pattern)
+        if idx_obj is None:
+            raise ToolError(
+                f"Could not locate that index-pattern ('{index_pattern}') on the dashboards "
+                "server - create it (or re-check WAZUH_DASHBOARD_URL) before retrying."
+            )
+        known_fields = osd.index_pattern_fields(idx_obj)
+        if known_fields is not None:
+            missing = sorted({
+                field for v in visualizations
+                for field in _agg_fields(v["obj"]["attributes"])
+                if field not in known_fields
+            })
+            if missing:
+                raise ToolError(
+                    f"Index pattern '{index_pattern}' does not know about field(s) {missing} used "
+                    "by these panels - refresh the index pattern fields in the Wazuh dashboard "
+                    "and try again."
+                )
+
+        # create visualizations, then the dashboard, then read it back
         created_vis: list[dict[str, Any]] = []
         try:
             for v in visualizations:
                 resp = dashboards_request(
                     "POST", "/api/saved_objects/visualization",
-                    body={
-                        "attributes": {
-                            "title": v["title"],
-                            "visState": v["vis_state"],
-                            "description": "Generated by the AI SOC engineer (approved)",
-                            "version": 1,
-                            "kibanaSavedObjectMeta": {"searchSourceJSON": v["search_source"]},
-                        },
-                        "references": [{"id": index_pattern,
-                                        "name": "kibanaSavedObjectMeta.searchSourceJSON.index",
-                                        "type": "index-pattern"}] if index_pattern else [],
-                    },
+                    body={"attributes": v["obj"]["attributes"], "references": v["obj"]["references"]},
                 )
-                obj = resp.get("saved_object") or resp.get("object") or {}
+                obj = resp.get("saved_object") or resp.get("object") or resp
                 vid = obj.get("id") or resp.get("id")
                 created_vis.append({"slug": v["slug"], "id": vid, "title": v["title"]})
         except ToolError as e:
             raise ToolError(f"Visualization step failed (dashboard not created): {e}") from e
 
-        # map real visualization ids into the grid
-        slug_to_id = {v["slug"]: v["id"] for v in created_vis}
-        real_panels = []
-        yseen: dict[int, int] = {}
-        for panel in grid:
-            slug = panel["id"].replace("vis-", "")
-            pid = slug_to_id.get(slug)
-            if not pid:
-                continue
-            y = yseen.get(panel["y"], panel["y"])
-            yseen[panel["y"]] = y + 15
-            real_panels.append({"id": pid, "x": panel["x"], "y": y,
-                                "w": panel["w"], "h": panel["h"], "type": "visualization"})
+        real_panels_json, real_refs = osd.build_panels([v["id"] for v in created_vis])
         try:
             dash = dashboards_request(
                 "POST", "/api/saved_objects/dashboard",
                 body={
-                    "attributes": {
-                        "title": p["title"],
-                        "description": p.get("description", ""),
-                        "hits": 0,
-                        "panelsJSON": json.dumps(real_panels),
-                        "timeRestore": False,
-                        "version": 1,
-                        "kibanaSavedObjectMeta": {"searchSourceJSON": json.dumps(
-                            {"query": {"query": "", "language": "kuery"}, "filter": []})},
-                    },
-                    # panel references mirror the dashboard references in the
-                    # proposed bundle so the panel ids resolve on import/export.
-                    "references": [{"id": panel["id"], "name": f"panel_{panel['id']}",
-                                    "type": "visualization"} for panel in real_panels],
+                    "attributes": osd.build_dashboard_attributes(
+                        p["title"], p.get("description", ""), real_panels_json),
+                    # panel references mirror the dashboard's own panelRefName
+                    # entries so the panel ids resolve on import/export.
+                    "references": real_refs,
                 },
             )
         except ToolError as e:
             raise ToolError(f"Dashboard create failed after {len(created_vis)} visualizations: {e}") from e
-        dobj = dash.get("saved_object") or dash.get("object") or {}
+        dobj = dash.get("saved_object") or dash.get("object") or dash
         did = dobj.get("id") or dash.get("id")
+
+        # Read the dashboard back and validate what the server actually
+        # stored - a bad read-back is reported, never silently claimed as
+        # success (see docs/architecture.md: "evidence before claims").
+        render_issues: list[str]
+        try:
+            fetched = dashboards_request("GET", f"/api/saved_objects/dashboard/{did}")
+            render_issues = osd.validate_dashboard(fetched)
+        except ToolError as e:
+            render_issues = [f"could not read the dashboard back after creating it: {e}"]
+
         return {
-            "status": "executed",
+            "status": "executed" if not render_issues else "executed_with_issues",
             "dashboard_id": did,
             "title": p["title"],
             "visualizations": created_vis,
-            "panels_created": len(real_panels),
+            "panels_created": len(created_vis),
             "verified_panels": [{"slug": v["slug"], "matched": v["matched"]} for v in verified],
+            "render_check": {"ok": not render_issues, "issues": render_issues},
+            "open_url_path": f"/app/dashboards#/view/{did}",
             "detail": dash.get("message"),
         }
 
