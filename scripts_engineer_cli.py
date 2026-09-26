@@ -25,6 +25,7 @@ Usage::
     python scripts_engineer_cli.py --add-skill /path/to/skill-dir   # install a pack
     python scripts_engineer_cli.py --new-skill my-skill    # scaffold a template
     python scripts_engineer_cli.py --list-skills
+    python scripts_engineer_cli.py --mode analyst           # start as the L1 analyst
     python scripts_engineer_cli.py --list-proposals pending
     python scripts_engineer_cli.py --proposal appr-abc123  # full diff/validation detail
     python scripts_engineer_cli.py --approve appr-abc123
@@ -51,6 +52,9 @@ from agent.skills import (
     suggest_skills,
 )
 from agent.soc_engineer import SYSTEM_PROMPT, EngineerResult, SOCEngineer
+from cli import connections, inline_approvals
+from cli.agents import MODES, AgentRunner
+from cli.mcp_client import MCPError, MCPManager, config_path, load_config, mcp_available
 from config import cfg
 
 SESSIONS_DIR = Path(getattr(cfg, "ENGINEER_SESSIONS_DIR", "data/engineer_sessions"))
@@ -73,6 +77,25 @@ Slash commands:
   /new-skill <name>                scaffold a new SKILL.md template
   /auto-skills on|off              toggle contextual skill auto-activation
   /new                             reset conversation history
+  /mode [analyst|engineer]         show or switch agent (conversation carries over)
+  /switch                          toggle analyst <-> engineer
+  /agents                          list agents you (or the agent) can delegate to
+  /delegate <agent> <task...>      run a task on another agent / skill sub-agent
+  /delegation on|off               let the agent delegate on its own (default on)
+  /load-skills on|off              let the agent load skills itself (default on)
+  /providers                       list SIEM connections (secrets redacted)
+  /connect <platform>              add a SIEM connection (prompts; secrets hidden)
+  /disconnect <id>                 remove a SIEM connection
+  /test <id>                       test a SIEM connection
+  /siem <id>|off                   SIEM the analyst queries for live alerts
+  /model [backend] [model]         show or switch the LLM for this session
+  /cost                            model calls, tokens, and estimated token savings
+  /tokens [lean|full]              token-saving mode (lean = trimmed tool set, default)
+  /approvals [ask|manual]          ask = review new proposals inline after each turn
+  /mcp                             MCP servers + status (config: .mcp.json)
+  /mcp tools [server]              list MCP tools (READ vs approval-required)
+  /mcp start|stop <server>         connect / disconnect one MCP server
+  /mcp allow <tool>                always allow one non-read MCP tool this session
   /proposals [status]              list proposals (default: pending)
   /proposals <id>                  full detail of one proposal (diff, validation)
   /approve <id>                    approve a pending proposal
@@ -260,10 +283,103 @@ class EngineerCLI:
         # drop an operator's skill
         if self.skills:
             active_skill_blocks(self.skills)  # raises SkillError
+        # modes, agent-loaded skills and sub-agents (cli/agents.py). The runner
+        # shares self.skills (same list object) so /use, /unuse and the
+        # agent's own load_skill all see one active set.
+        self.runner = AgentRunner(self.user, skills=self.skills, on_event=self._on_event,
+                                  on_step=self._on_step, engineer_system=self.system_prompt)
+        mode = getattr(args, "mode", None)
+        self.runner.set_mode(mode if isinstance(mode, str) and mode in MODES else "engineer")
+        full_tools = getattr(args, "full_tools", False)
+        self.runner.lean = not (full_tools is True)
+        mode_arg = getattr(args, "approval_mode", None)
+        self.approval_mode = mode_arg if mode_arg in ("ask", "manual") else "ask"
+        self.always_actions: set[str] = set()
+        self._ask = input
+        self.mcp: MCPManager | None = None
 
     def _ensure_engineer(self) -> None:
         if self.engineer is None:
-            self.engineer = SOCEngineer(user=self.user)
+            self.engineer = self.runner._main_agent("engineer")
+
+    # ------------------------------------------------------------ MCP
+    def start_mcp(self, interactive: bool) -> None:
+        """Connect configured MCP servers. Interactive runs get the inline
+        approver for non-read tools; one-shot/--json runs refuse them."""
+        if getattr(self.args, "no_mcp", False) is True:
+            return
+        cfg_arg = getattr(self.args, "mcp_config", None)
+        path = cfg_arg if isinstance(cfg_arg, str) else None
+        try:
+            config = load_config(path)
+        except MCPError as e:
+            print(f"mcp: {e}")
+            return
+        if not config:
+            return
+        if not mcp_available():
+            print("mcp: .mcp.json found but the 'mcp' package isn't installed (pip install mcp)")
+            return
+        self.mcp = MCPManager(config)
+        results = self.mcp.start_all()
+        self.runner.mcp = self.mcp
+        self.runner.mcp_approver = inline_approvals.mcp_approver(self._ask) if interactive else None
+        self.runner.reset_agents()
+        self.engineer = None
+        if not self.json_mode:
+            for name, err in results.items():
+                n = len(self.mcp._servers[name].tools) if err is None else 0
+                print(f"  mcp {name}: " + (f"connected ({n} tools)" if err is None else f"FAILED - {err}"))
+
+    def close(self) -> None:
+        if self.mcp is not None:
+            self.mcp.close()
+
+    def _ctx_factory(self, by: str):
+        from tools.api_client import WazuhManagerAPI
+        from tools.base import ToolContext
+        from tools.indexer_client import IndexerClient
+        return ToolContext(wazuh=WazuhManagerAPI(), indexer=IndexerClient(), user=by, agent="soc_engineer_cli")
+
+    def review_inline(self, result) -> None:
+        if self.approval_mode != "ask" or self.json_mode or not getattr(result, "proposals", None):
+            return
+        inline_approvals.review_pending(result.proposals, user=self.user, ask=self._ask,
+                                        always=self.always_actions, ctx_factory=self._ctx_factory)
+
+    def _on_event(self, kind: str, data: dict[str, Any]) -> None:
+        if self.json_mode:
+            return
+        sub = kind.startswith("sub:")
+        base = kind[4:] if sub else kind
+        indent = "      " if sub else "  "
+        who = f"[{data.get('agent')}] " if sub else ""
+        if base == "tool_calls":
+            for c in data.get("calls", []):
+                compact = json.dumps(c.get("input", {}), default=str)
+                compact = compact if len(compact) <= 110 else compact[:107] + "..."
+                print(f"{indent}\u2192 {who}{c.get('name')} {compact}", flush=True)
+        elif base == "load_skill":
+            print(f"{indent}\u2726 {who}loaded skill: {data.get('name')}", flush=True)
+        elif base == "delegate":
+            task = data.get("task", "")
+            print(f"{indent}\u21b3 {who}delegating to {data.get('agent')}: "
+                  f"{task if len(task) <= 100 else task[:97] + '...'}", flush=True)
+        elif base == "denied_tool":
+            print(f"{indent}\u2718 {who}blocked tool outside allowlist: {data.get('name')}", flush=True)
+        elif base == "find_tools":
+            found = data.get("found") or []
+            print(f"{indent}\u2315 {who}find_tools({data.get('query')!r}) \u2192 "
+                  f"{', '.join(found[:6]) or 'nothing'}{' \u2026' if len(found) > 6 else ''}", flush=True)
+        elif base == "mcp_call":
+            compact = json.dumps(data.get("input", {}), default=str)
+            compact = compact if len(compact) <= 100 else compact[:97] + "..."
+            tag = "read" if data.get("read_only") else "approved"
+            print(f"{indent}\u2192 {who}{data.get('name')} [{tag}] {compact}", flush=True)
+        elif base == "mcp_denied":
+            print(f"{indent}\u2718 {who}MCP call not approved: {data.get('name')}", flush=True)
+        elif base == "budget":
+            print(f"{indent}\u2718 {who}model-call budget reached ({data.get('max_calls')})", flush=True)
 
     def system_prompt(self, skills: list[str] | None = None) -> str:
         blocks = active_skill_blocks(skills if skills is not None else self.skills)
@@ -280,23 +396,18 @@ class EngineerCLI:
                 compact = compact[:117] + "..."
             print(f"  \u2192 {tc.get('name')} {compact}", flush=True)
 
-    def run_turn(self, message: str) -> EngineerResult:
-        self._ensure_engineer()
+    def run_turn(self, message: str):
         skills = list(self.skills)
         auto: list[str] = []
         if self.auto:
             auto = [name for name in suggest_skills(message, top_k=3)
                     if name not in skills]
             skills += auto
-        result = self.engineer.chat(
-            user_message=message,
-            history=self.history[-40:],
-            system=self.system_prompt(skills),
-            on_step=self._on_step,
-        )
+        if self.runner.mode == "engineer":
+            self._ensure_engineer()
+        result, self.history = self.runner.run(message, self.history, engineer_skills=skills)
         if auto and not self.json_mode:
             print(f"  (auto-activated skills: {', '.join(auto)})")
-        self.history = list(result.messages)
         if self.session:
             _save_turn(self.session, {
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -306,17 +417,27 @@ class EngineerCLI:
                 "proposals": result.proposals,
                 "skills": skills,
                 "auto_skills": auto,
+                "mode": result.mode,
+                "delegations": result.delegations,
                 "messages": self.history,
             })
         _audit(action="engineer_turn", params={"session": self.session,
                                                "skills": skills,
-                                               "auto_skills": auto},
+                                               "auto_skills": auto,
+                                               "mode": result.mode,
+                                               "delegations": [{"agent": d.get("agent"),
+                                                                "proposals": d.get("proposals")}
+                                                               for d in result.delegations]},
                user=self.user)
         return result
 
-    def print_result(self, result: EngineerResult) -> None:
+    def print_result(self, result) -> None:
         if result.reply:
             print(result.reply)
+        for d in getattr(result, "delegations", []) or []:
+            extra = f", proposals: {', '.join(d['proposals'])}" if d.get("proposals") else ""
+            print(f"  (sub-agent {d['agent']}: {d.get('model_calls', 0)} model call(s){extra}"
+                  f"{', error: ' + d['error'] if d.get('error') else ''})")
         if result.proposals:
             print("\nPending approvals:")
             _print_proposals("pending")
@@ -329,6 +450,8 @@ class EngineerCLI:
             "transcript": result.transcript,
             "session": self.session,
             "skills": self.skills,
+            "mode": getattr(result, "mode", "engineer"),
+            "delegations": getattr(result, "delegations", []),
         }, indent=2, default=str))
 
     # ------------------------------------------------------------------ #
@@ -368,7 +491,7 @@ class EngineerCLI:
             if not rest:
                 print("usage: /unuse <skill-name>")
                 return True
-            self.skills = [s for s in self.skills if s != rest[0]]
+            self.skills[:] = [s for s in self.skills if s != rest[0]]
             print(f"skill {rest[0]!r} deactivated")
             return True
         if cmd == "/add-skill":
@@ -445,7 +568,214 @@ class EngineerCLI:
                       f"{str(e.get('tool','')):<24} {e.get('action','')} "
                       f"{e.get('execution_status','')}")
             return True
+        handled = self._slash_agentic(cmd, rest)
+        if handled is not None:
+            return handled
         print(f"unknown command {cmd!r} - /help for the list")
+        return True
+
+    # ------------------------------------------------------------------ #
+    def _slash_agentic(self, cmd: str, rest: list[str]) -> bool | None:
+        """Modes, delegation, connections, model. None = not one of these."""
+        if cmd in ("/mode", "/switch"):
+            if cmd == "/switch":
+                target = "analyst" if self.runner.mode == "engineer" else "engineer"
+            elif rest:
+                target = rest[0].lower()
+            else:
+                print(f"mode: {self.runner.mode} (switch: /mode analyst|engineer, or /switch)")
+                return True
+            if target not in MODES:
+                print(f"error: mode must be one of {', '.join(MODES)}")
+                return True
+            self.runner.set_mode(target)
+            _audit(action="mode_switch", params={"mode": target}, user=self.user)
+            print(f"mode: {target} - conversation carries over")
+            return True
+        if cmd == "/agents":
+            for name, desc in self.runner.available_agents().items():
+                print(f"  {name:<24} {desc}")
+            print(f"  (agent-initiated delegation: {'ON' if self.runner.allow_delegation else 'OFF'})")
+            return True
+        if cmd == "/delegate":
+            if len(rest) < 2:
+                print("usage: /delegate <agent> <task...>")
+                return True
+            out = self.runner._delegate(rest[0], " ".join(rest[1:]))
+            _audit(action="operator_delegate", params={"agent": rest[0]}, user=self.user)
+            if out.get("error"):
+                print(f"error: {out['error']}")
+            if out.get("answer"):
+                print(out["answer"])
+            for p in out.get("pending_proposals", []):
+                print(f"  pending proposal {p['id']} ({p['action']}) - /proposals {p['id']}")
+            return True
+        if cmd in ("/delegation", "/load-skills"):
+            attr = "allow_delegation" if cmd == "/delegation" else "agent_load_skills"
+            if rest and rest[0].lower() in ("on", "off"):
+                setattr(self.runner, attr, rest[0].lower() == "on")
+            print(f"{cmd[1:]}: {'ON' if getattr(self.runner, attr) else 'OFF'}")
+            return True
+        if cmd == "/providers":
+            rows = connections.list_providers()
+            if not rows:
+                print("no SIEM connections - add one with /connect <platform>")
+            for p in rows:
+                mark = "*" if p.get("id") == self.runner.siem_provider_id else " "
+                host = (p.get("config") or {}).get("host", "")
+                print(f"{mark} {p.get('id'):<22} {p.get('platform'):<10} {p.get('name')}  {host}")
+            print(f"platforms: {', '.join(sorted(connections.platforms()))}")
+            return True
+        if cmd == "/connect":
+            if not rest:
+                print(f"usage: /connect <platform>  ({', '.join(sorted(connections.platforms()))})")
+                return True
+            try:
+                p = connections.connect(rest[0])
+            except (ValueError, EOFError, KeyboardInterrupt) as e:
+                print(f"error: {e or 'cancelled'}")
+                return True
+            _audit(action="provider_added", params={"id": p.get("id"), "platform": p.get("platform")},
+                   user=self.user)
+            print(f"added {p.get('id')} ({p.get('platform')}) - test it with /test {p.get('id')}")
+            return True
+        if cmd == "/disconnect":
+            if not rest:
+                print("usage: /disconnect <id>")
+                return True
+            ok = connections.remove(rest[0])
+            if ok and self.runner.siem_provider_id == rest[0]:
+                self.runner.siem_provider_id = None
+                self.runner.reset_agents()
+                self.engineer = None
+            _audit(action="provider_removed", params={"id": rest[0], "removed": ok}, user=self.user)
+            print("removed" if ok else f"no provider {rest[0]!r} (env-seeded ones are set in .env)")
+            return True
+        if cmd == "/test":
+            if not rest:
+                print("usage: /test <id>")
+                return True
+            print(json.dumps(connections.test(rest[0]), indent=2, default=str))
+            return True
+        if cmd == "/siem":
+            if not rest:
+                print(f"analyst SIEM: {self.runner.siem_provider_id or 'none'} (set: /siem <id>|off)")
+                return True
+            if rest[0].lower() == "off":
+                self.runner.siem_provider_id = None
+            else:
+                import siem_providers as store
+                if not store.get_provider(rest[0]):
+                    print(f"error: no provider {rest[0]!r} - see /providers")
+                    return True
+                self.runner.siem_provider_id = rest[0]
+            self.runner._agents.pop("analyst", None)  # rebuild with the new connector
+            print(f"analyst SIEM: {self.runner.siem_provider_id or 'none'}")
+            return True
+        if cmd == "/model":
+            if not rest:
+                cur = connections.current_model()
+                print(f"model: {cur['backend']} / {cur['model'] or '(default)'}")
+                print(f"backends: {', '.join(connections.llm_backends())}")
+                return True
+            try:
+                cur = connections.set_model(rest[0], rest[1] if len(rest) > 1 else None)
+            except Exception as e:  # noqa: BLE001
+                print(f"error: {e}")
+                return True
+            self.runner.reset_agents()
+            self.engineer = None
+            _audit(action="model_switch", params=cur, user=self.user)
+            print(f"model: {cur['backend']} / {cur['model'] or '(default)'} (this session only)")
+            return True
+        if cmd == "/cost":
+            u = self.runner.usage
+            print(f"model calls: {u.calls}  tokens: {u.total} "
+                  f"(prompt {u.prompt_tokens}, completion {u.completion_tokens})")
+            if u.full_chars:
+                print(f"request size: ~{u.sent_chars // 4} tokens sent vs ~{u.full_chars // 4} "
+                      f"in full mode (\u2248{u.saved_pct}% saved, estimate)")
+            return True
+        if cmd == "/tokens":
+            if rest and rest[0].lower() in ("lean", "full"):
+                self.runner.lean = rest[0].lower() == "lean"
+            u = self.runner.usage
+            print(f"token mode: {'lean' if self.runner.lean else 'full'}"
+                  + (f" \u00b7 \u2248{u.saved_pct}% of request size saved so far" if u.full_chars else ""))
+            return True
+        if cmd == "/approvals":
+            if rest and rest[0].lower() in ("ask", "manual"):
+                self.approval_mode = rest[0].lower()
+            print(f"approvals: {self.approval_mode}"
+                  + (f" \u00b7 always-approve this session: {', '.join(sorted(self.always_actions))}"
+                     if self.always_actions else ""))
+            return True
+        if cmd == "/mcp":
+            return self._slash_mcp(rest)
+        return None
+
+    def _slash_mcp(self, rest: list[str]) -> bool:
+        sub = rest[0].lower() if rest else ""
+        if not sub:
+            if not mcp_available():
+                print("mcp: package not installed (pip install mcp)")
+            try:
+                config = load_config()
+            except MCPError as e:
+                print(f"mcp: {e}")
+                return True
+            if not config:
+                print(f"no MCP servers configured - create {config_path()} "
+                      '({"mcpServers": {"name": {"command": ..., "args": [...]}}})')
+                return True
+            live = self.mcp.connected() if self.mcp else {}
+            for name in config:
+                srv = (self.mcp._servers.get(name) if self.mcp else None)
+                state = (f"connected, {len(live[name].tools)} tools" if name in live
+                         else f"error: {srv.error}" if srv and srv.error else "not connected")
+                print(f"  {name:<20} {state}")
+            return True
+        if sub == "tools":
+            if not self.mcp:
+                print("no MCP servers connected")
+                return True
+            for t in self.mcp.tools():
+                if len(rest) > 1 and t.server != rest[1]:
+                    continue
+                tag = "READ    " if t.read_only else "APPROVAL"
+                print(f"  {tag} {t.id:<40} {t.description[:70]}")
+            return True
+        if sub in ("start", "stop") and len(rest) > 1:
+            if sub == "start":
+                if self.mcp is None:
+                    try:
+                        self.mcp = MCPManager(load_config())
+                    except MCPError as e:
+                        print(f"mcp: {e}")
+                        return True
+                    self.runner.mcp = self.mcp
+                    self.runner.mcp_approver = inline_approvals.mcp_approver(self._ask)
+                try:
+                    srv = self.mcp.start(rest[1])
+                    print(f"mcp {rest[1]}: connected ({len(srv.tools)} tools)")
+                except MCPError as e:
+                    print(f"mcp: {e}")
+            elif self.mcp:
+                self.mcp.stop(rest[1])
+                print(f"mcp {rest[1]}: disconnected")
+            self.runner.reset_agents()
+            self.engineer = None
+            return True
+        if sub == "allow" and len(rest) > 1:
+            appr = self.runner.mcp_approver
+            if not self.mcp or not self.mcp.get_tool(rest[1]) or appr is None:
+                print(f"error: no connected MCP tool {rest[1]!r} (see /mcp tools)")
+                return True
+            appr.session_allowed.add(rest[1])  # type: ignore[attr-defined]
+            _audit(action="mcp_always_allow", params={"tool": rest[1]}, user=self.user)
+            print(f"{rest[1]}: always allowed for this session")
+            return True
+        print("usage: /mcp | /mcp tools [server] | /mcp start|stop <server> | /mcp allow <tool>")
         return True
 
     def _pending_count(self) -> int:
@@ -470,12 +800,15 @@ class EngineerCLI:
         print(f"stopped: {', '.join(r.get('stopped') or []) or 'none'}")
 
     def repl(self) -> int:
-        print("AI SOC engineer \u00b7 terminal agent")
+        print("AI SOC agent \u00b7 terminal")
+        print(f"  mode: {self.runner.mode} (/switch or /mode analyst|engineer)")
         print(f"  skills active: {', '.join(self.skills) or 'none (add with /use or --with-skill)'}")
+        print(f"  tokens: {'lean' if self.runner.lean else 'full'} \u00b7 approvals: {self.approval_mode}")
         print("  type /help for commands, /exit to quit")
+        self.start_mcp(interactive=True)
         while True:
             try:
-                raw = input("\u203a ")
+                raw = input(f"{self.runner.mode} \u203a ")
             except (EOFError, KeyboardInterrupt):
                 print()
                 return 0
@@ -488,6 +821,7 @@ class EngineerCLI:
                 continue
             result = self.run_turn(line)
             self.print_result(result)
+            self.review_inline(result)
             pending = self._pending_count()
             if pending:
                 print(f"{pending} approval(s) pending - /proposals pending to review")
@@ -512,6 +846,15 @@ def parse(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--list-sessions", action="store_true")
     ap.add_argument("--with-skill", action="append", default=[], metavar="NAME",
                     help="activate a skill pack (repeatable)")
+    ap.add_argument("--full-tools", action="store_true",
+                    help="send every tool schema on every call (disables lean token saving)")
+    ap.add_argument("--approval-mode", choices=["ask", "manual"], default="ask",
+                    help="ask: review new proposals inline after each REPL turn (default); "
+                         "manual: leave them for /proposals + /approve")
+    ap.add_argument("--mcp-config", help="MCP servers config (default: .mcp.json in the repo)")
+    ap.add_argument("--no-mcp", action="store_true", help="don't connect MCP servers")
+    ap.add_argument("--mode", choices=list(MODES), default="engineer",
+                    help="start in analyst or engineer mode (switch later with /mode or /switch)")
     ap.add_argument("--auto-skills", action="store_true",
                     help="contextually suggest and auto-activate relevant skills per turn")
     ap.add_argument("--add-skill", metavar="PATH",
@@ -592,7 +935,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if not args.message:
-        return cli.repl()
+        try:
+            return cli.repl()
+        finally:
+            cli.close()
 
     result = cli.run_turn(args.message)
     if args.json:

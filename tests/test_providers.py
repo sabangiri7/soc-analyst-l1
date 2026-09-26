@@ -8,7 +8,9 @@ Run: python -m unittest discover -s tests -v
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
+from config import cfg
 from llm import get_provider
 from llm.anthropic_provider import AnthropicProvider
 from llm.google_provider import GoogleProvider, to_google_contents
@@ -66,9 +68,13 @@ class TestFactory(unittest.TestCase):
 
     def test_freellmapi_defaults(self):
         from llm.freellmapi_provider import DEFAULT_BASE_URL, DEFAULT_MODEL, FreeLLMAPIProvider
-        p = FreeLLMAPIProvider()  # must not raise without a key
-        self.assertEqual(p._base_url, DEFAULT_BASE_URL)
-        self.assertEqual(p._model(), DEFAULT_MODEL)
+        # Hermetic: ignore operator .env FREELLMAPI_* overrides.
+        with mock.patch.object(cfg, "FREELLMAPI_BASE_URL", ""), \
+             mock.patch.object(cfg, "FREELLMAPI_MODEL", ""), \
+             mock.patch.object(cfg, "FREELLMAPI_API_KEY", ""):
+            p = FreeLLMAPIProvider()  # must not raise without a key
+            self.assertEqual(p._base_url, DEFAULT_BASE_URL)
+            self.assertEqual(p._model(), DEFAULT_MODEL)
 
     def test_dispatch_registry(self):
         # anthropic/openai/google need real keys at construction - check the

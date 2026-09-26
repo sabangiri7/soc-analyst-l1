@@ -1,0 +1,1 @@
+{"mcpServers": {"ti": {"command": "python", "args": ["tests/fixtures/mcp_threatintel_server.py"], "read_only_tools": ["lookup_ip"]}}}

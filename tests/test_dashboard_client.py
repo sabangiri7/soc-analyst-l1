@@ -42,6 +42,11 @@ class DashboardClientAuthTests(unittest.TestCase):
         )
         self._sources.start()
         self.addCleanup(self._sources.stop)
+        # Hermetic: ignore operator .env WAZUH_DASHBOARD_URL.
+        self._url = mock.patch.object(
+            dash_client.cfg, "WAZUH_DASHBOARD_URL", "https://localhost:443")
+        self._url.start()
+        self.addCleanup(self._url.stop)
 
     def test_first_request_logs_in_once(self):
         result = dashboards_request("GET", "/api/saved_objects/_find", params={"type": "dashboard"})

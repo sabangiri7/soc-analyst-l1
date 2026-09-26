@@ -113,12 +113,30 @@ def _proc_state(pid) -> str | None:
 def pid_alive(pid) -> bool:
     """True when the pid is a live, non-zombie process.
 
-    `os.kill(pid, 0)` alone is not enough: it also succeeds on zombies (dead
-    children awaiting reap), which would make a stopped watcher look alive.
+    `os.kill(pid, 0)` alone is not enough on Linux: it also succeeds on zombies
+    (dead children awaiting reap), which would make a stopped watcher look alive.
+    On Windows there is no /proc and `os.kill(pid, 0)` is not a reliable
+    existence check, so we use OpenProcess + GetExitCodeProcess instead.
     """
     try:
-        os.kill(int(pid), 0)
-        return _proc_state(pid) not in (None, "Z")
+        pid_i = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if os.name == "nt":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid_i)
+        if not handle:
+            return False
+        exit_code = ctypes.c_ulong()
+        ok = ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return bool(ok) and exit_code.value == STILL_ACTIVE
+    try:
+        os.kill(pid_i, 0)
+        return _proc_state(pid_i) not in (None, "Z")
     except (ProcessLookupError, PermissionError, OSError, TypeError, ValueError):
         return False
 
@@ -206,8 +224,55 @@ def tail_lines(path: Path, n: int) -> list[str]:
     return lines[-n:]
 
 
+def _find_watcher_pids_windows(aid: str) -> list[int]:
+    """Windows equivalent of /proc cmdline scan (via Win32_Process)."""
+    import json
+    import subprocess
+
+    # Compress JSON so a single process is an object and many are an array.
+    script = (
+        "$rows = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.CommandLine -and ($_.CommandLine -like '*run.py*') } | "
+        "ForEach-Object { [PSCustomObject]@{ pid = $_.ProcessId; cmd = $_.CommandLine } }); "
+        "if ($rows.Count -eq 0) { '' } else { $rows | ConvertTo-Json -Compress }"
+    )
+    try:
+        raw = subprocess.check_output(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+            text=True, errors="replace", timeout=20,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(data, dict):
+        data = [data]
+    found: list[int] = []
+    for item in data or []:
+        cmd = str(item.get("cmd") or "")
+        try:
+            pid = int(item.get("pid"))
+        except (TypeError, ValueError):
+            continue
+        args = cmd.split()
+        if "--agent-id" in args:
+            i = args.index("--agent-id")
+            if i + 1 < len(args) and args[i + 1].strip("\"'") == aid:
+                if pid_alive(pid):
+                    found.append(pid)
+        elif aid == "default" and "run.py" in cmd:
+            if pid_alive(pid):
+                found.append(pid)
+    return sorted(set(found))
+
+
 def find_watcher_pids(agent_id: str) -> list[int]:
-    """Pids of live `run.py` watchers for `agent_id`, found via /proc cmdline.
+    """Pids of live `run.py` watchers for `agent_id`, found via /proc cmdline
+    (Linux) or Win32_Process command lines (Windows).
 
     This is the authoritative process discovery used by Stop/Kill: it works
     even when the heartbeat pid is missing or stale (e.g. a watcher started
@@ -217,6 +282,8 @@ def find_watcher_pids(agent_id: str) -> list[int]:
     """
     import glob
     aid = sanitize_id(agent_id)
+    if os.name == "nt":
+        return _find_watcher_pids_windows(aid)
     found: list[int] = []
     try:
         entries = glob.glob("/proc/[0-9]*/cmdline")

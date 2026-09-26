@@ -253,13 +253,17 @@ def _preview(value: Any, limit: int = 500) -> str:
 
 
 def _proposal_summary(proposal: dict[str, Any]) -> dict[str, Any]:
+    # Tools normally store validation as a dict ({valid, diff, ...}), but a
+    # truncated/legacy payload can hand us a bare bool - never crash the turn.
+    raw = proposal.get("validation")
+    validation = raw if isinstance(raw, dict) else {}
     return {
         "id": proposal.get("id"),
         "action": proposal.get("action"),
         "reason": proposal.get("reason"),
         "permission": proposal.get("permission"),
         "status": proposal.get("status"),
-        "validation": (proposal.get("validation") or {}).get("valid"),
-        "diff": (proposal.get("validation") or {}).get("diff", ""),
+        "validation": validation.get("valid", raw if isinstance(raw, bool) else None),
+        "diff": validation.get("diff", ""),
         "created_at": proposal.get("created_at"),
     }
