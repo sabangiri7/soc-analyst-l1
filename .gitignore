@@ -15,8 +15,16 @@ __pycache__/
 venv/
 .venv/
 venv*/
+# any throwaway test venv (.venv-cli-test, .venv-cli-test-20260926, ...) -
+# these are ~400MB each and were previously NOT matched by the rules above
+.venv*/
 *.egg-info/
 .pytest_cache/
+
+# --- captured command output from manual/test runs ---
+# *.out scratch files (suite_batches.out, mcp_repl.out, ...) piled up in the
+# repo root because nothing claimed them
+*.out
 
 # --- data dir (runtime artifacts) ---
 data/*

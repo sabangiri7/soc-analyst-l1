@@ -55,6 +55,48 @@ def _looks_local(host: str) -> bool:
     return any(marker in host for marker in ("localhost", "127.0.0.1", "0.0.0.0", "::1"))
 
 
+def raise_for_inbody_error(resp: dict[str, Any], what: str) -> dict[str, Any]:
+    """Raise when a manager response reports failure INSIDE a 200 body.
+
+    The Wazuh API answers a semantically-rejected write with HTTP 200 and
+    {"error": 1, "message": "Could not upload rule", "data": {"total_failed_items": 1,
+    "failed_items": [{"error": {"code": 1113, ...}}]}}. request() only raises on
+    HTTP >= 400, so without this check every one of those was returned as a
+    success: create_wazuh_rule reported {"status": "executed"} with
+    "detail": "Could not upload rule" sitting unread in the same dict, and
+    approval_executor then marked the proposal executed and audited
+    execution_status="success" for a write that never happened. Because
+    claim_for_execution() is single-use, that proposal could never be retried.
+
+    Returns resp unchanged when the write actually succeeded.
+    """
+    if not isinstance(resp, dict):
+        return resp
+    data = resp.get("data")
+    data = data if isinstance(data, dict) else {}
+    failed = data.get("total_failed_items") or 0
+    has_failed = bool(failed) or bool(data.get("failed_items"))
+    reported_error = resp.get("error") not in (None, 0, False, "")
+    if not (has_failed or reported_error):
+        return resp
+    reasons = []
+    for item in data.get("failed_items") or []:
+        if not isinstance(item, dict):
+            continue
+        err = item.get("error") or {}
+        code = err.get("code")
+        msg = err.get("message") or "write rejected"
+        target = ", ".join(item.get("id") or []) or "target"
+        reasons.append(f"{target}: {msg} (code {code})" if code else f"{target}: {msg}")
+    detail = "; ".join(reasons) or str(resp.get("message") or "no detail")
+    raise WazuhAPIError(
+        f"{what} failed: {detail} (message: {resp.get('message') or 'n/a'})",
+        status=200,
+        code=resp.get("error") or (reasons and reasons[0]) or None,
+        detail=data.get("failed_items") or resp.get("message"),
+    )
+
+
 def _err_from_payload(payload: dict[str, Any], status: int) -> str:
     if isinstance(payload, dict):
         if payload.get("message"):
@@ -247,16 +289,19 @@ class WazuhManagerAPI:
         """POST /rules - NOT available on this API build (4.14 removed per-rule
         POST in favour of file management via put_rules_file). Kept for
         compatibility with builds that still expose it."""
-        return self.post("/rules", params={"overwrite": overwrite},
+        resp = self.post("/rules", params={"overwrite": overwrite},
                          body=rule_xml, body_content_type="application/xml")
+        return raise_for_inbody_error(resp, "Create rule")
 
     def update_rule(self, rule_id: int | str, rule_xml: str,
                     overwrite: bool = True, purge: bool = False) -> dict[str, Any]:
-        return self.put(f"/rules/{rule_id}", params={"overwrite": overwrite, "purge": purge},
+        resp = self.put(f"/rules/{rule_id}", params={"overwrite": overwrite, "purge": purge},
                         body=rule_xml, body_content_type="application/xml")
+        return raise_for_inbody_error(resp, f"Update rule {rule_id}")
 
     def delete_rule(self, rule_id: int | str, purge: bool = False) -> dict[str, Any]:
-        return self.delete(f"/rules/{rule_id}", params={"purge": purge})
+        resp = self.delete(f"/rules/{rule_id}", params={"purge": purge})
+        return raise_for_inbody_error(resp, f"Delete rule {rule_id}")
 
     # -- ruleset file management (the 4.14 way to add/modify/remove rules) --
     def get_rules_file(self, filename: str = "local_rules.xml", raw: bool = True) -> str:
@@ -266,8 +311,9 @@ class WazuhManagerAPI:
         return resp.get("data", {}).get("affected_items", [])
 
     def put_rules_file(self, filename: str, content: str, overwrite: bool = True) -> dict[str, Any]:
-        return self.put(f"/rules/files/{filename}", params={"overwrite": overwrite},
+        resp = self.put(f"/rules/files/{filename}", params={"overwrite": overwrite},
                         body=content, body_content_type="application/octet-stream")
+        return raise_for_inbody_error(resp, f"Upload of rules file '{filename}'")
 
     # ------------------------------------------------------------------ #
     # decoders
@@ -288,8 +334,9 @@ class WazuhManagerAPI:
         return str(resp.get("data", "")) if raw else resp.get("data", {}).get("affected_items", [])
 
     def put_decoders_file(self, filename: str, content: str, overwrite: bool = True) -> dict[str, Any]:
-        return self.put(f"/decoders/files/{filename}", params={"overwrite": overwrite},
+        resp = self.put(f"/decoders/files/{filename}", params={"overwrite": overwrite},
                         body=content, body_content_type="application/octet-stream")
+        return raise_for_inbody_error(resp, f"Upload of decoders file '{filename}'")
 
     # ------------------------------------------------------------------ #
     # agents
@@ -330,7 +377,12 @@ class WazuhManagerAPI:
         return self.get("/manager/configuration", params=params)
 
     def restart_manager(self) -> dict[str, Any]:
-        return self.put("/manager/restart")
+        # Same reason the rule/decoder writes are guarded: the manager answers
+        # a refused restart with HTTP 200 and error:1 in the body, which used to
+        # be reported as a successful restart. A restart is exactly when you
+        # need to know it did not happen.
+        return raise_for_inbody_error(self.put("/manager/restart"),
+                                      "Manager restart")
 
     # ------------------------------------------------------------------ #
     # logtest (rule/decoder testing on the manager)

@@ -129,10 +129,15 @@ class Config:
     # `?token=<token>`. Empty = no auth (fine for strictly local use on
     # 127.0.0.1; set this before binding --host to anything else).
     DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "")
-    # Optional per-user tokens: "user:token,user:token,...". When set (with or
-    # without DASHBOARD_TOKEN), a Bearer token maps to a VERIFIED identity -
-    # the Approval Center uses it for separation of duties (a proposer cannot
-    # approve their own proposal) and ignores any client-supplied "by" field.
+    # Optional per-user tokens: "user:token[:role],user:token[:role],...". When
+    # set (with or without DASHBOARD_TOKEN), a Bearer token maps to a VERIFIED
+    # identity - the Approval Center uses it for separation of duties (a proposer
+    # cannot approve their own proposal) and ignores any client-supplied "by"
+    # field. The optional role is "viewer" (reads), "approver" (reads + the
+    # Approval Center + /api/engineer/tool) or "admin" (everything, incl. the
+    # rules/lookup/provider CRUD and watcher control routes). An entry with no
+    # role - or an unrecognised one - is an admin, so configs written before
+    # roles existed keep the access they always had.
     DASHBOARD_USERS = os.getenv("DASHBOARD_USERS", "")
 
     # Splunk (also configurable per-provider via the dashboard)

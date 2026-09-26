@@ -38,6 +38,9 @@ from connectors.siem import PLATFORM_FIELDS
 from agent.triage_agent import TriageAgent, needs_human_review
 from agent.chat_agent import ChatAgent
 from llm.base import LLMRateLimitedError
+
+# SIGKILL is Unix-only; on Windows TerminateProcess is reached via SIGTERM.
+_SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 import lookup_tables as lookup
 import rules
 import notify
@@ -64,18 +67,39 @@ def _engineer_log_path(path: str | Path | None = None) -> Path:
 
 # --------------------------------------------------------------------------- #
 # Auth - optional single-shared-secret token (DASHBOARD_TOKEN) and/or per-user
-# tokens (DASHBOARD_USERS="user:token,user:token,..."). When neither is set
-# (the default) there is no auth, which is fine for strictly local use bound to
-# 127.0.0.1; set one before pointing --host at anything else, since every
-# route here (including ones that write to the SIEM, start/stop the overnight
-# watcher, and CRUD lookup tables/rules) is otherwise wide open. The token is
-# accepted as `Authorization: Bearer <token>` or `?token=...`; the page shell
-# (`/`) always loads so the JS can read `?token=` off the URL and attach it to
-# every subsequent /api/* call - see api() in index.html.
+# tokens (DASHBOARD_USERS="user:token[:role],user:token[:role],...").
+# When neither is set (the default) there is no auth, which is fine for strictly
+# local use bound to 127.0.0.1; set one before pointing --host at anything else,
+# since every route here (including ones that write to the SIEM, start/stop the
+# overnight watcher, and CRUD lookup tables/rules) is otherwise wide open. The
+# token is accepted as `Authorization: Bearer <token>` or `?token=<token>`; the
+# page shell (`/`) always loads so the JS can read `?token=` off the URL and
+# attach it to every subsequent /api/* call - see api() in index.html.
 # With DASHBOARD_USERS, a valid Bearer token maps to a VERIFIED identity: the
 # Approval Center uses it for separation of duties and ignores any
 # client-supplied "by" field.
+#
+# Roles (F3): "viewer" (reads only), "approver" (reads + the Approval Center),
+# "admin" (everything, incl. rules/lookup/provider CRUD and agent control). A
+# DASHBOARD_USERS entry without an explicit role is an "admin", so existing
+# configs keep exactly the access they had before roles existed.
+#
+# IMPORTANT: with auth DISABLED every request is a local-trust admin identity
+# ("local-user", verified=False). That is the same posture as the ungated routes
+# below and matches scripts_engineer_cli.py, which calls approvals.approve()
+# with identity_verified=False and no token at all. The Approval Center is
+# therefore usable out of the box; separation of duties switches on as soon as
+# DASHBOARD_USERS is configured.
 # --------------------------------------------------------------------------- #
+ROLES = {"viewer": 1, "approver": 2, "admin": 3}
+DEFAULT_ROLE = "admin"
+
+
+def _auth_configured() -> bool:
+    from config import cfg
+    return bool(getattr(cfg, "DASHBOARD_TOKEN", "") or getattr(cfg, "DASHBOARD_USERS", ""))
+
+
 def _supplied_token() -> str:
     supplied = request.headers.get("Authorization", "")
     if supplied.startswith("Bearer "):
@@ -90,8 +114,8 @@ def _token_ok() -> bool:
     return _supplied_token() == cfg.DASHBOARD_TOKEN
 
 
-def _token_user() -> str | None:
-    """Map a Bearer token to a verified per-user identity from DASHBOARD_USERS.
+def _token_user() -> tuple[str, str] | None:
+    """Map a Bearer token to a verified (user, role) identity from DASHBOARD_USERS.
     None when per-user auth isn't configured or the token is unknown."""
     from config import cfg
     users_cfg = getattr(cfg, "DASHBOARD_USERS", "") or ""
@@ -101,24 +125,88 @@ def _token_user() -> str | None:
     if not supplied:
         return None
     for entry in users_cfg.split(","):
-        if ":" not in entry:
+        parts = [p.strip() for p in entry.split(":")]
+        if len(parts) < 2:
             continue
-        user, tok = entry.split(":", 1)
-        if tok.strip() == supplied:
-            return user.strip()
+        user, tok = parts[0], parts[1]
+        role = parts[2] if len(parts) > 2 else DEFAULT_ROLE
+        if tok == supplied:
+            return user, (role if role in ROLES else DEFAULT_ROLE)
+    return None
+
+
+def _identity() -> tuple[str, str, bool]:
+    """(user, role, identity_verified) for the current request.
+
+    A per-user token wins and is VERIFIED. A bare shared DASHBOARD_TOKEN is an
+    unverified admin fallback that may self-declare "by". When no auth is
+    configured at all this is a local-trust admin identity, matching the
+    ungated routes - see the note in the auth block above."""
+    user, role = _token_user() or (None, None)
+    if user is not None:
+        return user, role, True
+    if _token_ok():
+        body = request.get_json(force=True, silent=True) or {}
+        return (body.get("by") or "dashboard-user"), DEFAULT_ROLE, False
+    if not _auth_configured():
+        return "local-user", DEFAULT_ROLE, False
+    return "", "", False
+
+
+def _unauthorized() -> tuple:
+    """401 that says WHICH mistake the caller made. Distinguishing these matters:
+    a caller that simply has no token configured needs to know auth is OFF
+    (approvals work, unverified), not that its token was rejected."""
+    hint = ("set Authorization: Bearer <token> or ?token=<token>"
+            if _auth_configured() else
+            "dashboard auth is disabled (no DASHBOARD_TOKEN/DASHBOARD_USERS), so "
+            "this request is treated as local-trust; configure either to enable "
+            "verified identities and separation of duties")
+    return jsonify({"error": f"Unauthorized - {hint}."}), 401
+
+
+def _require_role(minimum: str):
+    """Reject a request whose identity lacks `minimum` (403). Returns None when
+    allowed. Read routes call neither this nor _verified_approver - they are
+    covered by the before_request token gate alone."""
+    if not _auth_configured():
+        return None  # local-trust: the same posture as the ungated read routes
+    user, role, _ = _identity()
+    if not user:
+        return _unauthorized()
+    if ROLES.get(role, 0) < ROLES[minimum]:
+        return jsonify({"error": (
+            f"Forbidden - '{user}' has role '{role}'; '{minimum}' or higher is "
+            f"required for this action.")}), 403
     return None
 
 
 @app.before_request
 def _require_dashboard_token():
-    from config import cfg
-    if not (getattr(cfg, "DASHBOARD_TOKEN", "") or getattr(cfg, "DASHBOARD_USERS", "")):
+    if not _auth_configured():
         return None  # auth disabled (default) - purely local use
     if request.path == "/":
         return None  # let the page shell load; every /api/* call below is still gated
-    if _token_ok() or _token_user():
+    user, _ = _token_user() or (None, None)
+    if user is not None or _token_ok():
         return None
-    return jsonify({"error": "Unauthorized - set Authorization: Bearer <token> or ?token=<token>."}), 401
+    return _unauthorized()
+
+
+def _audit_write(action: str, params: dict, result: object = None, *,
+                 execution_status: str = "success", error: str | None = None) -> None:
+    """Audit a direct (non-proposal) dashboard write.
+
+    The Approval Center routes have always logged their own acts, but the
+    human-driven CRUD routes (rules, lookup tables, providers, agent control)
+    did not - so a rule edited straight through the UI was invisible in
+    /api/audit even though it lands in local_rules.xml. Every mutating route
+    below calls this. Secrets are redacted by audit.audit_log itself."""
+    user, _role, _verified = _identity()
+    audit.audit_log(tool="dashboard_ui", action=action, permission="human",
+                    approval_status="not_required",
+                    execution_status=execution_status, error=error,
+                    params=params, result=result, user=user, agent="dashboard_ui")
 
 
 # --------------------------------------------------------------------------- #
@@ -186,18 +274,28 @@ def api_providers():
 
 @app.post("/api/providers")
 def api_add_provider():
+    denied = _require_role("admin")
+    if denied:
+        return denied
     payload = request.get_json(force=True, silent=True) or {}
     try:
         provider = store.add_provider(payload)
     except store.ProviderError as e:
+        _audit_write("provider_add", {"provider": payload}, None,
+                     execution_status="failure", error=str(e))
         return jsonify({"error": str(e)}), 400
+    _audit_write("provider_add", {"provider": payload}, {"id": provider.get("id")})
     return jsonify({"provider": store.redact_provider(provider)}), 201
 
 
 @app.delete("/api/providers/<provider_id>")
 def api_delete_provider(provider_id: str):
+    denied = _require_role("admin")
+    if denied:
+        return denied
     if not store.remove_provider(provider_id):
         return jsonify({"error": "Provider not found, or it is env-seeded (edit .env to change it)."}), 404
+    _audit_write("provider_delete", {"provider_id": provider_id}, {"ok": True})
     return jsonify({"ok": True})
 
 
@@ -381,6 +479,9 @@ def api_lookup_tables():
 
 @app.post("/api/lookup-tables")
 def api_create_lookup_table():
+    denied = _require_role("admin")
+    if denied:
+        return denied
     body = request.get_json(force=True, silent=True) or {}
     name = (body.get("name") or "").strip()
     description = (body.get("description") or "").strip()
@@ -389,7 +490,11 @@ def api_create_lookup_table():
     try:
         table = lookup.create_lookup_table(name, description)
     except KeyError as e:
+        _audit_write("lookup_table_create", {"name": name}, None,
+                     execution_status="failure", error=str(e))
         return jsonify({"error": str(e)}), 409
+    _audit_write("lookup_table_create", {"name": name, "description": description},
+                 {"entry_count": len((table.get("entries") or {}))})
     return jsonify({"table": {"name": name, "entry_count": len((table.get("entries") or {})), "updated": table.get("updated")}}), 201
 
 
@@ -403,28 +508,43 @@ def api_read_lookup_table(name: str):
 
 @app.post("/api/lookup-tables/<name>/entries/<key>")
 def api_upsert_lookup_entry(name: str, key: str):
+    denied = _require_role("admin")
+    if denied:
+        return denied
     body = request.get_json(force=True, silent=True) or {}
     value = body.get("value")
     try:
         table = lookup.upsert_lookup_entry(name, key, value)
     except Exception as e:  # noqa: BLE001
+        _audit_write("lookup_entry_upsert", {"name": name, "key": key}, None,
+                     execution_status="failure", error=str(e))
         return jsonify({"error": str(e)}), 400
+    _audit_write("lookup_entry_upsert", {"name": name, "key": key, "value": value},
+                 {"entry_count": len((table.get("entries") or {}))})
     return jsonify({"name": name, "key": key, "entry_count": len((table.get("entries") or {})), "updated": table.get("updated")})
 
 
 @app.delete("/api/lookup-tables/<name>/entries/<key>")
 def api_delete_lookup_entry(name: str, key: str):
+    denied = _require_role("admin")
+    if denied:
+        return denied
     ok = lookup.delete_lookup_entry(name, key)
     if not ok:
         return jsonify({"error": f"Key '{key}' not found in table '{name}'."}), 404
+    _audit_write("lookup_entry_delete", {"name": name, "key": key}, {"ok": True})
     return jsonify({"ok": True})
 
 
 @app.delete("/api/lookup-tables/<name>")
 def api_delete_lookup_table(name: str):
+    denied = _require_role("admin")
+    if denied:
+        return denied
     ok = lookup.delete_lookup_table(name)
     if not ok:
         return jsonify({"error": f"Lookup table '{name}' not found."}), 404
+    _audit_write("lookup_table_delete", {"name": name}, {"ok": True})
     return jsonify({"ok": True})
 
 
@@ -444,11 +564,17 @@ def api_rules():
 
 @app.post("/api/rules")
 def api_create_rule():
+    denied = _require_role("admin")
+    if denied:
+        return denied
     payload = request.get_json(force=True, silent=True) or {}
     try:
         rule = rules.create_rule(payload)
     except rules.RuleError as e:
+        _audit_write("rule_create", {"rule": payload}, None,
+                     execution_status="failure", error=str(e))
         return jsonify({"error": str(e)}), 400
+    _audit_write("rule_create", {"rule": payload}, {"id": rule.get("id")})
     return jsonify({"rule": rule}), 201
 
 
@@ -462,20 +588,30 @@ def api_read_rule(rule_id: str):
 
 @app.patch("/api/rules/<rule_id>")
 def api_update_rule(rule_id: str):
+    denied = _require_role("admin")
+    if denied:
+        return denied
     payload = request.get_json(force=True, silent=True) or {}
     try:
         rule = rules.update_rule(rule_id, payload)
     except rules.RuleError as e:
+        _audit_write("rule_update", {"rule_id": rule_id, "patch": payload}, None,
+                     execution_status="failure", error=str(e))
         return jsonify({"error": str(e)}), 400
     if not rule:
         return jsonify({"error": f"Rule '{rule_id}' not found."}), 404
+    _audit_write("rule_update", {"rule_id": rule_id, "patch": payload}, {"id": rule_id})
     return jsonify({"rule": rule})
 
 
 @app.delete("/api/rules/<rule_id>")
 def api_delete_rule(rule_id: str):
+    denied = _require_role("admin")
+    if denied:
+        return denied
     if not rules.delete_rule(rule_id):
         return jsonify({"error": f"Rule '{rule_id}' not found."}), 404
+    _audit_write("rule_delete", {"rule_id": rule_id}, {"ok": True})
     return jsonify({"ok": True})
 
 
@@ -533,6 +669,9 @@ def api_export_rules():
 
 @app.post("/api/rules/import")
 def api_import_rules():
+    denied = _require_role("admin")
+    if denied:
+        return denied
     body = request.get_json(force=True, silent=True) or {}
     rule_defs = body.get("rules")
     if not isinstance(rule_defs, list):
@@ -541,7 +680,11 @@ def api_import_rules():
     try:
         result = rules.import_rules(rule_defs, on_conflict=on_conflict)
     except rules.RuleError as e:
+        _audit_write("rule_import", {"count": len(rule_defs),
+                                     "on_conflict": on_conflict}, None,
+                     execution_status="failure", error=str(e))
         return jsonify({"error": str(e)}), 400
+    _audit_write("rule_import", {"count": len(rule_defs), "on_conflict": on_conflict}, result)
     return jsonify(result)
 
 
@@ -613,16 +756,25 @@ def api_agent_status():
 @app.post("/api/agent/start")
 def api_agent_start():
     """Legacy single-agent start (default watcher)."""
+    denied = _require_role("admin")
+    if denied:
+        return denied
     body = request.get_json(force=True, silent=True) or {}
     provider_id = (body.get("provider_id") or "").strip() or None
     pid = _spawn_agent("default", provider_id)
+    _audit_write("agent_start", {"agent_id": "default", "provider_id": provider_id},
+                 {"pid": pid})
     return jsonify({"ok": True, "pid": pid})
 
 
 @app.post("/api/agent/stop")
 def api_agent_stop():
     """Legacy single-agent stop (default watcher)."""
+    denied = _require_role("admin")
+    if denied:
+        return denied
     hit = _signal_agent("default", signal.SIGTERM)
+    _audit_write("agent_stop", {"agent_id": "default"}, {"killed": hit})
     return jsonify({"ok": True, "killed": hit})
 
 
@@ -640,6 +792,9 @@ def api_agents_start():
     agent_id defaults to the provider id (natural name for a per-provider
     watcher) or 'default'. Refuses to double-start a watcher that is alive.
     """
+    denied = _require_role("admin")
+    if denied:
+        return denied
     body = request.get_json(force=True, silent=True) or {}
     provider_id = (body.get("provider_id") or "").strip() or None
     agent_id = ac.sanitize_id(body.get("agent_id")) if (body.get("agent_id") or "").strip() else (
@@ -648,22 +803,32 @@ def api_agents_start():
     if ac.status(agent_id)["running"]:
         return jsonify({"error": f"Watcher '{agent_id}' is already running."}), 409
     pid = _spawn_agent(agent_id, provider_id)
+    _audit_write("agent_start", {"agent_id": agent_id, "provider_id": provider_id},
+                 {"pid": pid})
     return jsonify({"ok": True, "agent_id": agent_id, "pid": pid})
 
 
 @app.post("/api/agents/<agent_id>/stop")
 def api_agents_stop(agent_id: str):
     """Graceful stop: SIGTERM + stop-file (watcher exits cleanly end-of-cycle)."""
+    denied = _require_role("admin")
+    if denied:
+        return denied
     hit = _signal_agent(agent_id, signal.SIGTERM)
+    _audit_write("agent_stop", {"agent_id": ac.sanitize_id(agent_id)}, {"killed": hit})
     return jsonify({"ok": True, "agent_id": ac.sanitize_id(agent_id), "killed": hit})
 
 
 @app.post("/api/agents/<agent_id>/kill")
 def api_agents_kill(agent_id: str):
     """Kill switch: SIGKILL immediately, no cleanup. Leaves a stopped heartbeat."""
+    denied = _require_role("admin")
+    if denied:
+        return denied
     aid = ac.sanitize_id(agent_id)
-    hit = _signal_agent(aid, signal.SIGKILL)
+    hit = _signal_agent(aid, _SIGKILL)
     ac.mark_stopped(aid, "killed (SIGKILL)")
+    _audit_write("agent_kill", {"agent_id": aid}, {"killed": hit})
     return jsonify({"ok": True, "agent_id": aid, "killed": hit})
 
 
@@ -700,7 +865,22 @@ def _engineer_context(user: str = "dashboard-user", agent: str = "engineer_ui"):
 def api_engineer_chat():
     """Run the conversational AI SOC engineer. Tool activity and proposals are
     returned in the transcript; proposals are already persisted in the
-    Approval Center (approvals.json)."""
+    Approval Center (approvals.json).
+
+    Gated at `approver` like /api/engineer/tool, because the agent loop runs
+    tools through the same registry - leaving this open let a `viewer` reach
+    tool execution and the proposal queue by going through chat instead.
+
+    The engine is constructed with the CALLER's identity, not a hardcoded
+    "dashboard-user". That string landed in every proposal's `user` field, and
+    separation of duties compares that field against the approver: with a
+    hardcoded proposer, `alice` proposing via chat and then approving it as
+    `alice` compared "dashboard-user" != "alice", passed the self-approval
+    block, and defeated it."""
+    denied = _require_role("approver")
+    if denied:
+        return denied
+    actor, _role, _verified = _identity()
     body = request.get_json(force=True, silent=True) or {}
     message = (body.get("message") or "").strip()
     history = body.get("history") or []
@@ -708,7 +888,7 @@ def api_engineer_chat():
         return jsonify({"error": "message is required."}), 400
     try:
         from agent.soc_engineer import SOCEngineer
-        engineer = SOCEngineer(user="dashboard-user")
+        engineer = SOCEngineer(user=actor or "dashboard-user")
         result = engineer.chat(user_message=message, history=list(history)[-20:])
     except Exception as e:  # noqa: BLE001 - surface provider/config errors to the UI
         return jsonify({"error": f"Engineer failed: {e}"}), 400
@@ -744,6 +924,9 @@ def api_engineer_tool():
     immediately; PROPOSE/EXECUTE tools without an approved proposal produce an
     approval_required outcome that lands in the Approval Center (no write
     happens). The execute endpoint below is the only path that writes."""
+    denied = _require_role("approver")
+    if denied:
+        return denied
     body = request.get_json(force=True, silent=True) or {}
     name = (body.get("tool") or "").strip()
     params = body.get("params") or {}
@@ -765,24 +948,23 @@ def api_proposals():
 
 
 def _verified_approver() -> tuple[str, bool] | None:
-    """(user, identity_verified) for the current request, or None when the
-    request has no valid credentials. Per-user tokens map to a VERIFIED
-    identity; a bare shared token is an unverified fallback."""
-    user = _token_user()
-    if user is not None:
-        return user, True
-    if _token_ok():
-        body = request.get_json(force=True, silent=True) or {}
-        return (body.get("by") or "dashboard-user"), False
-    return None
+    """(user, identity_verified) for the current request, or None when auth IS
+    configured but the request carried no valid credentials. Per-user tokens map
+    to a VERIFIED identity; a bare shared token - or a local-trust request with
+    auth disabled - is an unverified fallback."""
+    user, _role, verified = _identity()
+    return (user, verified) if user else None
 
 
 @app.post("/api/proposals/<pid>/approve")
 def api_proposal_approve(pid: str):
     import approvals
+    denied = _require_role("approver")
+    if denied:
+        return denied
     approver = _verified_approver()
     if approver is None:
-        return jsonify({"error": "Unauthorized - a valid token is required to approve."}), 401
+        return _unauthorized()
     by, verified = approver
     # A client-supplied "by" is ignored for verified identities: the token IS
     # the identity, so a proposer can never approve as someone else.
@@ -803,9 +985,12 @@ def api_proposal_approve(pid: str):
 @app.post("/api/proposals/<pid>/reject")
 def api_proposal_reject(pid: str):
     import approvals
+    denied = _require_role("approver")
+    if denied:
+        return denied
     approver = _verified_approver()
     if approver is None:
-        return jsonify({"error": "Unauthorized - a valid token is required to reject."}), 401
+        return _unauthorized()
     by, _ = approver
     body = request.get_json(force=True, silent=True) or {}
     reason = body.get("reason") or ""
@@ -821,19 +1006,65 @@ def api_proposal_reject(pid: str):
     return jsonify({"proposal": approvals.public_view(proposal)})
 
 
+@app.post("/api/proposals/<pid>/cancel")
+def api_proposal_cancel(pid: str):
+    """Withdraw a proposal that is still pending OR already approved.
+
+    `reject` only works on pending, which left an approved proposal as a
+    permanent executable grant - the only exit from `approved` was execution.
+    Cancelling is how a reviewer takes back a yes: the wrong payload was
+    approved, a newer proposal superseded it, it was deployed by hand, or it
+    was simply abandoned. Terminal proposals (executed/failed/expired/
+    rejected/cancelled) and anything mid-flight (`executing`) are refused -
+    history is not rewritten and we never race the executor."""
+    import approvals
+    denied = _require_role("approver")
+    if denied:
+        return denied
+    approver = _verified_approver()
+    if approver is None:
+        return _unauthorized()
+    by, _ = approver
+    body = request.get_json(force=True, silent=True) or {}
+    reason = body.get("reason") or ""
+    try:
+        proposal = approvals.cancel(pid, by, reason)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 409
+    except KeyError as e:
+        return jsonify({"error": str(e)}), 404
+    audit.audit_log(tool="approval_center", action="proposal_cancelled",
+                    permission="human", approval_status="cancelled", params={},
+                    result={"proposal_id": pid, "by": by, "reason": reason})
+    return jsonify({"proposal": approvals.public_view(proposal)})
+
+
 @app.post("/api/proposals/<pid>/execute")
 def api_proposal_execute(pid: str):
     """Execute an approved proposal deterministically with its stored payload.
-    This is the ONLY path that writes: the proposal is claimed atomically
-    (single-use - a replay is 409), EXECUTE-level actions need an explicit
-    'confirm' flag, and the real tool runs with the STORED payload via
-    approval_executor (no LLM involved)."""
+    This is the ONLY path that reaches Wazuh or a SIEM: the proposal is claimed
+    atomically (single-use - a replay is 409), EXECUTE-level actions need an
+    explicit 'confirm' flag, and the real tool runs with the STORED payload via
+    approval_executor (no LLM involved). local_rules.xml is written only through
+    these gated tools (put_rules_file is reachable from tools/ alone).
+
+    The CRUD routes below are a different, deliberately-direct surface for a
+    human editing LOCAL app config: /api/rules + /api/rules/import manage
+    data/rules.json (the pre-triage filter store in rules.py, which imports
+    nothing but stdlib+config and cannot reach Wazuh), /api/lookup-tables
+    manages data/lookup_tables.json, and /api/providers manages
+    data/siem_providers.json. None of them write to the SIEM or a Wazuh
+    manager, so none of them can bypass this gate. They are still role-gated
+    and audited."""
     import approval_executor
     from config import cfg
     body = request.get_json(force=True, silent=True) or {}
+    denied = _require_role("approver")
+    if denied:
+        return denied
     approver = _verified_approver()
     if approver is None:
-        return jsonify({"error": "Unauthorized - a valid token is required to execute."}), 401
+        return _unauthorized()
     by, verified = approver
     out = approval_executor.execute_proposal(
         pid,

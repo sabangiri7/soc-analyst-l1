@@ -124,9 +124,22 @@ def validate_wazuh_rule_xml(xml_text: str) -> dict[str, Any]:
         )
 
     # Top-level element whitelist (typo protection).
+    #
+    # The same_*/not_*/if_matched_* families are the standard companions of a
+    # frequency/timeframe correlation rule and were missing here, which made
+    # this validator reject XML the manager happily accepts: a rule using
+    # <same_source_ip /> came back "Unknown rule element <same_source_ip>."
+    # Verified against a live 4.x manager, which accepts
+    #   <rule id=".." level="10" frequency="5" timeframe="60">
+    #     <if_matched_sid>5710,5760</if_matched_sid><same_source_ip /></rule>
     _KNOWN_TAGS = {
         "match", "regex", "if_sid", "if_matched_sid", "if_group", "if_level",
+        "if_matched_group", "if_matched_level",
         "decoded_as", "field", "same_rule", "timeout",
+        "same_source_ip", "same_source_port", "same_dest_ip", "same_field",
+        "same_id", "same_user", "same_location", "same_agent",
+        "not_sid", "not_group", "not_level", "not_regex",
+        "category", "rule",
         "syscheck", "ar", "group", "mitre", "options", "var", "list",
         "check_all", "check_any", "check_diff", "info", "alert_opts",
         "id", "level", "description", "accumulate", "relative_dirname",

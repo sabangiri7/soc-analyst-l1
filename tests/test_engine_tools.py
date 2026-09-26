@@ -277,7 +277,15 @@ class TestDetectionEngine(unittest.TestCase):
         out = VerifyRuleDeployment().run(ctx, rule_id=105563, positive_samples=pos,
                                          negative_samples=["Accepted password for admin"])
         self.assertTrue(out["frequency_rule"])
-        self.assertTrue(out["verified"])
+        # The verdict stays inconclusive even though this mock makes the rule
+        # fire on the 3rd sample. Measured against a live 4.x manager, logtest
+        # holds no frequency state at all (8 failures in one session never
+        # tripped a frequency=5 rule), so it is not a valid oracle for a
+        # correlation rule in either direction - "confirmed" here would be an
+        # accident of the mock. The per-sample pass counts below remain the
+        # meaningful assertions, along with the session threading.
+        self.assertIsNone(out["verified"])
+        self.assertEqual(out["verification"], "inconclusive")
         self.assertEqual(out["positive_pass"], "1/3")   # fires on the 3rd (threshold)
         self.assertEqual(out["negative_pass"], "1/1")
         # all positives shared ONE session (token threaded); the negative got
@@ -327,6 +335,65 @@ class TestDetectionEngine(unittest.TestCase):
                                          negative_samples=["Accepted"])
         self.assertFalse(out["verified"])
         self.assertEqual(out["positive_pass"], "0/1")
+
+    def test_frequency_rule_verdict_is_inconclusive_not_false(self):
+        """logtest cannot hold frequency state, so a frequency rule that does
+        not fire is UNKNOWN, not disproven. Reporting verified=False reads as
+        "broken rule" and invites deleting a working rule."""
+        from tools.detection.detection_engine import VerifyRuleDeployment
+        wazuh = mock.MagicMock()
+        wazuh.get_rules_file.return_value = (
+            '<group name="local,">\n' + self.FREQ_RULE + '\n</group>\n')
+        # the parent fires, the correlation rule never does - the real-world case
+        wazuh.run_logtest.return_value = {
+            "data": {"codemsg": 0, "alert": True,
+                     "output": {"rule": {"id": 5760, "level": 5,
+                                         "description": "sshd: authentication failed."},
+                                "decoder": {"name": "sshd"}}}}
+        wazuh.end_logtest_session.return_value = {}
+        ctx = make_ctx(wazuh=wazuh)
+        out = VerifyRuleDeployment().run(ctx, rule_id=105563,
+                                         positive_samples=["Failed password for root",
+                                                           "Failed password for root",
+                                                           "Failed password for root",
+                                                           "Failed password for root",
+                                                           "Failed password for root"],
+                                         negative_samples=["Accepted password for deploy"])
+        self.assertTrue(out["frequency_rule"])
+        self.assertIsNone(out["verified"])
+        self.assertEqual(out["verification"], "inconclusive")
+        self.assertTrue(out["frequency_rule_unverifiable_via_logtest"])
+        # the negative arm is still a genuine, trustworthy signal
+        self.assertEqual(out["negative_pass"], "1/1")
+        self.assertIn("analysisd", out["how_to_verify_frequency_rule"])
+        # the note must not tell the operator to go hunting for a phantom bug
+        self.assertNotIn("check the rule's frequency", out["note"])
+
+    def test_plain_rule_keeps_a_boolean_verdict(self):
+        from tools.detection.detection_engine import VerifyRuleDeployment
+        wazuh = mock.MagicMock()
+        wazuh.get_rules_file.return_value = LOCAL_RULES_TEMPLATE
+
+        def fake_logtest(log, log_format=None, location=None, token=None):
+            # the negative must resolve to a DIFFERENT rule, else it counts as
+            # a false positive and the verdict is (correctly) False
+            if "Accepted" in log:
+                rid, desc = 5715, "sshd: authentication succeeded."
+            else:
+                rid, desc = 105565, "Detects a failed SSH password"
+            return {"data": {"codemsg": 0, "alert": True,
+                             "output": {"rule": {"id": rid, "level": 5, "description": desc},
+                                        "decoder": {"name": "sshd"}}}}
+
+        wazuh.run_logtest.side_effect = fake_logtest
+        wazuh.end_logtest_session.return_value = {}
+        ctx = make_ctx(wazuh=wazuh)
+        out = VerifyRuleDeployment().run(ctx, rule_id=105565,
+                                         positive_samples=["Failed password for root"],
+                                         negative_samples=["Accepted password for deploy"])
+        self.assertIs(out["verified"], True)
+        self.assertEqual(out["verification"], "confirmed")
+        self.assertFalse(out["frequency_rule_unverifiable_via_logtest"])
 
 
 class TestDashboardEngine(unittest.TestCase):
@@ -788,6 +855,43 @@ class TestFrequencyValidation(unittest.TestCase):
             '  <description>test</description>\n'
             '</rule>')
         self.assertTrue(v["valid"])
+
+    def test_same_source_ip_is_a_known_element(self):
+        """Regression: <same_source_ip /> is the standard companion of a
+        frequency rule and the live manager accepts it, but it was missing
+        from the _KNOWN_TAGS whitelist, so the validator rejected a rule the
+        manager would have taken."""
+        from tools.wazuh.validation import validate_wazuh_rule_xml
+        v = validate_wazuh_rule_xml(
+            '<rule id="200001" level="10" frequency="5" timeframe="60">\n'
+            '  <if_matched_sid>5710,5760</if_matched_sid>\n'
+            '  <same_source_ip />\n'
+            '  <description>SSH brute force from same source IP</description>\n'
+            '  <group>authentication_failures,sshd,ssh</group>\n'
+            '</rule>')
+        self.assertTrue(v["valid"], v["errors"])
+        self.assertFalse(any("Unknown rule element" in e for e in v["errors"]))
+
+    def test_other_correlation_elements_are_known(self):
+        from tools.wazuh.validation import validate_wazuh_rule_xml
+        for tag in ("same_field", "same_id", "same_user", "same_dest_ip",
+                    "not_sid", "not_group", "if_matched_group"):
+            v = validate_wazuh_rule_xml(
+                '<rule id="200002" level="10" frequency="3" timeframe="60">\n'
+                '  <if_matched_sid>5760</if_matched_sid>\n'
+                f'  <{tag} />\n'
+                '  <description>correlation</description>\n'
+                '</rule>')
+            self.assertTrue(v["valid"], f"{tag}: {v['errors']}")
+
+    def test_genuinely_unknown_element_is_still_caught(self):
+        from tools.wazuh.validation import validate_wazuh_rule_xml
+        v = validate_wazuh_rule_xml(
+            '<rule id="200003" level="5">\n'
+            '  <if_madched_sid>5760</if_madched_sid>\n'  # typo
+            '</rule>')
+        self.assertFalse(v["valid"])
+        self.assertTrue(any("Unknown rule element" in e for e in v["errors"]))
 
 
 if __name__ == "__main__":

@@ -333,12 +333,17 @@ class VerifyRuleDeployment(BaseWazuhTool):
             fired_pos = [i + 1 for i, r in enumerate(results)
                          if r["expected"] == "positive" and str(r.get("fired_rule")) == str(rid)]
             session_note = (
-                f"frequency/divide rule: positives were evaluated in a single logtest "
-                f"session (threshold accumulation). Fired on sample(s): {fired_pos}."
+                f"frequency/divide rule: positives were pushed through a single logtest "
+                f"session (threshold accumulation). Fired on sample(s): {fired_pos}. "
+                "NOTE: logtest does not persist frequency counters between calls, so "
+                "a non-firing frequency rule here is expected and is NOT evidence of "
+                "a broken rule - treat the positive arm as inconclusive and verify "
+                "through analysisd."
                 if fired_pos else
-                "frequency/divide rule: positives did NOT trip the counter in one "
-                "session - check the rule's frequency/timeframe vs. how many events "
-                "the sample set provides."
+                "frequency/divide rule: the rule did not trip inside logtest. This is "
+                "the expected result on this build - logtest holds no frequency state, "
+                "so it cannot confirm or refute a correlation rule. Do not conclude "
+                "the rule is broken; verify through analysisd instead."
             )
         else:
             for sample in positives:
@@ -375,18 +380,34 @@ class VerifyRuleDeployment(BaseWazuhTool):
         pos_total = sum(1 for r in results if r["expected"] == "positive")
         neg_total = sum(1 for r in results if r["expected"] == "negative")
         clean = not any(r.get("error") for r in results)
-        verified = (
-            pos_total > 0 and neg_pass == neg_total and clean and
-            ((not freq and pos_pass == pos_total) or
-             (freq and any(str(r.get("fired_rule")) == str(rid)
-                           for r in results if r["expected"] == "positive")))
-        )
+        pos_fired = any(str(r.get("fired_rule")) == str(rid)
+                        for r in results if r["expected"] == "positive")
+        verified = pos_total > 0 and neg_pass == neg_total and clean and (
+            (not freq and pos_pass == pos_total) or (freq and pos_fired))
+        # logtest is a per-event decoder+rule tester: it holds no frequency/
+        # timeframe counter, so a correlation rule can never be CONFIRMED (or
+        # refuted) through it. Measured on a live 4.x manager: 8 repeated
+        # failures through a single session never tripped a frequency=5 rule
+        # while the live pipeline would have. Reporting verified=False there
+        # is a false negative - it reads as "this rule is broken" and invites
+        # deleting a working rule, so say inconclusive and mean it.
+        verification = ("inconclusive" if freq else
+                        ("confirmed" if verified else "failed"))
         return {
             "rule_id": rid,
             "frequency_rule": freq,
             "positive_pass": f"{pos_pass}/{pos_total}",
             "negative_pass": f"{neg_pass}/{neg_total}",
-            "verified": verified,
+            # None (not False) for a frequency rule: unknown, not disproven.
+            "verified": (None if freq else verified),
+            "verification": verification,
+            "frequency_rule_unverifiable_via_logtest": bool(freq),
+            "how_to_verify_frequency_rule": (
+                "Push real events through analysisd (agent/syslog input) and read "
+                "the alert stream, or confirm the rule is loaded and enabled via "
+                "GET /rules/<id> and trust the live engine. The parent rules and "
+                "the negatives below are still verified by logtest."
+            ) if freq else None,
             "samples": results,
             "note": ("verified=True means the manager confirmed the rule fires on all "
                      "positives and no negatives. " + session_note).strip(),

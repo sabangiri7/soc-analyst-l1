@@ -542,3 +542,63 @@ The Flask dashboard (`dashboard.py`, port `5001`) now exposes seven new panels b
 ## Dashboard auth
 
 Every route above is **open by default** (fine for strictly local use on `127.0.0.1`). Set `DASHBOARD_TOKEN` in `.env` **before binding `--host` to anything else** — every route (including ones that write to the SIEM, start/stop the overnight watcher, and CRUD lookup tables/rules) is otherwise unauthenticated. With a token set, open the dashboard once as `http://<host>:5001/?token=<token>`; the page reads it off the URL, stores it in `sessionStorage`, strips it from the address bar, and attaches it as `Authorization: Bearer` on every API call from then on. The token is also accepted directly as `?token=...` on any API request (e.g. for `curl`).
+
+### `DASHBOARD_USERS` — verified identities, separation of duties, and roles
+
+`DASHBOARD_USERS="user:token[:role],..."` maps a Bearer token to a **verified** identity. The Approval Center then ignores any client-supplied `by` field and blocks a proposer from approving their own proposal.
+
+Each entry takes an optional third field, the **role**:
+
+| Role | Can do |
+|---|---|
+| `viewer` | read-only |
+| `approver` | reads + the Approval Center (`approve`/`reject`/`cancel`/`execute`) + `POST /api/engineer/tool` |
+| `admin` | everything, incl. rules / lookup-table / provider CRUD and watcher start/stop/kill |
+
+An entry **without** a role is an `admin`, so pre-existing configs keep exactly the access they had. An unrecognised role name also falls back to `admin` rather than silently locking someone out.
+
+```bash
+DASHBOARD_USERS=alice:tok_alice:admin,bob:tok_bob:approver,carol:tok_carol:viewer
+```
+
+Roles only bite once auth is configured. With auth **off** (the default) every request is a local-trust `admin` identity — the Approval Center works out of the box and approvals are recorded with `"verified": false`. That is deliberate and matches `scripts_engineer_cli.py`, which calls `approvals.approve()` with no token at all; separation of duties switches on the moment `DASHBOARD_USERS` is set.
+
+### Withdrawing an approval: `POST /api/proposals/<id>/cancel`
+
+`reject` only works on `pending`. That used to leave an **approved** proposal as a permanent executable grant — the only exit from `approved` was execution — so a reviewer could not take back a yes when the payload was wrong, a newer proposal superseded it, or it was simply abandoned.
+
+`cancel` withdraws a `pending` **or** `approved` proposal and records who/when/why. It refuses terminal states (`executed`, `failed`, `expired`, `rejected`, `cancelled`) — history is not rewritten — and refuses `executing`, so it can never race the executor. Once cancelled the proposal can no longer be approved or claimed.
+
+### Which routes can reach Wazuh or a SIEM
+
+Only `POST /api/proposals/<id>/execute` does, via the permission-gated tools in `tools/` — `local_rules.xml` is written exclusively through `put_rules_file`, which no HTTP route calls directly. The dashboard's CRUD routes manage purely local app config and cannot bypass that gate:
+
+- `/api/rules` + `/api/rules/import` → `data/rules.json`, the pre-triage filter store (`rules.py` imports nothing but stdlib + config)
+- `/api/lookup-tables` → `data/lookup_tables.json`
+- `/api/providers` → `data/siem_providers.json`
+
+All of them are role-gated and now write to the audit log (`tool="dashboard_ui"`), so a rule edited straight through the UI shows up in `/api/audit` instead of vanishing.
+
+## Verifying a deployed Wazuh rule — and the logtest trap
+
+`verify_rule_deployment` logtests your positive/negative samples. It works for ordinary rules, but **it cannot confirm or refute a frequency/timeframe correlation rule**, and the tool now says so instead of guessing.
+
+`logtest` is a per-event decoder + rule tester. It holds no frequency counter: the `frequency`/`timeframe` state lives in analysisd's live event pipeline. Measured on a live 4.x manager — 8 repeated `Failed password` events pushed through a *single* logtest session never tripped a `frequency="5"` rule, while the live engine would have. So for a correlation rule the result is:
+
+```json
+{ "verified": null, "verification": "inconclusive",
+  "frequency_rule_unverifiable_via_logtest": true,
+  "negative_pass": "4/4" }
+```
+
+`verified` is `null`, **not** `false` — unknown, not disproven. Reading that as a failure is how you end up deleting a working rule. What logtest *does* still prove for a correlation rule is real signal:
+
+- the **parent** rules fire (e.g. `5710`/`5760` for SSH auth failures), which proves decoding and the `if_matched_sid` wiring;
+- the **negatives** stay silent, which proves the rule is not over-matching.
+
+To confirm the correlation itself, push real events through analysisd (agent or syslog input) and read the alert stream, or check the rule is loaded and enabled with `GET /rules/<id>` and trust the live engine.
+
+Two related gotchas this toolchain hit for real:
+
+- **`<if_matched_sid>` and `<same_source_ip/>` must be child elements** on a Wazuh 4.x build. The attribute form (`if_matched_sid="5710,5760" same_source_ip="yes"`) is rejected by the manager with `1113: XML syntax error`.
+- **Wazuh already ships an SSH brute-force rule.** `5763` (*"sshd: brute force trying to get access to the system"*) fires on repeated `Failed password` from one source IP. A custom rule is a deliberate threshold/scope choice and will overlap with it — check the stock rule before tuning your own, and expect duplicate alerts if both match.

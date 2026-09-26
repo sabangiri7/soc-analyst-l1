@@ -33,7 +33,6 @@ can only ever win once.
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import time
@@ -41,6 +40,11 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 from config import cfg
 import permissions
@@ -83,12 +87,25 @@ def _locked(path: Path) -> Iterator[None]:
     a proposal must be atomic so concurrent executes can't both win."""
     lock_path = path.with_suffix(path.suffix + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "a+") as f:
-        try:
+    with open(lock_path, "a+b") as f:
+        if os.name == "nt":
+            # msvcrt locks a byte range from the current file position. Keep
+            # one stable byte in the lock file so this also works on Windows.
+            if f.tell() == 0:
+                f.write(b"\0")
+                f.flush()
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        else:
             fcntl.flock(f, fcntl.LOCK_EX)
+        try:
             yield
         finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+            if os.name == "nt":
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def _now() -> float:
@@ -281,6 +298,42 @@ def reject(proposal_id: str, by: str, reason: str = "", path: str | Path | None 
     raise KeyError(f"Proposal {proposal_id} not found.")
 
 
+_CANCELLABLE = ("pending", "approved")
+
+
+def cancel(proposal_id: str, by: str, reason: str = "",
+            path: str | Path | None = None) -> dict[str, Any]:
+    """Withdraw a proposal: pending/approved -> cancelled.
+
+    Without this, an approved proposal was a permanent grant: the only exit
+    from `approved` was execution, so once a reviewer said yes the change
+    could never be taken back. Stale approvals (wrong payload, superseded by
+    a newer proposal, deployed by hand, or simply abandoned) stayed
+    executable forever with no way to withdraw them.
+
+    Terminal states are refused - a proposal that already ran is history and
+    must not be rewritten, and `executing` is mid-flight so cancelling it
+    would race the executor. The withdrawal is recorded (who/when/why) so the
+    audit trail shows the grant was revoked rather than silently dropped.
+    """
+    p = _path(path)
+    with _locked(p):
+        items = _load(p)
+        for item in items:
+            if item.get("id") != proposal_id:
+                continue
+            if item["status"] not in _CANCELLABLE:
+                raise ValueError(
+                    f"Proposal {proposal_id} is {item['status']} and can no longer be cancelled.")
+            item["status"] = "cancelled"
+            item["cancelled_by"] = by
+            item["cancel_reason"] = reason
+            item["cancelled_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+            _save(items, p)
+            return item
+    raise KeyError(f"Proposal {proposal_id} not found.")
+
+
 def public_view(proposal: dict[str, Any]) -> dict[str, Any]:
     """Payload suitable for the UI/chat - never includes secrets (the payload
     is generated config the user needs to review, so it is shown; audit
@@ -297,4 +350,6 @@ def public_view(proposal: dict[str, Any]) -> dict[str, Any]:
         "user": proposal.get("user"),
         "required_approvers": proposal.get("required_approvers"),
         "approvals": proposal.get("approvals"),
+        "cancelled_by": proposal.get("cancelled_by"),
+        "cancel_reason": proposal.get("cancel_reason"),
     }
