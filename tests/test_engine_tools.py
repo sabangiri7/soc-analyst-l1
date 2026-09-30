@@ -1713,6 +1713,41 @@ class TestFrequencyValidation(unittest.TestCase):
             self.assertFalse(v["valid"], f"{tag} should be rejected as an attribute")
             self.assertTrue(any(tag in e for e in v["errors"]), v["errors"])
 
+    def test_suggested_fix_is_valid_xml_for_flag_elements(self):
+        """The error doubles as repair instructions for the agent, so the
+        suggested form must itself be valid: <same_source_ip />, never
+        '<same_source_ip> /yes</same_source_ip>'."""
+        from tools.wazuh.validation import validate_wazuh_rule_xml
+        v = validate_wazuh_rule_xml(
+            '<rule id="200006" level="10" frequency="5" timeframe="60" '
+            'same_source_ip="yes"><if_matched_sid>5760</if_matched_sid>'
+            '<description>x</description></rule>')
+        msg = next(e for e in v["errors"] if "same_source_ip" in e)
+        self.assertIn("<same_source_ip />", msg)
+        self.assertNotIn("> /yes", msg)
+
+    def test_any_misplaced_child_element_is_caught_not_just_listed_ones(self):
+        """Allowlist, not deny-list: common mistakes outside the original
+        15 tags (if_sid, match, 4.x same_srcip / different_*) used to pass
+        validation and die at upload with 1113."""
+        from tools.wazuh.validation import validate_wazuh_rule_xml
+        for attr, fix in (('if_sid="5716"', "<if_sid>5716</if_sid>"),
+                          ('match="Failed password"', "<match>Failed password</match>"),
+                          ('same_srcip="yes"', "<same_srcip />"),
+                          ('different_srcip="yes"', "<different_srcip />")):
+            v = validate_wazuh_rule_xml(
+                f'<rule id="200007" level="10" frequency="5" timeframe="60" {attr}>'
+                '<if_matched_sid>5760</if_matched_sid><description>x</description></rule>')
+            self.assertFalse(v["valid"], attr)
+            self.assertTrue(any(fix in e for e in v["errors"]), (attr, v["errors"]))
+
+    def test_every_documented_rule_attribute_is_accepted(self):
+        from tools.wazuh.validation import validate_wazuh_rule_xml
+        v = validate_wazuh_rule_xml(
+            '<rule id="200008" level="3" maxsize="512" ignore="60" overwrite="yes" noalert="1">'
+            '<if_sid>5716</if_sid><description>x</description></rule>')
+        self.assertTrue(v["valid"], v["errors"])
+
     def test_valid_child_form_still_passes(self):
         """The fix must not break the form the manager actually accepts."""
         from tools.wazuh.validation import validate_wazuh_rule_xml

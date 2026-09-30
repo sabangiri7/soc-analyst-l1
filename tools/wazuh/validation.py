@@ -30,6 +30,23 @@ _CHILD_ONLY_TAGS = (
 )
 
 
+# The only attributes <rule> accepts. frequency_check/divide are kept because
+# this module already treats them as rule attributes (see _ATTR_ONLY_TAGS).
+_RULE_ATTRS = frozenset({
+    "id", "level", "maxsize", "frequency", "timeframe", "ignore", "overwrite",
+    "noalert", "frequency_check", "divide",
+})
+# Correlation flags that are EMPTY elements in Wazuh: <same_source_ip />, not
+# <same_source_ip>yes</same_source_ip> (and never "<same_source_ip> /yes</...>").
+_FLAG_PREFIXES = ("same_", "different_")
+
+
+def _child_form(tag: str, value: str) -> str:
+    """The working child-element form of a misplaced attribute."""
+    if tag.startswith(_FLAG_PREFIXES) and value.strip().lower() in ("", "yes", "true", "1"):
+        return f"<{tag} />"
+    return f"<{tag}>{value}</{tag}>"
+
 from tools.wazuh.xmlio import UnsafeXmlError, safe_fromstring
 
 
@@ -144,15 +161,20 @@ def validate_wazuh_rule_xml(xml_text: str) -> dict[str, Any]:
     # die at upload with a bare "1113: XML syntax error" - burning a fully
     # approved proposal to learn something knowable offline. Caught here
     # instead, with the working form spelled out.
-    for tag in _CHILD_ONLY_TAGS:
-        if tag in root.attrib:
-            errors.append(
-                f'{tag}="{root.attrib[tag]}" is not a valid <rule> attribute - '
-                f"it must be a child element: <{tag}>"
-                f"{' /' if tag.startswith('same_') else ''}"
-                f"{root.attrib[tag]}</{tag}>. The manager rejects the attribute "
-                f"form with 'XML syntax error' (1113)."
-            )
+    # Allowlist, not a deny-list: <rule> takes only a handful of attributes, so
+    # ANY other one is a child element written in the wrong place - including
+    # the ones a deny-list misses (if_sid="...", match="...", and the 4.x
+    # same_srcip / different_* spellings). _CHILD_ONLY_TAGS documents the
+    # correlation elements this was first written for.
+    for tag, value in root.attrib.items():
+        if tag in _RULE_ATTRS:
+            continue
+        errors.append(
+            f'{tag}="{value}" is not a valid <rule> attribute (valid: '
+            f"{', '.join(sorted(_RULE_ATTRS))}) - it must be a child element: "
+            f"{_child_form(tag, value)}. The manager rejects the attribute form "
+            "with 'XML syntax error' (1113)."
+        )
 
     # frequency/divide counting rules must reference their parent via
     # if_matched_sid: this Wazuh build rejects if_sid on frequency rules

@@ -1,0 +1,125 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index fe6e285..28a0c07 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,16 @@ the tag + `VERSION` + this file's latest section into a GitHub release.
+ 
+ ### Fixed
+ 
++- Rule validation now allowlists `<rule>` attributes (id, level, maxsize, frequency, timeframe,
++  ignore, overwrite, noalert, frequency_check, divide) instead of deny-listing 15 correlation
++  tags, so other misplaced child elements - `if_sid="..."`, `match="..."`, the 4.x
++  `same_srcip` / `different_*` spellings - are caught offline too instead of failing at upload
++  with 1113. The suggested fix for flag elements is now valid (`<same_source_ip />`; it was
++  `<same_source_ip> /yes</same_source_ip>`), which matters because the agent repairs its XML
++  from these messages.
++
++### Fixed
++
+ - `PROMPT_PROFILE=detailed` dropped the engineer's tool contract (dashboard routing via
+   `design_detection_dashboard` + `intent`, "call get_index_schema before asserting a field",
+   threat-intel routing), bringing back failing/generic dashboards and invented-field false
+diff --git a/tests/test_engine_tools.py b/tests/test_engine_tools.py
+index 9fc9822..51d1da0 100644
+--- a/tests/test_engine_tools.py
++++ b/tests/test_engine_tools.py
+@@ -1713,6 +1713,41 @@ class TestFrequencyValidation(unittest.TestCase):
+             self.assertFalse(v["valid"], f"{tag} should be rejected as an attribute")
+             self.assertTrue(any(tag in e for e in v["errors"]), v["errors"])
+ 
++    def test_suggested_fix_is_valid_xml_for_flag_elements(self):
++        """The error doubles as repair instructions for the agent, so the
++        suggested form must itself be valid: <same_source_ip />, never
++        '<same_source_ip> /yes</same_source_ip>'."""
++        from tools.wazuh.validation import validate_wazuh_rule_xml
++        v = validate_wazuh_rule_xml(
++            '<rule id="200006" level="10" frequency="5" timeframe="60" '
++            'same_source_ip="yes"><if_matched_sid>5760</if_matched_sid>'
++            '<description>x</description></rule>')
++        msg = next(e for e in v["errors"] if "same_source_ip" in e)
++        self.assertIn("<same_source_ip />", msg)
++        self.assertNotIn("> /yes", msg)
++
++    def test_any_misplaced_child_element_is_caught_not_just_listed_ones(self):
++        """Allowlist, not deny-list: common mistakes outside the original
++        15 tags (if_sid, match, 4.x same_srcip / different_*) used to pass
++        validation and die at upload with 1113."""
++        from tools.wazuh.validation import validate_wazuh_rule_xml
++        for attr, fix in (('if_sid="5716"', "<if_sid>5716</if_sid>"),
++                          ('match="Failed password"', "<match>Failed password</match>"),
++                          ('same_srcip="yes"', "<same_srcip />"),
++                          ('different_srcip="yes"', "<different_srcip />")):
++            v = validate_wazuh_rule_xml(
++                f'<rule id="200007" level="10" frequency="5" timeframe="60" {attr}>'
++                '<if_matched_sid>5760</if_matched_sid><description>x</description></rule>')
++            self.assertFalse(v["valid"], attr)
++            self.assertTrue(any(fix in e for e in v["errors"]), (attr, v["errors"]))
++
++    def test_every_documented_rule_attribute_is_accepted(self):
++        from tools.wazuh.validation import validate_wazuh_rule_xml
++        v = validate_wazuh_rule_xml(
++            '<rule id="200008" level="3" maxsize="512" ignore="60" overwrite="yes" noalert="1">'
++            '<if_sid>5716</if_sid><description>x</description></rule>')
++        self.assertTrue(v["valid"], v["errors"])
++
+     def test_valid_child_form_still_passes(self):
+         """The fix must not break the form the manager actually accepts."""
+         from tools.wazuh.validation import validate_wazuh_rule_xml
+diff --git a/tools/wazuh/validation.py b/tools/wazuh/validation.py
+index ea2c0ab..7e258c3 100644
+--- a/tools/wazuh/validation.py
++++ b/tools/wazuh/validation.py
+@@ -30,6 +30,23 @@ _CHILD_ONLY_TAGS = (
+ )
+ 
+ 
++# The only attributes <rule> accepts. frequency_check/divide are kept because
++# this module already treats them as rule attributes (see _ATTR_ONLY_TAGS).
++_RULE_ATTRS = frozenset({
++    "id", "level", "maxsize", "frequency", "timeframe", "ignore", "overwrite",
++    "noalert", "frequency_check", "divide",
++})
++# Correlation flags that are EMPTY elements in Wazuh: <same_source_ip />, not
++# <same_source_ip>yes</same_source_ip> (and never "<same_source_ip> /yes</...>").
++_FLAG_PREFIXES = ("same_", "different_")
++
++
++def _child_form(tag: str, value: str) -> str:
++    """The working child-element form of a misplaced attribute."""
++    if tag.startswith(_FLAG_PREFIXES) and value.strip().lower() in ("", "yes", "true", "1"):
++        return f"<{tag} />"
++    return f"<{tag}>{value}</{tag}>"
++
+ from tools.wazuh.xmlio import UnsafeXmlError, safe_fromstring
+ 
+ 
+@@ -144,15 +161,20 @@ def validate_wazuh_rule_xml(xml_text: str) -> dict[str, Any]:
+     # die at upload with a bare "1113: XML syntax error" - burning a fully
+     # approved proposal to learn something knowable offline. Caught here
+     # instead, with the working form spelled out.
+-    for tag in _CHILD_ONLY_TAGS:
+-        if tag in root.attrib:
+-            errors.append(
+-                f'{tag}="{root.attrib[tag]}" is not a valid <rule> attribute - '
+-                f"it must be a child element: <{tag}>"
+-                f"{' /' if tag.startswith('same_') else ''}"
+-                f"{root.attrib[tag]}</{tag}>. The manager rejects the attribute "
+-                f"form with 'XML syntax error' (1113)."
+-            )
++    # Allowlist, not a deny-list: <rule> takes only a handful of attributes, so
++    # ANY other one is a child element written in the wrong place - including
++    # the ones a deny-list misses (if_sid="...", match="...", and the 4.x
++    # same_srcip / different_* spellings). _CHILD_ONLY_TAGS documents the
++    # correlation elements this was first written for.
++    for tag, value in root.attrib.items():
++        if tag in _RULE_ATTRS:
++            continue
++        errors.append(
++            f'{tag}="{value}" is not a valid <rule> attribute (valid: '
++            f"{', '.join(sorted(_RULE_ATTRS))}) - it must be a child element: "
++            f"{_child_form(tag, value)}. The manager rejects the attribute form "
++            "with 'XML syntax error' (1113)."
++        )
+ 
+     # frequency/divide counting rules must reference their parent via
+     # if_matched_sid: this Wazuh build rejects if_sid on frequency rules

@@ -11,6 +11,16 @@ the tag + `VERSION` + this file's latest section into a GitHub release.
 
 ### Fixed
 
+- Rule validation now allowlists `<rule>` attributes (id, level, maxsize, frequency, timeframe,
+  ignore, overwrite, noalert, frequency_check, divide) instead of deny-listing 15 correlation
+  tags, so other misplaced child elements - `if_sid="..."`, `match="..."`, the 4.x
+  `same_srcip` / `different_*` spellings - are caught offline too instead of failing at upload
+  with 1113. The suggested fix for flag elements is now valid (`<same_source_ip />`; it was
+  `<same_source_ip> /yes</same_source_ip>`), which matters because the agent repairs its XML
+  from these messages.
+
+### Fixed
+
 - `PROMPT_PROFILE=detailed` dropped the engineer's tool contract (dashboard routing via
   `design_detection_dashboard` + `intent`, "call get_index_schema before asserting a field",
   threat-intel routing), bringing back failing/generic dashboards and invented-field false
